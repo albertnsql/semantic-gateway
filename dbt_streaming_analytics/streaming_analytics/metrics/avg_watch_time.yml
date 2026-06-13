@@ -1,0 +1,7 @@
+metrics:
+  - name: avg_watch_time
+    description: Average watch time per session in minutes
+    type: simple
+    label: Average Watch Time
+    type_params:
+      measure: avg_watch_time

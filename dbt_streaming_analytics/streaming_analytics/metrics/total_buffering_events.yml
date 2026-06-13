@@ -1,0 +1,7 @@
+metrics:
+  - name: total_buffering_events
+    description: Total buffering events during sessions.
+    type: simple
+    label: Total Buffering Events
+    type_params:
+      measure: total_buffering_events

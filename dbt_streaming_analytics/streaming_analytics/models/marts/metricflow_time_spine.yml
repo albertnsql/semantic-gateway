@@ -1,0 +1,12 @@
+models:
+  - name: metricflow_time_spine
+    description: Time spine model required by MetricFlow
+    time_spine:
+      standard_granularity_column: date_day
+    columns:
+      - name: date_day
+        description: The primary date column for the time spine
+        granularity: day
+        tests:
+          - unique
+          - not_null

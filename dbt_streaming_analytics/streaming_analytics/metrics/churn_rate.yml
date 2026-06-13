@@ -1,0 +1,8 @@
+metrics:
+  - name: churn_rate
+    description: Subscriber Churn Rate
+    label: Subscriber Churn Rate
+    type: ratio
+    type_params:
+      numerator: churned_subscribers
+      denominator: total_subscribers

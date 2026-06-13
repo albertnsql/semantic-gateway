@@ -1,0 +1,7 @@
+metrics:
+  - name: total_recommendations
+    description: Count of all recommendation events
+    label: Total Recommendations
+    type: simple
+    type_params:
+      measure: total_recommendations

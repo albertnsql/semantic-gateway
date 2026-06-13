@@ -1,0 +1,7 @@
+metrics:
+  - name: mrr
+    description: Total MRR across active subscriptions.
+    label: Monthly Recurring Revenue
+    type: simple
+    type_params:
+      measure: mrr_usd

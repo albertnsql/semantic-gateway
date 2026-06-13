@@ -1,0 +1,7 @@
+metrics:
+  - name: ltv
+    description: Total revenue per subscriber lifetime.
+    label: Lifetime Value
+    type: simple
+    type_params:
+      measure: total_revenue_usd

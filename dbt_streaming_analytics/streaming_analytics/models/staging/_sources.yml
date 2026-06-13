@@ -1,0 +1,37 @@
+version: 2
+
+sources:
+  - name: raw
+    database: streaming_analytics
+    schema: raw
+    tables:
+      - name: subscribers
+        config:
+          loaded_at_field: current_timestamp()
+      - name: content_catalog
+        config:
+          loaded_at_field: current_timestamp()
+      - name: content_genre_bridge
+        config:
+          loaded_at_field: current_timestamp()
+      - name: subscriptions
+        config:
+          loaded_at_field: current_timestamp()
+      - name: subscription_plan_history
+        config:
+          loaded_at_field: current_timestamp()
+      - name: payments
+        config:
+          loaded_at_field: current_timestamp()
+      - name: stream_sessions
+        config:
+          loaded_at_field: current_timestamp()
+      - name: recommendation_events
+        config:
+          loaded_at_field: current_timestamp()
+      - name: search_events
+        config:
+          loaded_at_field: current_timestamp()
+      - name: user_watchlists
+        config:
+          loaded_at_field: current_timestamp()

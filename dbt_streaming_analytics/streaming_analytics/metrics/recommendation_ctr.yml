@@ -1,0 +1,8 @@
+metrics:
+  - name: recommendation_ctr
+    description: Recommendation Click-Through Rate
+    label: Recommendation Click-Through Rate
+    type: ratio
+    type_params:
+      numerator: clicked_recommendations
+      denominator: total_recommendations

@@ -1,0 +1,39 @@
+# Environment files
+.env
+.env.*
+
+# But keep the example file
+!.env.example
+!gateway/.env.example
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# dbt
+target/
+dbt_packages/
+profiles.yml
+logs/
+
+# VS Code
+.vscode/
+
+# Generated data
+output/
+raw_tables/
+chroma_store/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive Data Scripts
+load_raw_data_to_snowfalke.py
+generate_streaming_data.py

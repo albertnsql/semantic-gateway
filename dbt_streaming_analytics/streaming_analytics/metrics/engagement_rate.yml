@@ -1,0 +1,7 @@
+metrics:
+  - name: engagement_rate
+    description: Average watch completion across all sessions.
+    label: Content Engagement Rate
+    type: simple
+    type_params:
+      measure: avg_completion_pct

@@ -1,0 +1,7 @@
+metrics:
+  - name: churned_subscribers
+    description: Count of churned subscribers
+    label: Churned Subscribers
+    type: simple
+    type_params:
+      measure: churned_subscribers

@@ -1,0 +1,68 @@
+semantic_models:
+  - name: sem_stream_sessions
+    description: Semantic model for stream sessions
+    model: ref('fct_stream_sessions')
+    entities:
+      - name: session
+        type: primary
+        expr: session_id
+      - name: subscriber
+        type: foreign
+        expr: subscriber_id
+      - name: content
+        type: foreign
+        expr: content_id
+    dimensions:
+      - name: device_type
+        type: categorical
+      - name: quality_streamed
+        type: categorical
+      - name: referral_source
+        type: categorical
+      - name: is_completed
+        type: categorical
+      - name: watch_quality_tier
+        type: categorical
+      - name: country
+        type: categorical
+      - name: was_resumed
+        type: categorical
+      - name: plan_type
+        type: categorical
+      - name: content_primary_genre
+        type: categorical
+      - name: session_start
+        type: time
+        type_params:
+          time_granularity: day
+    measures:
+      - name: total_sessions
+        description: Count of stream sessions
+        expr: session_id
+        agg: count
+        agg_time_dimension: session_start
+      - name: total_watch_minutes
+        description: Total watch minutes
+        expr: duration_minutes
+        agg: sum
+        agg_time_dimension: session_start
+      - name: avg_completion_pct
+        description: Average completion percentage
+        expr: completion_pct
+        agg: average
+        agg_time_dimension: session_start
+      - name: avg_watch_time
+        description: Average watch time in minutes
+        expr: duration_minutes
+        agg: average
+        agg_time_dimension: session_start
+      - name: total_buffering_events
+        description: Total buffering events during sessions
+        expr: buffering_events
+        agg: sum
+        agg_time_dimension: session_start
+      - name: avg_buffering_events
+        description: Average buffering events per session
+        expr: buffering_events
+        agg: average
+        agg_time_dimension: session_start

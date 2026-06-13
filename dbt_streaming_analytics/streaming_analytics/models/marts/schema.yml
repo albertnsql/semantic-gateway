@@ -1,0 +1,106 @@
+version: 2
+
+models:
+  - name: dim_subscribers
+    description: Subscriber dimension
+    columns:
+      - name: subscriber_id
+        tests:
+          - unique
+          - not_null
+      - name: subscription_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['paused', 'churned', 'active']
+      - name: plan_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['basic', 'standard', 'premium']
+
+  - name: dim_content
+    description: Content dimension
+    columns:
+      - name: content_id
+        tests:
+          - unique
+          - not_null
+      - name: content_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['movie', 'documentary', 'short', 'series']
+      - name: completion_rate_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['high', 'medium', 'low']
+
+  - name: dim_dates
+    description: Date dimension spine
+    columns:
+      - name: date_day
+        tests:
+          - unique
+          - not_null
+
+  - name: fct_stream_sessions
+    description: Stream sessions fact table
+    columns:
+      - name: session_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_subscribers')
+                field: subscriber_id
+      - name: content_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_content')
+                field: content_id
+      - name: watch_quality_tier
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['premium', 'standard', 'basic']
+
+  - name: fct_payments
+    description: Payments fact table
+    columns:
+      - name: payment_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_subscribers')
+                field: subscriber_id
+
+  - name: fct_mrr_monthly
+    description: Monthly MRR per subscription
+    columns:
+      - name: mrr_usd
+        tests:
+          - assert_positive_mrr_when_active
+      - name: subscription_id
+        tests:
+          - not_null
+      - name: period_month
+        tests:
+          - not_null
+      - name: mrr_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['new', 'expansion', 'contraction', 'churned', 'inactive', 'retained']

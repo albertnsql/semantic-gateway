@@ -1,0 +1,32 @@
+semantic_models:
+  - name: sem_recommendation_events
+    description: Semantic model for recommendation events
+    model: ref('stg_recommendation_events')
+    entities:
+      - name: event
+        type: primary
+        expr: event_id
+      - name: subscriber
+        type: foreign
+        expr: subscriber_id
+      - name: content
+        type: foreign
+        expr: content_id
+    dimensions:
+      - name: recommendation_type
+        type: categorical
+      - name: event_timestamp
+        type: time
+        type_params:
+          time_granularity: day
+    measures:
+      - name: clicked_recommendations
+        description: Count of clicked recommendations
+        expr: case when was_clicked = true then event_id else null end
+        agg: count
+        agg_time_dimension: event_timestamp
+      - name: total_recommendations
+        description: Count of all recommendation events
+        expr: event_id
+        agg: count
+        agg_time_dimension: event_timestamp

@@ -1,0 +1,7 @@
+metrics:
+  - name: total_watch_time
+    description: Total watch time in minutes
+    type: simple
+    label: Total Watch Time
+    type_params:
+      measure: total_watch_minutes

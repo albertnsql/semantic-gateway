@@ -1,0 +1,7 @@
+metrics:
+  - name: total_subscribers
+    description: Total subscribers
+    label: Total Subscribers
+    type: simple
+    type_params:
+      measure: total_subscribers

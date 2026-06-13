@@ -1,0 +1,7 @@
+metrics:
+  - name: avg_buffering_events
+    description: Average buffering events per session.
+    type: simple
+    label: Average Buffering Events
+    type_params:
+      measure: avg_buffering_events

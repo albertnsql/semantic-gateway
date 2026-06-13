@@ -1,0 +1,7 @@
+metrics:
+  - name: clicked_recommendations
+    description: Count of clicked recommendations
+    label: Clicked Recommendations
+    type: simple
+    type_params:
+      measure: clicked_recommendations

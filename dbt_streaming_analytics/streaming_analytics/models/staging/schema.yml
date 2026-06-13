@@ -1,0 +1,206 @@
+version: 2
+
+models:
+  - name: stg_subscribers
+    description: Staging model for subscribers
+    columns:
+      - name: subscriber_id
+        tests:
+          - unique
+          - not_null
+      - name: subscription_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['paused', 'churned', 'active']
+      - name: plan_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['basic', 'standard', 'premium']
+
+  - name: stg_content_catalog
+    description: Staging model for content catalog
+    columns:
+      - name: content_id
+        tests:
+          - unique
+          - not_null
+      - name: content_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['movie', 'documentary', 'short', 'series']
+
+  - name: stg_content_genre_bridge
+    description: Staging model for content genre bridge
+    columns:
+      - name: bridge_id
+        tests:
+          - unique
+          - not_null
+      - name: content_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_content_catalog')
+                field: content_id
+
+  - name: stg_subscriptions
+    description: Staging model for subscriptions
+    columns:
+      - name: subscription_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+      - name: plan_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['basic', 'standard', 'premium']
+      - name: status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['active', 'cancelled', 'paused']
+
+  - name: stg_subscription_plan_history
+    description: Staging model for subscription plan history
+    columns:
+      - name: change_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+      - name: change_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['upgrade', 'downgrade', 'crossgrade']
+
+  - name: stg_payments
+    description: Staging model for payments
+    columns:
+      - name: payment_id
+        tests:
+          - unique
+          - not_null
+      - name: subscription_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscriptions')
+                field: subscription_id
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+      - name: status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['disputed', 'succeeded', 'refunded', 'failed']
+
+  - name: stg_stream_sessions
+    description: Staging model for stream sessions
+    columns:
+      - name: session_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+      - name: content_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_content_catalog')
+                field: content_id
+      - name: quality_streamed
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['SD', 'HD', '4K']
+
+  - name: stg_recommendation_events
+    description: Staging model for recommendation events
+    columns:
+      - name: event_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+      - name: content_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_content_catalog')
+                field: content_id
+
+  - name: stg_search_events
+    description: Staging model for search events
+    columns:
+      - name: search_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+
+  - name: stg_user_watchlists
+    description: Staging model for user watchlists
+    columns:
+      - name: watchlist_id
+        tests:
+          - unique
+          - not_null
+      - name: subscriber_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_subscribers')
+                field: subscriber_id
+      - name: content_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_content_catalog')
+                field: content_id

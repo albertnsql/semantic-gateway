@@ -1,0 +1,42 @@
+semantic_models:
+  - name: sem_subscribers
+    description: Semantic model for subscribers
+    model: ref('dim_subscribers')
+    entities:
+      - name: subscriber
+        type: primary
+        expr: subscriber_id
+    dimensions:
+      - name: country
+        type: categorical
+      - name: plan_type
+        type: categorical
+      - name: acquisition_channel
+        type: categorical
+      - name: age_group
+        type: categorical
+      - name: subscription_status
+        type: categorical
+      - name: cohort_month
+        type: categorical
+      - name: churn_reason
+        type: categorical
+      - name: signup_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: churn_date
+        type: time
+        type_params:
+          time_granularity: day
+    measures:
+      - name: churned_subscribers
+        description: Count of churned subscribers
+        expr: case when is_churned = true then subscriber_id else null end
+        agg: count
+        agg_time_dimension: signup_date
+      - name: total_subscribers
+        description: Total subscribers
+        expr: subscriber_id
+        agg: count
+        agg_time_dimension: signup_date

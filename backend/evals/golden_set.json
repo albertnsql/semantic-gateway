@@ -1,0 +1,242 @@
+[
+  {
+    "id": "mrr-001",
+    "category": "metric_extraction",
+    "question": "What is the MRR for last month?",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": [],
+      "time_range_relative": "last_month",
+      "needs_clarification": false
+    },
+    "notes": "Simplest MRR query — single metric, single time range, no dimensions."
+  },
+  {
+    "id": "mrr-002",
+    "category": "dimension_extraction",
+    "question": "Show me MRR broken down by plan type for the last 3 months",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": ["plan_type"],
+      "time_range_relative": "last_3_months",
+      "needs_clarification": false
+    },
+    "notes": "Core MRR segmentation query — plan_type is the most common dimension."
+  },
+  {
+    "id": "mrr-003",
+    "category": "dimension_extraction",
+    "question": "MRR by plan type and billing cycle this year",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": ["plan_type", "billing_cycle"],
+      "time_range_relative": "this_year",
+      "needs_clarification": false
+    },
+    "notes": "Two dimensions on the same metric — tests multi-dim extraction."
+  },
+  {
+    "id": "churn-001",
+    "category": "metric_extraction",
+    "question": "What is our churn rate by country this year?",
+    "expected": {
+      "metrics": ["churn_rate"],
+      "dimensions": ["country"],
+      "time_range_relative": "this_year",
+      "needs_clarification": false
+    },
+    "notes": "Churn rate is a ratio metric — tests correct mapping vs 'churned_mrr'."
+  },
+  {
+    "id": "churn-002",
+    "category": "metric_extraction",
+    "question": "How many subscribers have churned in the last 30 days?",
+    "expected": {
+      "metrics": ["churned_subscribers"],
+      "dimensions": [],
+      "time_range_relative": "last_30_days",
+      "needs_clarification": false
+    },
+    "notes": "Churned subscriber COUNT not churn rate — distinct metric."
+  },
+  {
+    "id": "ltv-001",
+    "category": "metric_extraction",
+    "question": "What is the lifetime value of our subscribers by acquisition channel?",
+    "expected": {
+      "metrics": ["ltv"],
+      "dimensions": ["acquisition_channel"],
+      "time_range_relative": null,
+      "needs_clarification": false
+    },
+    "notes": "LTV is typically queried without a time range — tests null time_range handling."
+  },
+  {
+    "id": "engagement-001",
+    "category": "metric_extraction",
+    "question": "Show me engagement rate by device type for the last 30 days",
+    "expected": {
+      "metrics": ["engagement_rate"],
+      "dimensions": ["device_type"],
+      "time_range_relative": "last_30_days",
+      "needs_clarification": false
+    },
+    "notes": "Engagement rate from fct_stream_sessions — common content performance query."
+  },
+  {
+    "id": "engagement-002",
+    "category": "dimension_extraction",
+    "question": "What is our video completion rate by content quality last week?",
+    "expected": {
+      "metrics": ["engagement_rate"],
+      "dimensions": ["quality_streamed"],
+      "time_range_relative": "last_30_days",
+      "needs_clarification": false
+    },
+    "notes": "Synonym test -- 'video completion rate' should map to engagement_rate. time range is approximate (last week -> last 30 days fallback acceptable).",
+    "partial_match_ok": true
+  },
+  {
+    "id": "expansion-001",
+    "category": "metric_extraction",
+    "question": "Show me expansion MRR by plan type over the last quarter",
+    "expected": {
+      "metrics": ["expansion_mrr"],
+      "dimensions": ["plan_type"],
+      "time_range_relative": "last_quarter",
+      "needs_clarification": false
+    },
+    "notes": "Expansion MRR — tests that model distinguishes from base MRR."
+  },
+  {
+    "id": "subscribers-001",
+    "category": "metric_extraction",
+    "question": "How many active subscribers do we have by country?",
+    "expected": {
+      "metrics": ["total_subscribers"],
+      "dimensions": ["country"],
+      "time_range_relative": null,
+      "needs_clarification": false
+    },
+    "notes": "Active subscriber count — 'active' qualifier should not confuse the model."
+  },
+  {
+    "id": "recommendation-001",
+    "category": "metric_extraction",
+    "question": "What is our recommendation click-through rate last month?",
+    "expected": {
+      "metrics": ["recommendation_ctr"],
+      "dimensions": [],
+      "time_range_relative": "last_month",
+      "needs_clarification": false
+    },
+    "notes": "CTR metric from stg_recommendation_events — tests full metric name recognition."
+  },
+  {
+    "id": "filter-001",
+    "category": "filter_extraction",
+    "question": "What is MRR for premium plan subscribers last month?",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": [],
+      "time_range_relative": "last_month",
+      "filters": [{"column": "plan_type", "operator": "eq", "value": "premium"}],
+      "needs_clarification": false
+    },
+    "notes": "Filter extraction — 'premium plan' should produce a plan_type=premium filter."
+  },
+  {
+    "id": "filter-002",
+    "category": "filter_extraction",
+    "question": "Show churn rate for annual billing cycle subscribers this year",
+    "expected": {
+      "metrics": ["churn_rate"],
+      "dimensions": [],
+      "time_range_relative": "this_year",
+      "filters": [{"column": "billing_cycle", "operator": "eq", "value": "annual"}],
+      "needs_clarification": false
+    },
+    "notes": "Filter on billing_cycle dimension — tests filter vs dimension distinction."
+  },
+  {
+    "id": "multi-metric-001",
+    "category": "multi_metric",
+    "question": "Show me MRR and churn rate by country for last quarter",
+    "expected": {
+      "metrics": ["mrr", "churn_rate"],
+      "dimensions": ["country"],
+      "time_range_relative": "last_quarter",
+      "needs_clarification": false
+    },
+    "notes": "Multi-metric query — both metrics share country as a dimension."
+  },
+  {
+    "id": "time-001",
+    "category": "time_range",
+    "question": "What was MRR in January 2025?",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": [],
+      "time_range_start": "2025-01-01",
+      "time_range_end": "2025-01-31",
+      "time_range_relative": null,
+      "needs_clarification": false
+    },
+    "notes": "Absolute date range — tests direct date parsing instead of relative labels."
+  },
+  {
+    "id": "time-002",
+    "category": "time_range",
+    "question": "Compare MRR by plan type month over month",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": ["plan_type"],
+      "aggregation_level": "month",
+      "needs_clarification": false
+    },
+    "notes": "MoM comparison — 'month over month' should set aggregation_level=month."
+  },
+  {
+    "id": "clarification-001",
+    "category": "clarification",
+    "question": "Show me revenue",
+    "expected": {
+      "metrics": ["mrr"],
+      "needs_clarification": false
+    },
+    "notes": "'Revenue' is ambiguous but should map to mrr as closest certified metric. Clarification not required.",
+    "partial_match_ok": true
+  },
+  {
+    "id": "clarification-002",
+    "category": "clarification",
+    "question": "What is our performance?",
+    "expected": {
+      "metrics": [],
+      "needs_clarification": true
+    },
+    "notes": "'Performance' is too vague to map to any certified metric — should request clarification."
+  },
+  {
+    "id": "hallucination-001",
+    "category": "hallucination_resistance",
+    "question": "What is the customer satisfaction score by region last quarter?",
+    "expected": {
+      "metrics": [],
+      "needs_clarification": true
+    },
+    "notes": "CSAT is not a certified metric — model must NOT hallucinate a metric name. Should return empty metrics or ask for clarification."
+  },
+  {
+    "id": "hallucination-002",
+    "category": "hallucination_resistance",
+    "question": "Show me MRR by continent for last month",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": ["country"],
+      "time_range_relative": "last_month",
+      "needs_clarification": false
+    },
+    "notes": "'Continent' is not a certified dimension — model must fall back to 'country' (closest certified) rather than hallucinating 'continent'."
+  }
+]

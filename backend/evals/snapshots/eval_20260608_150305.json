@@ -1,0 +1,1169 @@
+{
+  "run_at": "2026-06-08T15:03:05.954298Z",
+  "snapshot_date": "2026-06-08",
+  "total": 20,
+  "passed": 18,
+  "failed": 2,
+  "errored": 0,
+  "pass_rate_pct": 90.0,
+  "fail_threshold_pct": 75,
+  "category_filter": null,
+  "cases": [
+    {
+      "id": "mrr-001",
+      "category": "metric_extraction",
+      "question": "What is the MRR for last month?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [],
+          "actual": [],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_month",
+          "actual": "last_month",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 3.14,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [],
+        "time_range": {
+          "start_date": "2026-05-01",
+          "end_date": "2026-05-31",
+          "relative": "last_month"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "mrr-002",
+      "category": "dimension_extraction",
+      "question": "Show me MRR broken down by plan type for the last 3 months",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "plan_type"
+          ],
+          "actual": [
+            "plan_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_3_months",
+          "actual": "last_3_months",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 12.7,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [
+          "plan_type"
+        ],
+        "time_range": {
+          "start_date": "2026-03-10",
+          "end_date": "2026-06-08",
+          "relative": "last_3_months"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "is_trial",
+            "operator": "eq",
+            "value": "false"
+          },
+          {
+            "column": "is_deleted",
+            "operator": "eq",
+            "value": "false"
+          },
+          {
+            "column": "plan_type",
+            "operator": "in",
+            "value": "['basic', 'standard', 'premium']"
+          }
+        ]
+      }
+    },
+    {
+      "id": "mrr-003",
+      "category": "dimension_extraction",
+      "question": "MRR by plan type and billing cycle this year",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "billing_cycle",
+            "plan_type"
+          ],
+          "actual": [
+            "billing_cycle",
+            "plan_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "this_year",
+          "actual": "this_year",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.34,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [
+          "plan_type",
+          "billing_cycle"
+        ],
+        "time_range": {
+          "start_date": "2026-01-01",
+          "end_date": "2026-06-08",
+          "relative": "this_year"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "plan_type",
+            "operator": "in",
+            "value": "['basic', 'standard', 'premium']"
+          },
+          {
+            "column": "is_trial",
+            "operator": "eq",
+            "value": "false"
+          },
+          {
+            "column": "is_deleted",
+            "operator": "eq",
+            "value": "false"
+          }
+        ]
+      }
+    },
+    {
+      "id": "churn-001",
+      "category": "metric_extraction",
+      "question": "What is our churn rate by country this year?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "churn_rate"
+          ],
+          "actual": [
+            "churn_rate"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "country"
+          ],
+          "actual": [
+            "country"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "this_year",
+          "actual": "this_year",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.97,
+      "intent": {
+        "metrics": [
+          "churn_rate"
+        ],
+        "dimensions": [
+          "country"
+        ],
+        "time_range": {
+          "start_date": "2026-01-01",
+          "end_date": "2026-06-08",
+          "relative": "this_year"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "country",
+            "operator": "neq",
+            "value": "null"
+          }
+        ]
+      }
+    },
+    {
+      "id": "churn-002",
+      "category": "metric_extraction",
+      "question": "How many subscribers have churned in the last 30 days?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "churned_subscribers"
+          ],
+          "actual": [
+            "churned_subscribers"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [],
+          "actual": [],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_30_days",
+          "actual": "last_30_days",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 2.05,
+      "intent": {
+        "metrics": [
+          "churned_subscribers"
+        ],
+        "dimensions": [],
+        "time_range": {
+          "start_date": "2026-05-09",
+          "end_date": "2026-06-08",
+          "relative": "last_30_days"
+        },
+        "aggregation_level": "day",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "ltv-001",
+      "category": "metric_extraction",
+      "question": "What is the lifetime value of our subscribers by acquisition channel?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "ltv"
+          ],
+          "actual": [
+            "ltv"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "acquisition_channel"
+          ],
+          "actual": [
+            "acquisition_channel"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": null,
+          "actual": null,
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 40.61,
+      "intent": {
+        "metrics": [
+          "ltv"
+        ],
+        "dimensions": [
+          "acquisition_channel"
+        ],
+        "time_range": null,
+        "aggregation_level": null,
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "engagement-001",
+      "category": "metric_extraction",
+      "question": "Show me engagement rate by device type for the last 30 days",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "engagement_rate"
+          ],
+          "actual": [
+            "engagement_rate"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "device_type"
+          ],
+          "actual": [
+            "device_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_30_days",
+          "actual": "last_30_days",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 4.24,
+      "intent": {
+        "metrics": [
+          "engagement_rate"
+        ],
+        "dimensions": [
+          "device_type"
+        ],
+        "time_range": {
+          "start_date": "2026-05-09",
+          "end_date": "2026-06-08",
+          "relative": "last_30_days"
+        },
+        "aggregation_level": "day",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "engagement-002",
+      "category": "dimension_extraction",
+      "question": "What is our video completion rate by content quality last week?",
+      "passed": false,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "engagement_rate"
+          ],
+          "actual": [],
+          "ok": false
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "quality_streamed"
+          ],
+          "actual": [],
+          "ok": false
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_30_days",
+          "actual": "last_week",
+          "ok": false
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": true,
+          "ok": false
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.25,
+      "intent": {
+        "metrics": [],
+        "dimensions": [],
+        "time_range": {
+          "start_date": "2026-06-01",
+          "end_date": "2026-06-07",
+          "relative": "last_week"
+        },
+        "aggregation_level": null,
+        "needs_clarification": true,
+        "filters": []
+      }
+    },
+    {
+      "id": "expansion-001",
+      "category": "metric_extraction",
+      "question": "Show me expansion MRR by plan type over the last quarter",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "expansion_mrr"
+          ],
+          "actual": [
+            "expansion_mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "plan_type"
+          ],
+          "actual": [
+            "plan_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_quarter",
+          "actual": "last_quarter",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.11,
+      "intent": {
+        "metrics": [
+          "expansion_mrr"
+        ],
+        "dimensions": [
+          "plan_type"
+        ],
+        "time_range": {
+          "start_date": "2026-01-01",
+          "end_date": "2026-03-31",
+          "relative": "last_quarter"
+        },
+        "aggregation_level": "quarter",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "subscribers-001",
+      "category": "metric_extraction",
+      "question": "How many active subscribers do we have by country?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "total_subscribers"
+          ],
+          "actual": [
+            "total_subscribers"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "country"
+          ],
+          "actual": [
+            "country"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": null,
+          "actual": null,
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 15.3,
+      "intent": {
+        "metrics": [
+          "total_subscribers"
+        ],
+        "dimensions": [
+          "country"
+        ],
+        "time_range": null,
+        "aggregation_level": null,
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "country",
+            "operator": "neq",
+            "value": "null"
+          }
+        ]
+      }
+    },
+    {
+      "id": "recommendation-001",
+      "category": "metric_extraction",
+      "question": "What is our recommendation click-through rate last month?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "recommendation_ctr"
+          ],
+          "actual": [
+            "recommendation_ctr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [],
+          "actual": [],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_month",
+          "actual": "last_month",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.11,
+      "intent": {
+        "metrics": [
+          "recommendation_ctr"
+        ],
+        "dimensions": [],
+        "time_range": {
+          "start_date": "2026-05-01",
+          "end_date": "2026-05-31",
+          "relative": "last_month"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "filter-001",
+      "category": "filter_extraction",
+      "question": "What is MRR for premium plan subscribers last month?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [],
+          "actual": [
+            "plan_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_month",
+          "actual": "last_month",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        },
+        {
+          "field": "filters",
+          "expected": [
+            {
+              "column": "plan_type",
+              "operator": "eq",
+              "value": "premium"
+            }
+          ],
+          "actual": [
+            {
+              "column": "plan_type",
+              "operator": "eq",
+              "value": "premium"
+            }
+          ],
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.34,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [
+          "plan_type"
+        ],
+        "time_range": {
+          "start_date": "2026-05-01",
+          "end_date": "2026-05-31",
+          "relative": "last_month"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "plan_type",
+            "operator": "eq",
+            "value": "premium"
+          }
+        ]
+      }
+    },
+    {
+      "id": "filter-002",
+      "category": "filter_extraction",
+      "question": "Show churn rate for annual billing cycle subscribers this year",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "churn_rate"
+          ],
+          "actual": [
+            "churn_rate"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [],
+          "actual": [
+            "plan_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "this_year",
+          "actual": "this_year",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        },
+        {
+          "field": "filters",
+          "expected": [
+            {
+              "column": "billing_cycle",
+              "operator": "eq",
+              "value": "annual"
+            }
+          ],
+          "actual": [
+            {
+              "column": "billing_cycle",
+              "operator": "eq",
+              "value": "annual"
+            }
+          ],
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.91,
+      "intent": {
+        "metrics": [
+          "churn_rate"
+        ],
+        "dimensions": [
+          "plan_type"
+        ],
+        "time_range": {
+          "start_date": "2026-01-01",
+          "end_date": "2026-06-08",
+          "relative": "this_year"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "billing_cycle",
+            "operator": "eq",
+            "value": "annual"
+          }
+        ]
+      }
+    },
+    {
+      "id": "multi-metric-001",
+      "category": "multi_metric",
+      "question": "Show me MRR and churn rate by country for last quarter",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "churn_rate",
+            "mrr"
+          ],
+          "actual": [
+            "churn_rate",
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "country"
+          ],
+          "actual": [
+            "country"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_quarter",
+          "actual": "last_quarter",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 19.22,
+      "intent": {
+        "metrics": [
+          "mrr",
+          "churn_rate"
+        ],
+        "dimensions": [
+          "country"
+        ],
+        "time_range": {
+          "start_date": "2026-01-01",
+          "end_date": "2026-03-31",
+          "relative": "last_quarter"
+        },
+        "aggregation_level": "quarter",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "time-001",
+      "category": "time_range",
+      "question": "What was MRR in January 2025?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [],
+          "actual": [
+            "period_month"
+          ],
+          "ok": true
+        },
+        {
+          "field": "time_range_relative",
+          "expected": null,
+          "actual": null,
+          "ok": true
+        },
+        {
+          "field": "time_range_start",
+          "expected": "2025-01-01",
+          "actual": "2025-01-01",
+          "ok": true
+        },
+        {
+          "field": "time_range_end",
+          "expected": "2025-01-31",
+          "actual": "2025-01-31",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.99,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [
+          "period_month"
+        ],
+        "time_range": {
+          "start_date": "2025-01-01",
+          "end_date": "2025-01-31",
+          "relative": null
+        },
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": [
+          {
+            "column": "period_month",
+            "operator": "eq",
+            "value": "2025-01"
+          }
+        ]
+      }
+    },
+    {
+      "id": "time-002",
+      "category": "time_range",
+      "question": "Compare MRR by plan type month over month",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "plan_type"
+          ],
+          "actual": [
+            "period_month",
+            "plan_type"
+          ],
+          "ok": true
+        },
+        {
+          "field": "aggregation_level",
+          "expected": "month",
+          "actual": "month",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 16.38,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [
+          "plan_type",
+          "period_month"
+        ],
+        "time_range": null,
+        "aggregation_level": "month",
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "clarification-001",
+      "category": "clarification",
+      "question": "Show me revenue",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": false,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 1.11,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [],
+        "time_range": null,
+        "aggregation_level": null,
+        "needs_clarification": false,
+        "filters": []
+      }
+    },
+    {
+      "id": "clarification-002",
+      "category": "clarification",
+      "question": "What is our performance?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [],
+          "actual": [],
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": true,
+          "actual": true,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 4.25,
+      "intent": {
+        "metrics": [],
+        "dimensions": [],
+        "time_range": null,
+        "aggregation_level": null,
+        "needs_clarification": true,
+        "filters": []
+      }
+    },
+    {
+      "id": "hallucination-001",
+      "category": "hallucination_resistance",
+      "question": "What is the customer satisfaction score by region last quarter?",
+      "passed": true,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [],
+          "actual": [],
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": true,
+          "actual": true,
+          "ok": true
+        }
+      ],
+      "error": null,
+      "elapsed_s": 6.67,
+      "intent": {
+        "metrics": [],
+        "dimensions": [],
+        "time_range": {
+          "start_date": "2026-04-01",
+          "end_date": "2026-06-30",
+          "relative": "last_quarter"
+        },
+        "aggregation_level": null,
+        "needs_clarification": true,
+        "filters": []
+      }
+    },
+    {
+      "id": "hallucination-002",
+      "category": "hallucination_resistance",
+      "question": "Show me MRR by continent for last month",
+      "passed": false,
+      "checks": [
+        {
+          "field": "metrics",
+          "expected": [
+            "mrr"
+          ],
+          "actual": [
+            "mrr"
+          ],
+          "ok": true
+        },
+        {
+          "field": "dimensions",
+          "expected": [
+            "country"
+          ],
+          "actual": [],
+          "ok": false
+        },
+        {
+          "field": "time_range_relative",
+          "expected": "last_month",
+          "actual": "last_month",
+          "ok": true
+        },
+        {
+          "field": "needs_clarification",
+          "expected": false,
+          "actual": true,
+          "ok": false
+        }
+      ],
+      "error": null,
+      "elapsed_s": 16.66,
+      "intent": {
+        "metrics": [
+          "mrr"
+        ],
+        "dimensions": [],
+        "time_range": {
+          "start_date": "2026-05-01",
+          "end_date": "2026-05-31",
+          "relative": "last_month"
+        },
+        "aggregation_level": "month",
+        "needs_clarification": true,
+        "filters": []
+      }
+    }
+  ]
+}

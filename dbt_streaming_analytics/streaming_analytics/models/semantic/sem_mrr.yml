@@ -1,0 +1,30 @@
+semantic_models:
+  - name: sem_mrr
+    description: >
+      Semantic model for Monthly Recurring Revenue. 
+      IMPORTANT: This metric must not be joined to session-level data without an explicit bridge — doing so will cause a fanout.
+    model: ref('fct_mrr_monthly')
+    entities:
+      - name: subscription
+        type: primary
+        expr: subscription_id
+      - name: subscriber
+        type: foreign
+        expr: subscriber_id
+    dimensions:
+      - name: plan_type
+        type: categorical
+      - name: billing_cycle
+        type: categorical
+      - name: mrr_type
+        type: categorical
+      - name: period_month
+        type: time
+        type_params:
+          time_granularity: month
+    measures:
+      - name: mrr_usd
+        description: MRR in USD
+        expr: mrr_usd
+        agg: sum
+        agg_time_dimension: period_month

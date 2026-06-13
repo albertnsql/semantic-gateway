@@ -1,0 +1,33 @@
+semantic_models:
+  - name: sem_payments
+    description: Semantic model for payments
+    model: ref('fct_payments')
+    entities:
+      - name: payment
+        type: primary
+        expr: payment_id
+      - name: subscriber
+        type: foreign
+        expr: subscriber_id
+    dimensions:
+      - name: payment_method
+        type: categorical
+      - name: currency
+        type: categorical
+      - name: is_renewal
+        type: categorical
+      - name: payment_date
+        type: time
+        type_params:
+          time_granularity: day
+    measures:
+      - name: total_revenue_usd
+        description: Total revenue in USD for succeeded payments
+        expr: case when status = 'succeeded' then amount_usd else 0 end
+        agg: sum
+        agg_time_dimension: payment_date
+      - name: failed_payment_count
+        description: Count of failed payments
+        expr: case when status = 'failed' then payment_id else null end
+        agg: count
+        agg_time_dimension: payment_date
