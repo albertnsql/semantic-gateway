@@ -26,6 +26,7 @@ import logging
 import os
 import time
 import decimal
+import datetime
 from collections import OrderedDict
 from typing import Optional
 
@@ -36,6 +37,8 @@ def make_json_safe(obj):
         return {k: make_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, decimal.Decimal):
         return float(obj)
+    if isinstance(obj, (datetime.date, datetime.datetime)):
+        return obj.isoformat()
     return obj
 
 logger = logging.getLogger(__name__)
