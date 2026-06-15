@@ -14,7 +14,7 @@ const PIPELINE = [
   { icon: Code2,    label: 'dbt Models',                 gradient: 'from-amber-400 to-amber-600', featured: false },
   { icon: Layers,   label: 'MetricFlow\nSemantic Layer', gradient: 'from-teal-400 to-teal-600',   featured: true  },
   { icon: Shield,   label: 'FastAPI\nGateway',           gradient: 'from-emerald-400 to-emerald-600', featured: false },
-  { icon: Cpu,      label: 'gpt-4o\nLLM',               gradient: 'from-teal-400 to-teal-700',   featured: false },
+  { icon: Cpu,      label: 'Gemini 1.5\nLLM',               gradient: 'from-teal-400 to-teal-700',   featured: false },
   { icon: Monitor,  label: 'React\nFrontend',            gradient: 'from-cyan-400 to-teal-600',   featured: false },
 ];
 
@@ -72,7 +72,7 @@ export default function LandingPage() {
             className="text-xs font-bold tracking-widest text-[#0D9488] uppercase"
             style={{ fontFamily: 'DM Sans, sans-serif' }}
           >
-            Production-Grade · MetricFlow · GPT-4o · Snowflake
+            Production-Grade · MetricFlow · Gemini 1.5 · Snowflake
           </span>
         </div>
 
