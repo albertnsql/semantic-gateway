@@ -150,13 +150,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             from rag.embedder import MetricEmbedder
             metric_embedder = MetricEmbedder(persist_dir=_chroma_dir)
             logger.info("✓ ChromaDB index found, loading…")
-            # Eagerly warm the SentenceTransformer model so the first user query
-            # does not pay the ~60s cold-start penalty for lazy model loading.
-            try:
-                _ = metric_embedder.model  # triggers SentenceTransformer download/load
-                logger.info("✓ SentenceTransformer model warmed (ready for first query).")
-            except Exception as warm_exc:
-                logger.warning("✗ SentenceTransformer pre-warm failed (%s) — will load on first query.", warm_exc)
         except Exception as exc:
             logger.warning("✗ Could not load MetricEmbedder (%s) — falling back to full metric injection.", exc)
     else:

@@ -26,28 +26,40 @@ class MetricEmbedder:
     def __init__(self, persist_dir: str = "./chroma_store") -> None:
         """Initialise the persistent ChromaDB collection."""
         import chromadb
+        import os
+        from chromadb import Documents, EmbeddingFunction, Embeddings
+        from openai import OpenAI
 
-        self._model = None
-        self._model_name = "all-MiniLM-L6-v2"
+        # ---------------------------------------------------------
+        # Lightweight API-based Embedding Function
+        # Replaces sentence-transformers/PyTorch to save >150MB RAM!
+        # ---------------------------------------------------------
+        class GeminiEmbeddingFunction(EmbeddingFunction):
+            def __init__(self):
+                api_key = os.getenv("GOOGLE_API_KEY") or "MISSING_KEY"
+                self.client = OpenAI(
+                    api_key=api_key,
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+                )
+            def __call__(self, input: Documents) -> Embeddings:
+                if self.client.api_key == "MISSING_KEY":
+                    logger.warning("GOOGLE_API_KEY not set! Embeddings will fail.")
+                response = self.client.embeddings.create(
+                    input=input,
+                    model="text-embedding-004"
+                )
+                return [data.embedding for data in response.data]
+
+        self._embedding_function = GeminiEmbeddingFunction()
 
         logger.info("Connecting to ChromaDB at '%s'…", persist_dir)
         self._client = chromadb.PersistentClient(path=persist_dir)
         self.collection = self._client.get_or_create_collection(
             name="metrics",
             metadata={"hnsw:space": "cosine"},
+            embedding_function=self._embedding_function,
         )
         logger.info("MetricEmbedder ready. Collection size: %d", self.collection.count())
-
-    @property
-    def model(self):
-        """Lazy-load the sentence transformer model to prevent blocking startup."""
-        if self._model is None:
-            import os
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading SentenceTransformer model '%s'…", self._model_name)
-            self._model = SentenceTransformer(self._model_name)
-        return self._model
 
     def _build_document(self, metric: dict) -> str:
         """Build a plain-text sentence describing a metric for embedding."""
@@ -95,16 +107,12 @@ class MetricEmbedder:
             logger.warning("index_metrics: no valid metric names found.")
             return
 
-        # Batch encode all documents in one call — 3-5x faster than one-at-a-time
-        logger.info("Encoding %d metric documents (batched)…", len(documents))
-        embeddings_matrix = self.model.encode(
-            documents, batch_size=32, show_progress_bar=False
-        )
-        embeddings = [vec.tolist() for vec in embeddings_matrix]
+        # Batch encode happens automatically in ChromaDB upsert if documents are passed
+        # and embedding_function is attached to the collection.
+        logger.info("Upserting %d metrics into ChromaDB (will call Embedding API)…", len(documents))
 
         self.collection.upsert(
             ids=ids,
-            embeddings=embeddings,
             documents=documents,
             metadatas=metadatas,
         )
@@ -118,9 +126,8 @@ class MetricEmbedder:
                 "Run: python -m gateway.rag.indexer to build the index."
             )
 
-        query_embedding = self.model.encode(query)
         results = self.collection.query(
-            query_embeddings=[query_embedding.tolist()],
+            query_texts=[query],
             n_results=min(top_k, self.collection.count()),
             include=["metadatas", "documents"],
         )
