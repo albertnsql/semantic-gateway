@@ -24,15 +24,24 @@ export default function ChatMessage({ message, onSuggest, onSuggestPopulate }) {
 
   // Error
   if (message.status === 'error') {
+    const isServerAsleep = message.error && (
+      message.error.includes('503') || 
+      message.error.includes('502') || 
+      message.error.includes('Network Error')
+    );
+    const displayError = isServerAsleep 
+      ? "The AI Gateway is currently waking up from sleep mode. Please wait 30-50 seconds and try your query again!"
+      : message.error;
+
     return (
       <div
         className="self-start max-w-[85%] px-4 py-3 rounded-[20px] rounded-tl-[6px] backdrop-blur-xl"
         style={{ background: 'rgba(255,255,255,0.80)', boxShadow: '8px 8px 20px rgba(13,148,136,0.08), -6px -6px 16px rgba(255,255,255,0.9)' }}
       >
         <div className="flex items-center gap-1.5 text-[#F59E0B] font-bold text-xs mb-1.5">
-          <AlertTriangle size={13} /> Query Error
+          <AlertTriangle size={13} /> {isServerAsleep ? 'Server Waking Up' : 'Query Error'}
         </div>
-        <p className="text-sm text-[#1A3A38]" style={{ fontFamily: 'DM Sans, sans-serif' }}>{message.error}</p>
+        <p className="text-sm text-[#1A3A38]" style={{ fontFamily: 'DM Sans, sans-serif' }}>{displayError}</p>
         {message.date && (
           <p className="text-[9px] text-[#4A7B76] mt-1">
             {message.date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
