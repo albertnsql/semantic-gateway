@@ -143,7 +143,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         os.path.isdir(_chroma_dir)
         and any(True for _ in os.scandir(_chroma_dir))
     )
-    if _chroma_populated:
+    if os.getenv("DISABLE_RAG", "false").lower() == "true":
+        logger.info("✓ RAG disabled via environment variable. Falling back to full metric injection (uses less RAM).")
+    elif _chroma_populated:
         try:
             from rag.embedder import MetricEmbedder
             metric_embedder = MetricEmbedder(persist_dir=_chroma_dir)
