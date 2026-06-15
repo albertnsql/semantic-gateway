@@ -15,10 +15,6 @@ from __future__ import annotations
 import logging
 import os
 
-# Skip HuggingFace network checks for locally cached models to fix cold-start latency
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-
 import time
 import traceback
 import uuid
