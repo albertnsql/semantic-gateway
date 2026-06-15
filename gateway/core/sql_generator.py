@@ -22,6 +22,7 @@ import logging
 import os
 import subprocess
 import concurrent.futures
+import sys
 from typing import TYPE_CHECKING, Any
 
 import snowflake.connector
@@ -420,11 +421,14 @@ class SQLGenerator:
         env["PYTHONIOENCODING"] = "utf-8"
         env["NO_COLOR"] = "1"
 
-        windows_safe_command = f"chcp 65001 >nul && {mf_command}"
+        if sys.platform == "win32":
+            safe_command = f"chcp 65001 >nul && {mf_command}"
+        else:
+            safe_command = mf_command
         
         try:
             result = subprocess.run(
-                windows_safe_command,
+                safe_command,
                 shell=True,
                 capture_output=True,
                 text=True,
