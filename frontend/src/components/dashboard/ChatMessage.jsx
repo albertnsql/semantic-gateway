@@ -230,8 +230,8 @@ export default function ChatMessage({ message, onSuggest, onSuggestPopulate }) {
                 <span className="hidden group-open:inline">▾</span>
                 View Data Table
               </summary>
-              <div className="rounded-[20px] overflow-hidden" style={{ boxShadow: 'inset 4px 4px 8px rgba(13,148,136,0.06), inset -4px -4px 8px rgba(255,255,255,0.9)' }}>
-                <table className="w-full text-left border-collapse">
+              <div className="rounded-[20px] overflow-x-auto" style={{ boxShadow: 'inset 4px 4px 8px rgba(13,148,136,0.06), inset -4px -4px 8px rgba(255,255,255,0.9)' }}>
+                <table className="w-full text-left border-collapse whitespace-nowrap">
                   <thead>
                     <tr style={{ background: 'rgba(13,148,136,0.06)', borderBottom: '1px solid rgba(13,148,136,0.10)' }}>
                       {Object.keys(raw.result.data[0]).map(k => (
