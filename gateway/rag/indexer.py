@@ -61,6 +61,11 @@ def main() -> None:
     print(f"[indexer] Found {len(all_metrics)} metrics to index.")
 
     # ── 3. Index into ChromaDB ────────────────────────────────────────────────
+    # Clear old database to prevent dimension mismatch errors between 
+    # sentence-transformers (384-dim) and Gemini (3072-dim)
+    import shutil
+    shutil.rmtree("./chroma_store", ignore_errors=True)
+    
     embedder = MetricEmbedder(persist_dir="./chroma_store")
     embedder.index_metrics(all_metrics)
     print(f"Indexed {len(all_metrics)} metrics into ChromaDB.")

@@ -36,19 +36,29 @@ class MetricEmbedder:
         # ---------------------------------------------------------
         class GeminiEmbeddingFunction(EmbeddingFunction):
             def __init__(self):
-                api_key = os.getenv("GOOGLE_API_KEY") or "MISSING_KEY"
-                self.client = OpenAI(
-                    api_key=api_key,
-                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-                )
+                self.api_key = os.getenv("GOOGLE_API_KEY")
+                
             def __call__(self, input: Documents) -> Embeddings:
-                if self.client.api_key == "MISSING_KEY":
+                if not self.api_key:
                     logger.warning("GOOGLE_API_KEY not set! Embeddings will fail.")
-                response = self.client.embeddings.create(
-                    input=input,
-                    model="text-embedding-004"
-                )
-                return [data.embedding for data in response.data]
+                    return [[0.0] * 768 for _ in input]
+                    
+                import requests
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents?key={self.api_key}"
+                
+                reqs = []
+                for text in input:
+                    reqs.append({
+                        "model": "models/gemini-embedding-2",
+                        "content": {"parts": [{"text": text}]}
+                    })
+                    
+                resp = requests.post(url, json={"requests": reqs})
+                if not resp.ok:
+                    raise RuntimeError(f"Gemini API error: {resp.text}")
+                    
+                data = resp.json()
+                return [obj["values"] for obj in data.get("embeddings", [])]
 
         self._embedding_function = GeminiEmbeddingFunction()
 
