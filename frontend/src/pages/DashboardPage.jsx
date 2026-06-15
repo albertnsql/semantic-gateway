@@ -360,7 +360,8 @@ export default function DashboardPage() {
       });
       setMessages(prev => [...prev, { role: 'agent', status: res.status, raw: res, date: new Date() }]);
     } catch (err) {
-      setMessages(prev => [...prev, { role: 'agent', status: 'error', error: err.message || 'Failed', date: new Date() }]);
+      const errorMsg = err.response?.data?.message || err.response?.data?.error || err.message || 'Failed';
+      setMessages(prev => [...prev, { role: 'agent', status: 'error', error: errorMsg, date: new Date() }]);
     } finally { setIsTyping(false); }
   };
 
