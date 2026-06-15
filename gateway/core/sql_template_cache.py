@@ -295,16 +295,23 @@ def inject_time_filter(
         sql_before = sql_template[:insert_pos].rstrip()
         sql_after  = sql_template[insert_pos:]
 
-        if re.search(r"\bWHERE\b", sql_before, re.IGNORECASE):
-            # Existing WHERE — append as AND condition
-            return sql_before + f"\n  AND {date_filter}" + "\n" + sql_after
+        # We must only check for WHERE in the outer query, not inside CTEs.
+        last_from_idx = sql_before.upper().rfind(" FROM ")
+        segment = sql_before[last_from_idx:] if last_from_idx != -1 else sql_before
+
+        if re.search(r"\bWHERE\b", segment, re.IGNORECASE):
+            # Existing WHERE in outer query — append as AND condition
+            return sql_before + f"\n  AND {date_filter}\n" + sql_after
         else:
-            # No WHERE yet — add one
+            # No WHERE yet in outer query — add one
             return sql_before + f"\nWHERE {date_filter}\n" + sql_after
     else:
         # No GROUP BY / ORDER BY found — safe to append at the very end
         sql = sql_template.rstrip().rstrip(";").rstrip()
-        if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+        last_from_idx = sql.upper().rfind(" FROM ")
+        segment = sql[last_from_idx:] if last_from_idx != -1 else sql
+        
+        if re.search(r"\bWHERE\b", segment, re.IGNORECASE):
             return sql + f"\n  AND {date_filter}"
         else:
             return sql + f"\nWHERE {date_filter}"
