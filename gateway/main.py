@@ -104,8 +104,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     response_builder = ResponseBuilder(metric_registry=metric_registry)
 
     # ── 4. Open Snowflake connection pool (replaces per-query connect) ───────
-    # Pool size 15: 11 parallel dashboard widgets + headroom for concurrent chat/query requests
-    snowflake_pool = SnowflakePool(settings=settings, size=15)
+    # Dynamically size pool for Render's 512MB RAM constraint
+    pool_size = int(os.getenv("SNOWFLAKE_POOL_SIZE", "5"))
+    snowflake_pool = SnowflakePool(settings=settings, size=pool_size)
     snowflake_ok   = False
     try:
         snowflake_pool.initialise()
@@ -201,18 +202,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.intent_classifier = None
 
     # ── 8. Cache Warmer ────────────────────────────────────────────────
-    try:
-        from core.cache_warmer import CacheWarmer
-        warmer = CacheWarmer(
-            settings=settings,
-            sql_generator=sql_generator,
-            query_cache=query_cache,
-            response_builder=response_builder
-        )
-        app.state.cache_warmer = warmer
-        warmer.start()
-    except Exception as exc:
-        logger.error("✗ Failed to start CacheWarmer: %s", exc)
+    if os.getenv("DISABLE_CACHE_WARMER", "false").lower() != "true":
+        try:
+            from core.cache_warmer import CacheWarmer
+            warmer = CacheWarmer(
+                settings=settings,
+                sql_generator=sql_generator,
+                query_cache=query_cache,
+                response_builder=response_builder
+            )
+            app.state.cache_warmer = warmer
+            warmer.start()
+        except Exception as exc:
+            logger.error("✗ Failed to start CacheWarmer: %s", exc)
+    else:
+        logger.info("✓ CacheWarmer disabled via environment variable.")
 
     logger.info("=" * 60)
     logger.info(
