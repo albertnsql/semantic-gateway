@@ -280,39 +280,8 @@ def inject_time_filter(
         sql = sql.replace(_DATE_PLACEHOLDER_END, end_date)
         return sql
 
-    # ── No placeholder: inject the filter before GROUP BY / ORDER BY ─────────
-    # Find the first clause that terminates the WHERE region.
-    # We match at a newline boundary so we don't accidentally match inside a
-    # string literal or column alias.
-    terminator_match = re.search(
-        r"(?m)^\s*(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT)\b",
-        sql_template,
-        re.IGNORECASE,
-    )
-
-    if terminator_match:
-        insert_pos = terminator_match.start()
-        sql_before = sql_template[:insert_pos].rstrip()
-        sql_after  = sql_template[insert_pos:]
-
-        # We must only check for WHERE in the outer query, not inside CTEs.
-        last_from_idx = sql_before.upper().rfind(" FROM ")
-        segment = sql_before[last_from_idx:] if last_from_idx != -1 else sql_before
-
-        if re.search(r"\bWHERE\b", segment, re.IGNORECASE):
-            # Existing WHERE in outer query — append as AND condition
-            return sql_before + f"\n  AND {date_filter}\n" + sql_after
-        else:
-            # No WHERE yet in outer query — add one
-            return sql_before + f"\nWHERE {date_filter}\n" + sql_after
-    else:
-        # No GROUP BY / ORDER BY found — safe to append at the very end
-        sql = sql_template.rstrip().rstrip(";").rstrip()
-        last_from_idx = sql.upper().rfind(" FROM ")
-        segment = sql[last_from_idx:] if last_from_idx != -1 else sql
-        
-        if re.search(r"\bWHERE\b", segment, re.IGNORECASE):
-            return sql + f"\n  AND {date_filter}"
-        else:
-            return sql + f"\nWHERE {date_filter}"
+    # If we get here, the SQL generator failed to force a cache miss, which is a bug.
+    # Return it unchanged rather than corrupting the AST with regex insertions.
+    logger.error("inject_time_filter called on template without placeholders! (time_col=%s)", time_col)
+    return sql_template
 

@@ -291,26 +291,32 @@ class SQLGenerator:
                 tpl_col = cached_tpl["time_col"]
 
                 if intent.time_range and tpl_col:
-                    # Template has a placeholder — inject the requested dates
-                    compiled_sql = inject_time_filter(
-                        tpl_sql,
-                        tpl_col,
-                        intent.time_range.start_date,
-                        intent.time_range.end_date,
-                    )
-                    logger.info(
-                        "SQLTemplateCache HIT — skipped MetricFlow subprocess. "
-                        "Injected %s..%s on %s.",
-                        intent.time_range.start_date,
-                        intent.time_range.end_date,
-                        tpl_col,
-                    )
+                    if not cached_tpl.get("has_time_filter", False):
+                        # We cannot safely inject dates into a query that wasn't compiled with them
+                        # (because the time_col may be missing from the outer CTE). Force a miss.
+                        compiled_sql = None
+                        logger.info("SQLTemplateCache MISS — template lacks time filter placeholders.")
+                    else:
+                        # Template has a placeholder — inject the requested dates
+                        compiled_sql = inject_time_filter(
+                            tpl_sql,
+                            tpl_col,
+                            intent.time_range.start_date,
+                            intent.time_range.end_date,
+                        )
+                        logger.info(
+                            "SQLTemplateCache HIT — skipped MetricFlow subprocess. "
+                            "Injected %s..%s on %s.",
+                            intent.time_range.start_date,
+                            intent.time_range.end_date,
+                            tpl_col,
+                        )
+                        used_template_cache = True
                 else:
                     # No time range requested or template has no time col — use as-is
                     compiled_sql = tpl_sql
                     logger.info("SQLTemplateCache HIT — no time range injection needed.")
-
-                used_template_cache = True
+                    used_template_cache = True
 
         # ── MetricFlow subprocess & Speculative LLM Review ───────────
         mf_command = ""
