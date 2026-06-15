@@ -462,9 +462,6 @@ export default function DashboardPage() {
               <Button variant="outline" onClick={() => loadDashboardData(selectedPlans, selectedYears, selectedCountries)} title="Force refresh">
                 <RotateCw size={14} className="text-slate-500" /> Refresh
               </Button>
-              <Button variant="primary">
-                <Download size={14} /> Export
-              </Button>
             </div>
           </div>
 
