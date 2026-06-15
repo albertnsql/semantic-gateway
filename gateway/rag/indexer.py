@@ -16,6 +16,10 @@ from __future__ import annotations
 import sys
 import os
 
+# Save downloaded HuggingFace models locally so Render preserves them
+# between the build phase and the runtime phase.
+os.environ["HF_HOME"] = os.path.abspath("./.hf_cache")
+
 # Ensure the gateway package root is on sys.path when run via -m
 _GATEWAY_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _GATEWAY_ROOT not in sys.path:

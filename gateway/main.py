@@ -15,6 +15,10 @@ from __future__ import annotations
 import logging
 import os
 
+# Save downloaded HuggingFace models locally so Render preserves them
+# between the build phase and the runtime phase.
+os.environ["HF_HOME"] = os.path.abspath("./.hf_cache")
+
 import time
 import traceback
 import uuid
