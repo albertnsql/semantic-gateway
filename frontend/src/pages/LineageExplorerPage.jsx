@@ -13,6 +13,7 @@ import { getMetrics, getLineage } from '../api/metrics';
 
 const CLAY_SHADOW = `16px 16px 32px rgba(13,148,136,0.12), -10px -10px 24px rgba(255,255,255,0.9), inset 6px 6px 12px rgba(13,148,136,0.04), inset -6px -6px 12px rgba(255,255,255,1)`;
 const CLAY_INSET  = `inset 8px 8px 16px rgba(13,148,136,0.08), inset -8px -8px 16px rgba(255,255,255,0.9)`;
+const CLAY_SHADOW_PRIMARY = `12px 12px 24px rgba(13, 148, 136, 0.25), -8px -8px 16px rgba(255, 255, 255, 0.5), inset 4px 4px 8px rgba(255, 255, 255, 0.3), inset -4px -4px 8px rgba(0, 0, 0, 0.1)`;
 
 function inferLayer(name, isLast) {
   if (isLast)              return 'metric';
@@ -44,22 +45,22 @@ function CustomDropdown({ metrics, selected, onSelect }) {
         type="button"
         onClick={() => setIsOpen(!isOpen)}
         className="w-full flex items-center justify-between rounded-[20px] px-6 py-4
-                   text-[#1A3A38] text-sm cursor-pointer transition-all duration-200 backdrop-blur-xl
-                   focus:outline-none focus:ring-4 focus:ring-[#0D9488]/20"
+                   text-white text-sm cursor-pointer transition-all duration-200
+                   focus:outline-none focus:ring-4 focus:ring-[#0D9488]/30"
         style={{
-          background: '#E6F7F6',
-          boxShadow: CLAY_INSET,
+          background: 'linear-gradient(135deg, #2DD4BF, #0D9488)',
+          boxShadow: CLAY_SHADOW_PRIMARY,
           fontFamily: 'DM Sans, sans-serif',
         }}
       >
         <span>
           {selectedMetric ? (
-            <><span className="font-bold">{selectedMetric.name}</span> <span className="text-[#4A7B76]">— {selectedMetric.label}</span></>
+            <><span className="font-bold text-white">{selectedMetric.name}</span> <span className="text-white/80">— {selectedMetric.label}</span></>
           ) : '— Choose a metric —'}
         </span>
         <ChevronDown
           size={18}
-          className={`text-[#4A7B76] transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`}
+          className={`text-white transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`}
         />
       </button>
 
@@ -182,26 +183,35 @@ export default function LineageExplorerPage() {
         <div className="flex flex-col gap-5 animate-slide-in relative z-10">
           {/* Summary cards */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            {[
-              { label: 'Metric', value: <code className="text-sm text-[#0D9488] font-mono font-bold">{lineage.metric_name}</code> },
-              { label: 'Source Model', value: <code className="text-sm text-[#4A7B76] font-mono">{lineage.source_model}</code> },
-              { label: 'Upstream Models', value: <span className="text-2xl font-black text-[#1A3A38]" style={{ fontFamily: 'Nunito, sans-serif' }}>{lineage.upstream_models?.length ?? 0}</span> },
-            ].map(({ label, value }) => (
-              <div
-                key={label}
-                className="p-5 rounded-[32px] backdrop-blur-xl"
-                style={{ background: 'rgba(255,255,255,0.65)', boxShadow: CLAY_SHADOW }}
-              >
-                <span className="text-xs text-[#4A7B76] font-bold uppercase tracking-wide block mb-2" style={{ fontFamily: 'DM Sans, sans-serif' }}>{label}</span>
-                {value}
-              </div>
-            ))}
+            <div
+              className="p-5 rounded-[32px] backdrop-blur-xl"
+              style={{ background: 'rgba(255,255,255,0.65)', boxShadow: CLAY_SHADOW }}
+            >
+              <span className="text-xs text-[#4A7B76] font-bold uppercase tracking-wide block mb-2" style={{ fontFamily: 'DM Sans, sans-serif' }}>Metric</span>
+              <code className="text-sm text-[#0D9488] font-mono font-bold">{lineage.metric_name}</code>
+            </div>
+
+            <div
+              className="p-5 rounded-[32px] backdrop-blur-xl"
+              style={{ background: 'rgba(255,255,255,0.65)', boxShadow: CLAY_SHADOW }}
+            >
+              <span className="text-xs text-[#4A7B76] font-bold uppercase tracking-wide block mb-2" style={{ fontFamily: 'DM Sans, sans-serif' }}>Source Model</span>
+              <code className="text-sm text-[#4A7B76] font-mono">{lineage.source_model}</code>
+            </div>
+
+            <div
+              className="p-5 rounded-[32px]"
+              style={{ background: 'linear-gradient(135deg, #FCD34D, #F59E0B)', boxShadow: CLAY_SHADOW_PRIMARY }}
+            >
+              <span className="text-xs text-amber-900/80 font-bold uppercase tracking-wide block mb-2" style={{ fontFamily: 'DM Sans, sans-serif' }}>Upstream Models</span>
+              <span className="text-2xl font-black text-white" style={{ fontFamily: 'Nunito, sans-serif' }}>{lineage.upstream_models?.length ?? 0}</span>
+            </div>
           </div>
 
           {/* Lineage visual */}
           <div
             className="p-6 rounded-[32px] backdrop-blur-xl"
-            style={{ background: 'rgba(255,255,255,0.65)', boxShadow: CLAY_SHADOW }}
+            style={{ background: 'rgba(255,255,255,0.5)', boxShadow: CLAY_INSET }}
           >
             <h3
               className="text-base font-bold text-[#1A3A38] mb-4"
@@ -235,11 +245,11 @@ export default function LineageExplorerPage() {
               <div className="overflow-x-auto">
                 <table className="w-full text-sm" style={{ fontFamily: 'DM Sans, sans-serif' }}>
                   <thead>
-                    <tr style={{ background: 'rgba(13,148,136,0.04)', borderBottom: '1px solid rgba(13,148,136,0.08)' }}>
-                      <th className="px-5 py-3 text-left text-xs font-bold text-[#4A7B76] uppercase tracking-wider">Step</th>
-                      <th className="px-5 py-3 text-left text-xs font-bold text-[#4A7B76] uppercase tracking-wider">Model Name</th>
-                      <th className="px-5 py-3 text-left text-xs font-bold text-[#4A7B76] uppercase tracking-wider">Layer</th>
-                      <th className="px-5 py-3 text-left text-xs font-bold text-[#4A7B76] uppercase tracking-wider">Description</th>
+                    <tr style={{ background: '#0D9488' }}>
+                      <th className="px-5 py-4 text-left text-xs font-bold text-white uppercase tracking-wider">Step</th>
+                      <th className="px-5 py-4 text-left text-xs font-bold text-white uppercase tracking-wider">Model Name</th>
+                      <th className="px-5 py-4 text-left text-xs font-bold text-white uppercase tracking-wider">Layer</th>
+                      <th className="px-5 py-4 text-left text-xs font-bold text-white uppercase tracking-wider">Description</th>
                     </tr>
                   </thead>
                   <tbody>
