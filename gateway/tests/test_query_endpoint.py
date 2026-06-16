@@ -220,6 +220,7 @@ def client():
 
     mock_validator = MagicMock()
     mock_validator.validate.return_value = _make_validation(passed=True)
+    mock_validator._get_bare_dimension.side_effect = lambda x: x
 
     mock_sql_gen = MagicMock()
     mock_sql_gen.generate.return_value = _make_generated_query()

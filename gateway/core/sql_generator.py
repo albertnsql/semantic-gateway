@@ -32,8 +32,7 @@ from pydantic import BaseModel
 from core.exceptions import SnowflakeConnectionError, SQLGenerationError
 from core.sql_template_cache import (
     SQLTemplateCache,
-    strip_time_filter,
-    inject_time_filter,
+    parameterize_sql_dates,
 )
 
 import importlib.util
@@ -288,32 +287,26 @@ class SQLGenerator:
             cached_tpl = self._template_cache.get(intent.metrics, intent.dimensions)
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
-                tpl_col = cached_tpl["time_col"]
 
-                if intent.time_range and tpl_col:
+                if intent.time_range:
                     if not cached_tpl.get("has_time_filter", False):
                         # We cannot safely inject dates into a query that wasn't compiled with them
-                        # (because the time_col may be missing from the outer CTE). Force a miss.
+                        # Force a miss.
                         compiled_sql = None
                         logger.info("SQLTemplateCache MISS — template lacks time filter placeholders.")
                     else:
                         # Template has a placeholder — inject the requested dates
-                        compiled_sql = inject_time_filter(
-                            tpl_sql,
-                            tpl_col,
-                            intent.time_range.start_date,
-                            intent.time_range.end_date,
-                        )
+                        compiled_sql = tpl_sql.replace("{start_date}", intent.time_range.start_date)
+                        compiled_sql = compiled_sql.replace("{end_date}", intent.time_range.end_date)
                         logger.info(
-                            "SQLTemplateCache HIT — skipped MetricFlow subprocess. "
-                            "Injected %s..%s on %s.",
+                            "SQLTemplateCache HIT (parameterized) — skipping MetricFlow. Executing SQL directly. "
+                            "Injected %s..%s.",
                             intent.time_range.start_date,
                             intent.time_range.end_date,
-                            tpl_col,
                         )
                         used_template_cache = True
                 else:
-                    # No time range requested or template has no time col — use as-is
+                    # No time range requested — use as-is
                     compiled_sql = tpl_sql
                     logger.info("SQLTemplateCache HIT — no time range injection needed.")
                     used_template_cache = True
@@ -370,21 +363,20 @@ class SQLGenerator:
             # WHERE to anchor to instead of appending after GROUP BY.
             if self._template_cache is not None and intent.metrics and intent.dimensions:
                 try:
-                    primary_metric = intent.metrics[0]
-                    time_col = self._METRIC_TIME_COL.get(primary_metric)
-                    if time_col is None:
-                        sql_template, time_col = strip_time_filter(compiled_sql)
-                    else:
-                        sql_template, detected_col = strip_time_filter(compiled_sql)
-                        if detected_col:
-                            time_col = detected_col
+                    sql_template = compiled_sql
+                    has_placeholder = False
 
-                    has_placeholder = "__TEMPLATE_START_DATE__" in sql_template
+                    if intent.time_range:
+                        sql_template, has_placeholder = parameterize_sql_dates(
+                            compiled_sql, 
+                            intent.time_range.start_date, 
+                            intent.time_range.end_date
+                        )
+
                     self._template_cache.set(
                         intent.metrics,
                         intent.dimensions,
                         sql_template,
-                        time_col,
                         has_placeholder,
                     )
                 except Exception as tpl_exc:

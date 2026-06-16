@@ -33,10 +33,9 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Sentinel token written into the template WHERE clause in place of the date range.
-# Must be a string that cannot appear in valid SQL.
-_DATE_PLACEHOLDER_START = "__TEMPLATE_START_DATE__"
-_DATE_PLACEHOLDER_END = "__TEMPLATE_END_DATE__"
+# Sentinel tokens used for parameterization
+_DATE_PLACEHOLDER_START = "{start_date}"
+_DATE_PLACEHOLDER_END = "{end_date}"
 
 
 class SQLTemplateCache:
@@ -87,9 +86,7 @@ class SQLTemplateCache:
         Return the cached template entry, or None if missing / expired.
 
         Returns a dict with keys:
-            ``sql_template``   — SQL string with placeholder tokens for dates
-            ``time_col``       — physical column used for the date filter (may be None
-                                 if the original query had no time range)
+            ``sql_template``   — SQL string with `{start_date}` and `{end_date}` placeholders
             ``has_time_filter`` — bool; True if the template contains placeholders
         """
         key = self.make_key(metrics, dimensions)
@@ -112,7 +109,6 @@ class SQLTemplateCache:
         metrics: list[str],
         dimensions: list[str],
         sql_template: str,
-        time_col: str | None,
         has_time_filter: bool,
     ) -> None:
         """
@@ -121,8 +117,7 @@ class SQLTemplateCache:
         Args:
             metrics:         Metric names for this template.
             dimensions:      Dimension names for this template.
-            sql_template:    Compiled SQL with date literals replaced by placeholders.
-            time_col:        Physical column name used for the time filter.
+            sql_template:    Compiled SQL with date literals replaced by {start_date} and {end_date}.
             has_time_filter: Whether the template includes a time-filter placeholder.
         """
         key = self.make_key(metrics, dimensions)
@@ -134,7 +129,6 @@ class SQLTemplateCache:
         self._store[key] = {
             "template": {
                 "sql_template": sql_template,
-                "time_col": time_col,
                 "has_time_filter": has_time_filter,
             },
             "expires_at": now + self._ttl,
@@ -149,8 +143,8 @@ class SQLTemplateCache:
             )
 
         logger.info(
-            "SQLTemplateCache SET for %s × %s (key %s…, time_col=%s)",
-            metrics, dimensions, key[:8], time_col,
+            "SQLTemplateCache SET for %s × %s (key %s…, parameterizable=%s)",
+            metrics, dimensions, key[:8], has_time_filter,
         )
 
     def invalidate(self, metrics: list[str], dimensions: list[str]) -> None:
@@ -178,110 +172,25 @@ class SQLTemplateCache:
 
 # ──────────────────────────────────────────────── SQL template helpers (module-level)
 
-def strip_time_filter(sql: str) -> tuple[str, str | None]:
+def parameterize_sql_dates(sql: str, start_date: str, end_date: str) -> tuple[str, bool]:
     """
-    Remove time-range WHERE predicates from a MetricFlow-compiled SQL string and
-    replace them with placeholder tokens.
-
-    MetricFlow injects time filters as one of these patterns:
-        WHERE col >= 'YYYY-MM-DD' AND col <= 'YYYY-MM-DD'
-        WHERE col BETWEEN 'YYYY-MM-DD' AND 'YYYY-MM-DD'
-        AND col >= 'YYYY-MM-DD' AND col <= 'YYYY-MM-DD'   (appended to existing WHERE)
-
-    Detects the physical time column from the known date columns in the schema.
-
-    Returns:
-        (sql_with_placeholders, time_col_name)
-        time_col_name is None when no time filter was found.
+    Replace literal date strings with {start_date} and {end_date} placeholders.
+    Returns (parameterized_sql, success_bool).
     """
-    import re
+    if start_date == end_date:
+        logger.warning("parameterize_sql_dates: start_date == end_date (%s). Cannot safely parameterize without ambiguity. Forcing miss.", start_date)
+        return sql, False
 
-    # Known physical date columns across all mart tables
-    _TIME_COLS = [
-        "period_month",
-        "payment_date",
-        "session_start",
-        "event_timestamp",
-        "signup_date",
-    ]
+    # Targeted replacement: we replace occurrences of exactly 'YYYY-MM-DD'
+    s_literal = f"'{start_date}'"
+    e_literal = f"'{end_date}'"
+    
+    # We only consider it a success if we found both bounds in the SQL
+    if s_literal not in sql or e_literal not in sql:
+        return sql, False
 
-    for col in _TIME_COLS:
-        # Pattern: col >= 'date' AND col <= 'date'  (with optional leading AND/WHERE)
-        pattern_gte_lte = re.compile(
-            r"(?:AND\s+|WHERE\s+)?"
-            + re.escape(col)
-            + r"\s*>=\s*'[^']+'\s+AND\s+"
-            + re.escape(col)
-            + r"\s*<=\s*'[^']+'",
-            re.IGNORECASE,
-        )
-        # Pattern: col BETWEEN 'date' AND 'date'
-        pattern_between = re.compile(
-            r"(?:AND\s+|WHERE\s+)?"
-            + re.escape(col)
-            + r"\s+BETWEEN\s+'[^']+'\s+AND\s+'[^']+'",
-            re.IGNORECASE,
-        )
-
-        replacement = (
-            f"{col} >= '{_DATE_PLACEHOLDER_START}' "
-            f"AND {col} <= '{_DATE_PLACEHOLDER_END}'"
-        )
-
-        new_sql, n1 = pattern_gte_lte.subn(replacement, sql)
-        if n1 > 0:
-            logger.debug("strip_time_filter: replaced >= / <= on '%s'", col)
-            return new_sql, col
-
-        new_sql, n2 = pattern_between.subn(replacement, sql)
-        if n2 > 0:
-            logger.debug("strip_time_filter: replaced BETWEEN on '%s'", col)
-            return new_sql, col
-
-    # No time filter found — return SQL unchanged with no column
-    return sql, None
-
-
-def inject_time_filter(
-    sql_template: str,
-    time_col: str,
-    start_date: str,
-    end_date: str,
-) -> str:
-    """
-    Replace placeholder tokens in a SQL template with real date literals,
-    or inject a date filter into the WHERE clause if no placeholders exist.
-
-    Injection strategy (when no placeholder is present):
-        Find the first GROUP BY / ORDER BY / HAVING / LIMIT clause and insert
-        the date predicate *before* it — not at the very end of the string.
-        This prevents the classic "unexpected WHERE after GROUP BY" syntax error.
-
-    Args:
-        sql_template: SQL with placeholder tokens (from strip_time_filter), or
-                      a clean SQL string with no time filter at all.
-        time_col:     Physical column name to filter on.
-        start_date:   Start date string (YYYY-MM-DD).
-        end_date:     End date string (YYYY-MM-DD).
-
-    Returns:
-        Final SQL with real date literals injected.
-    """
-    import re
-
-    date_filter = (
-        f"{time_col} >= '{start_date}'"
-        f" AND {time_col} <= '{end_date}'"
-    )
-
-    # ── Fast path: template already has placeholders ─────────────────────────
-    if _DATE_PLACEHOLDER_START in sql_template:
-        sql = sql_template.replace(_DATE_PLACEHOLDER_START, start_date)
-        sql = sql.replace(_DATE_PLACEHOLDER_END, end_date)
-        return sql
-
-    # If we get here, the SQL generator failed to force a cache miss, which is a bug.
-    # Return it unchanged rather than corrupting the AST with regex insertions.
-    logger.error("inject_time_filter called on template without placeholders! (time_col=%s)", time_col)
-    return sql_template
+    sql = sql.replace(s_literal, "'{start_date}'")
+    sql = sql.replace(e_literal, "'{end_date}'")
+    
+    return sql, True
 
