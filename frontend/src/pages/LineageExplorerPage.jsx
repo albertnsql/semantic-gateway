@@ -55,7 +55,7 @@ function CustomDropdown({ metrics, selected, onSelect }) {
       >
         <span>
           {selectedMetric ? (
-            <><span className="font-bold text-white">{selectedMetric.name}</span> <span className="text-white/80">— {selectedMetric.label}</span></>
+            <><span className="font-bold text-white">{selectedMetric.name}</span> <span className="font-bold text-white/90">— {selectedMetric.label}</span></>
           ) : '— Choose a metric —'}
         </span>
         <ChevronDown
@@ -196,7 +196,7 @@ export default function LineageExplorerPage() {
               style={{ background: 'rgba(255,255,255,0.65)', boxShadow: CLAY_SHADOW }}
             >
               <span className="text-xs text-[#4A7B76] font-bold uppercase tracking-wide block mb-2" style={{ fontFamily: 'DM Sans, sans-serif' }}>Source Model</span>
-              <code className="text-sm text-[#4A7B76] font-mono">{lineage.source_model}</code>
+              <code className="text-sm text-[#4A7B76] font-mono font-bold">{lineage.source_model}</code>
             </div>
 
             <div
@@ -261,7 +261,7 @@ export default function LineageExplorerPage() {
                       >
                         <td className="px-5 py-3 text-[#4A7B76] font-mono text-xs">{i + 1}</td>
                         <td className="px-5 py-3">
-                          <code className="text-xs font-mono text-[#1A3A38]">{s.model_name}</code>
+                          <code className="text-xs font-mono font-bold text-[#1A3A38]">{s.model_name}</code>
                         </td>
                         <td className="px-5 py-3">
                           <StatusBadge status="info" label={s.layer ?? inferLayer(s.model_name, false)} />
@@ -294,7 +294,7 @@ export default function LineageExplorerPage() {
                 {lineage.source_tables.map((t) => (
                   <code
                     key={t}
-                    className="px-4 py-1.5 rounded-[20px] text-xs text-[#1A3A38] font-mono backdrop-blur-xl"
+                    className="px-4 py-1.5 rounded-[20px] text-xs text-[#1A3A38] font-bold font-mono backdrop-blur-xl"
                     style={{ background: 'rgba(255,255,255,0.80)', boxShadow: CLAY_SHADOW }}
                   >
                     {t}
