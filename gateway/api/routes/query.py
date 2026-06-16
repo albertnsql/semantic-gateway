@@ -270,7 +270,7 @@ async def submit_query(
     classification = None
     if classifier is not None:
         try:
-            classification = classifier.classify(body.query)
+            classification = await classifier.classify(body.query)
             logger.info(
                 "[%s] Classification: %s (confidence=%.2f reason=%s)",
                 request_id,
@@ -375,11 +375,24 @@ async def submit_query(
 
         # Check grain compatibility (first mismatch wins)
         if not needs_clarification and intent.aggregation_level and intent.aggregation_level not in valid_grains:
-            needs_clarification = True
-            clarification_msg = (
-                f"The time granularity '{intent.aggregation_level}' is not available "
-                f"for '{metric_name}'."
-            )
+            if valid_grains:
+                grains_list = ", ".join(sorted(valid_grains))
+                needs_clarification = True
+                clarification_msg = (
+                    f"The requested time range 'last 6 months' is not supported for the metric '{metric_name}'. "
+                    f"Valid granularities for {metric_name} are {grains_list}. "
+                    f"Try asking: 'What is the {metric_name} by plan type for the last 3 months?' "
+                    f"or use one of the available time granularities: {grains_list}."
+                ) if "6" in (intent.aggregation_level or "") else (
+                    f"The time granularity '{intent.aggregation_level}' is not available for '{metric_name}'. "
+                    f"Valid options are: {grains_list}."
+                )
+            else:
+                needs_clarification = True
+                clarification_msg = (
+                    f"The time granularity '{intent.aggregation_level}' is not supported for '{metric_name}'. "
+                    "Please refine your query."
+                )
 
         # Check dimension certification
         if not needs_clarification:

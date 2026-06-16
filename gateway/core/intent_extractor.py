@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date, timedelta
 
 from openai import OpenAI
@@ -251,20 +252,34 @@ class IntentExtractor:
         # Resolve relative time ranges to absolute dates
         parsed = self._resolve_time_range(parsed, today_str)
 
-        # Map common NLU time grains to MetricFlow grains just in case the LLM ignored instructions
+        # Normalise aggregation_level: map verbose/LLM-invented strings to
+        # the MetricFlow grain names (month / week / day / year).
+        # Uses a two-pass approach:
+        #   1. Exact-match lookup for well-known aliases.
+        #   2. Regex extraction for patterns like "13 months", "90 days", etc.
+        #      where the LLM erroneously stuffed a duration into aggregation_level.
         if parsed.get("aggregation_level"):
-            mapping = {
-                "monthly": "month",
-                "weekly": "week",
-                "daily": "day",
-                "yearly": "year",
-                "period_month": "month",
-                "period_day": "day",
-                "period_week": "week",
-                "period_year": "year",
+            _AL = parsed["aggregation_level"]
+            _ALIAS_MAP = {
+                "monthly": "month", "weekly": "week",
+                "daily": "day",    "yearly": "year",
+                "period_month": "month", "period_day": "day",
+                "period_week": "week",   "period_year": "year",
+                "semi-annual": "month",  "semiannual": "month",
+                "bimonthly": "month",    "quarterly": "quarter",
             }
-            if parsed["aggregation_level"] in mapping:
-                parsed["aggregation_level"] = mapping[parsed["aggregation_level"]]
+            if _AL in _ALIAS_MAP:
+                parsed["aggregation_level"] = _ALIAS_MAP[_AL]
+            else:
+                # Regex: e.g. "13 months", "last_6_months", "90_days", "2weeks"
+                _unit_match = re.search(
+                    r"(month|week|day|year)", _AL, re.IGNORECASE
+                )
+                if _unit_match:
+                    # Normalise the unit word to the MetricFlow grain
+                    _unit = _unit_match.group(1).lower()
+                    parsed["aggregation_level"] = _unit  # already singular
+                # If nothing matches, leave as-is and let grain validation handle it
 
         try:
             intent = QueryIntent(
@@ -447,14 +462,23 @@ Your job is to extract structured query intent from natural language analytics q
 {_data_reference_block}
 {_dashboard_context_block}
 ## TIME RANGE RESOLUTION:
-- "last 30 days" → relative: "last_30_days", compute start_date as today-30d
-- "last 3 months" → relative: "last_3_months", compute start_date as today-90d
-- "last month" → relative: "last_month", start_date = first day of last month
-- "last year" → relative: "last_year", start_date = today-365d
-- "this year" → relative: "this_year", start_date = first day of current year
-- "last quarter" → relative: "last_quarter"
-- If a specific date range is mentioned, parse it directly
+For ANY "last N <unit>" phrase (where N is any number and unit is days/weeks/months/years),
+set relative to "last_N_<unit>s" format. Examples:
+- "last 30 days"   → relative: "last_30_days"
+- "last 3 months"  → relative: "last_3_months"
+- "last 6 months"  → relative: "last_6_months"
+- "last 13 months" → relative: "last_13_months"
+- "last 2 weeks"   → relative: "last_2_weeks"
+- "last 2 years"   → relative: "last_2_years"
+- "last month"     → relative: "last_month" (first day of previous calendar month)
+- "last year"      → relative: "last_year" (today minus 365 days)
+- "this year"      → relative: "this_year" (Jan 1st of current year)
+- "last quarter"   → relative: "last_quarter" (today minus 90 days)
+- If a specific date range is mentioned, parse it directly into start_date/end_date
 - If no time range is mentioned, set time_range to null
+
+For aggregation_level, always use the base grain word: "month", "week", "day", or "year".
+Never put a duration (e.g. "6 months") in aggregation_level.
 
 ## OUTPUT JSON SCHEMA:
 {schema}
@@ -477,43 +501,88 @@ Output:
     def _resolve_time_range(self, parsed: dict, today_str: str) -> dict:
         """
         Fill in missing start_date/end_date for relative time range references.
-        Modifies the parsed dict in place and returns it.
+
+        Handles both named ranges (last_month, this_year …) and the general
+        ``last_N_<unit>s`` pattern produced for any arbitrary duration the user
+        mentions (e.g. "last 13 months", "last 90 days", "last 2 weeks").
+
+        Resolution order:
+          1. Named aliases  (last_month, last_year, this_year, last_quarter)
+          2. Regex pattern  last_N_(days|weeks|months|years)  — any N
+          3. Fallback       last 30 days (same as before)
         """
         # Guard against malformed LLM response
         if not isinstance(parsed, dict):
-            logger.warning(f"_resolve_time_range: expected dict, got {type(parsed)}. Resetting.")
+            logger.warning(
+                "_resolve_time_range: expected dict, got %s. Resetting.", type(parsed)
+            )
             parsed = {"metrics": [], "dims": [], "time_range": None}
-            
+
         tr = parsed.get("time_range")
         if not tr:
             return parsed
 
         today = date.fromisoformat(today_str)
-        relative = tr.get("relative", "")
+        relative = (tr.get("relative") or "").strip().lower()
 
         if not tr.get("start_date") or not tr.get("end_date"):
-            if relative == "last_30_days":
-                tr["start_date"] = (today - timedelta(days=30)).isoformat()
-                tr["end_date"] = today_str
-            elif relative in ("last_3_months", "last_quarter"):
-                tr["start_date"] = (today - timedelta(days=90)).isoformat()
-                tr["end_date"] = today_str
-            elif relative == "last_month":
+
+            # ── Named aliases ─────────────────────────────────────────────────
+            if relative == "last_month":
                 first_of_month = today.replace(day=1)
                 last_month_end = first_of_month - timedelta(days=1)
-                last_month_start = last_month_end.replace(day=1)
-                tr["start_date"] = last_month_start.isoformat()
-                tr["end_date"] = last_month_end.isoformat()
-            elif relative == "last_year":
+                tr["start_date"] = last_month_end.replace(day=1).isoformat()
+                tr["end_date"]   = last_month_end.isoformat()
+
+            elif relative in ("last_year", "last_365_days"):
                 tr["start_date"] = (today - timedelta(days=365)).isoformat()
-                tr["end_date"] = today_str
+                tr["end_date"]   = today_str
+
             elif relative == "this_year":
                 tr["start_date"] = today.replace(month=1, day=1).isoformat()
-                tr["end_date"] = today_str
+                tr["end_date"]   = today_str
+
+            elif relative in ("last_quarter", "last_3_months"):
+                tr["start_date"] = (today - timedelta(days=90)).isoformat()
+                tr["end_date"]   = today_str
+
             else:
-                # Default: last 30 days
-                tr["start_date"] = (today - timedelta(days=30)).isoformat()
-                tr["end_date"] = today_str
+                # ── General pattern: last_N_days / last_N_weeks /
+                #                    last_N_months / last_N_years
+                # Also matches variants the LLM might emit:
+                #   "last_13_months", "last_30_days", "last_2_years", etc.
+                _pattern = re.match(
+                    r"last[_\s](\d+)[_\s]?(day|week|month|year)s?",
+                    relative,
+                    re.IGNORECASE,
+                )
+                if _pattern:
+                    n    = int(_pattern.group(1))
+                    unit = _pattern.group(2).lower()
+                    if unit == "day":
+                        delta = timedelta(days=n)
+                    elif unit == "week":
+                        delta = timedelta(weeks=n)
+                    elif unit == "month":
+                        # Approximate: 1 month ≈ 30 days
+                        delta = timedelta(days=n * 30)
+                    else:  # year
+                        delta = timedelta(days=n * 365)
+                    tr["start_date"] = (today - delta).isoformat()
+                    tr["end_date"]   = today_str
+                    logger.info(
+                        "_resolve_time_range: resolved '%s' → %s to %s",
+                        relative, tr["start_date"], tr["end_date"],
+                    )
+                else:
+                    # Truly unknown — default to last 30 days and log it
+                    logger.warning(
+                        "_resolve_time_range: unrecognised relative '%s' — "
+                        "defaulting to last 30 days.",
+                        relative,
+                    )
+                    tr["start_date"] = (today - timedelta(days=30)).isoformat()
+                    tr["end_date"]   = today_str
 
         parsed["time_range"] = tr
         return parsed

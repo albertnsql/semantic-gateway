@@ -10,6 +10,7 @@ import { postQuery } from '../api/query';
 
 const CLAY_SHADOW = `16px 16px 32px rgba(13,148,136,0.12), -10px -10px 24px rgba(255,255,255,0.9), inset 6px 6px 12px rgba(13,148,136,0.04), inset -6px -6px 12px rgba(255,255,255,1)`;
 const CLAY_INSET  = `inset 8px 8px 16px rgba(13,148,136,0.08), inset -8px -8px 16px rgba(255,255,255,0.9)`;
+const CLAY_SHADOW_PRIMARY = `12px 12px 24px rgba(13, 148, 136, 0.25), -8px -8px 16px rgba(255, 255, 255, 0.5), inset 4px 4px 8px rgba(255, 255, 255, 0.3), inset -4px -4px 8px rgba(0, 0, 0, 0.1)`;
 
 const EXAMPLE_QUERIES = [
   'What is the MRR by plan type for the last 3 months?',
@@ -209,7 +210,7 @@ export default function QueryPage() {
                       {/* User message bubble */}
                       <div 
                         className="self-end max-w-[75%] px-6 py-4 rounded-[32px] rounded-br-[8px]" 
-                        style={{ background: 'linear-gradient(135deg, #2DD4BF, #0D9488)', boxShadow: CLAY_SHADOW }}
+                        style={{ background: 'linear-gradient(135deg, #2DD4BF, #0D9488)', boxShadow: CLAY_SHADOW_PRIMARY }}
                       >
                         <p className="text-[15px] leading-relaxed text-white font-medium" style={{ fontFamily: 'DM Sans, sans-serif' }}>
                           {item.query}

@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
 
 from classifier import IntentClassifier, QueryType, build_out_of_scope_suggestion
 
@@ -69,30 +70,33 @@ class TestExtractRetryAfter:
 
 
 class TestSleepRetryAfter:
-    """Tests that _sleep_retry_after respects the cap."""
+    """Tests that _sleep_retry_after respects the cap and uses asyncio.sleep."""
 
-    def test_sleeps_for_detected_delay(self):
+    @pytest.mark.asyncio
+    async def test_sleeps_for_detected_delay(self):
         clf = IntentClassifier(llm_client=None, model="x")
         exc = Exception("retry in 5s")
-        with patch("time.sleep") as mock_sleep:
-            clf._sleep_retry_after(exc)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await clf._sleep_retry_after(exc)
         mock_sleep.assert_called_once_with(5.0)
 
-    def test_cap_is_respected(self):
+    @pytest.mark.asyncio
+    async def test_cap_is_respected(self):
         """Delays longer than _MAX_RETRY_SLEEP_S should be capped."""
         clf = IntentClassifier(llm_client=None, model="x")
         exc = Exception("retry in 999s")
-        with patch("time.sleep") as mock_sleep:
-            clf._sleep_retry_after(exc)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await clf._sleep_retry_after(exc)
         called_with = mock_sleep.call_args[0][0]
         assert called_with == IntentClassifier._MAX_RETRY_SLEEP_S
 
-    def test_no_sleep_when_no_retry_hint(self):
-        """If no retry hint is present, time.sleep should not be called."""
+    @pytest.mark.asyncio
+    async def test_no_sleep_when_no_retry_hint(self):
+        """If no retry hint is present, asyncio.sleep should not be called."""
         clf = IntentClassifier(llm_client=None, model="x")
         exc = Exception("Some other error with no retry info")
-        with patch("time.sleep") as mock_sleep:
-            clf._sleep_retry_after(exc)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await clf._sleep_retry_after(exc)
         mock_sleep.assert_not_called()
 
 
@@ -100,15 +104,17 @@ class TestSleepRetryAfter:
 
 
 class TestClassify:
-    """Tests for IntentClassifier.classify()."""
+    """Tests for IntentClassifier.classify() — now async."""
 
-    def test_defaults_to_metric_query_when_no_client(self):
+    @pytest.mark.asyncio
+    async def test_defaults_to_metric_query_when_no_client(self):
         """No LLM client → always returns METRIC_QUERY without crashing."""
         clf = IntentClassifier(llm_client=None, model="any-model")
-        result = clf.classify("Why did MRR drop?")
+        result = await clf.classify("Why did MRR drop?")
         assert result["query_type"] == QueryType.METRIC_QUERY
 
-    def test_parses_metric_query_response(self):
+    @pytest.mark.asyncio
+    async def test_parses_metric_query_response(self):
         """LLM returns a valid metric_query JSON → correctly parsed."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = SimpleNamespace(
@@ -125,11 +131,12 @@ class TestClassify:
             ]
         )
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("Show me MRR by plan type")
+        result = await clf.classify("Show me MRR by plan type")
         assert result["query_type"] == QueryType.METRIC_QUERY
         assert result["confidence"] == 0.95
 
-    def test_parses_schema_question_response(self):
+    @pytest.mark.asyncio
+    async def test_parses_schema_question_response(self):
         """LLM returns schema_question → correctly mapped."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = SimpleNamespace(
@@ -146,10 +153,11 @@ class TestClassify:
             ]
         )
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("What metrics do you have?")
+        result = await clf.classify("What metrics do you have?")
         assert result["query_type"] == QueryType.SCHEMA_QUESTION
 
-    def test_parses_out_of_scope_response(self):
+    @pytest.mark.asyncio
+    async def test_parses_out_of_scope_response(self):
         """LLM returns out_of_scope → correctly mapped."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = SimpleNamespace(
@@ -166,10 +174,11 @@ class TestClassify:
             ]
         )
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("What will MRR be next quarter?")
+        result = await clf.classify("What will MRR be next quarter?")
         assert result["query_type"] == QueryType.OUT_OF_SCOPE
 
-    def test_falls_back_on_invalid_json(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_on_invalid_json(self):
         """LLM returns non-JSON → must default to METRIC_QUERY, not raise."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = SimpleNamespace(
@@ -180,10 +189,11 @@ class TestClassify:
             ]
         )
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("anything")
+        result = await clf.classify("anything")
         assert result["query_type"] == QueryType.METRIC_QUERY
 
-    def test_falls_back_on_unknown_query_type(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_on_unknown_query_type(self):
         """LLM returns unrecognised query_type → defaults to METRIC_QUERY."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = SimpleNamespace(
@@ -200,18 +210,21 @@ class TestClassify:
             ]
         )
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("test")
+        result = await clf.classify("test")
         assert result["query_type"] == QueryType.METRIC_QUERY
 
-    def test_falls_back_on_api_exception(self):
+    @pytest.mark.asyncio
+    async def test_falls_back_on_api_exception(self):
         """If the LLM call raises, return METRIC_QUERY default, don't propagate."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = RuntimeError("network error")
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("What is MRR?")
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await clf.classify("What is MRR?")
         assert result["query_type"] == QueryType.METRIC_QUERY
 
-    def test_strips_markdown_fences(self):
+    @pytest.mark.asyncio
+    async def test_strips_markdown_fences(self):
         """LLM wraps JSON in ```json ... ``` fences → still parsed correctly."""
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = SimpleNamespace(
@@ -224,7 +237,24 @@ class TestClassify:
             ]
         )
         clf = IntentClassifier(llm_client=mock_client, model="test-model")
-        result = clf.classify("Show me churn")
+        result = await clf.classify("Show me churn")
+        assert result["query_type"] == QueryType.METRIC_QUERY
+
+    @pytest.mark.asyncio
+    async def test_no_blocking_sleep_on_rate_limit(self):
+        """On 429, asyncio.sleep is awaited (not time.sleep) — event loop stays free."""
+        import time
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = Exception(
+            "Error code: 429 - Please retry in 10s."
+        )
+        clf = IntentClassifier(llm_client=mock_client, model="test-model")
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_async_sleep, \
+             patch("time.sleep") as mock_sync_sleep:
+            result = await clf.classify("Show me MRR")
+        # asyncio.sleep should be called, time.sleep should NOT
+        mock_async_sleep.assert_called_once_with(10.0)
+        mock_sync_sleep.assert_not_called()
         assert result["query_type"] == QueryType.METRIC_QUERY
 
 

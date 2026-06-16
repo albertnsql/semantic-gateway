@@ -18,6 +18,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -98,11 +99,14 @@ Respond with ONLY a JSON object, no other text:
                 pass
         return None
 
-    def _sleep_retry_after(self, exc: Exception) -> None:
+    async def _sleep_retry_after(self, exc: Exception) -> None:
         """
         If the exception carries a Retry-After hint, sleep for that duration
         (capped at _MAX_RETRY_SLEEP_S) so the next request doesn't immediately
         hit the same rate-limit wall.
+
+        Uses asyncio.sleep() so the Uvicorn event loop is never blocked —
+        other requests continue to be served during the back-off window.
         """
         delay = self._extract_retry_after(exc)
         if delay is not None:
@@ -112,14 +116,20 @@ Respond with ONLY a JSON object, no other text:
                 "(retry-after=%.1f s, cap=%.0f s).",
                 capped, delay, self._MAX_RETRY_SLEEP_S,
             )
-            time.sleep(capped)
+            await asyncio.sleep(capped)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def classify(self, question: str) -> dict:
-        """Classify a question into METRIC_QUERY, SCHEMA_QUESTION, or OUT_OF_SCOPE."""
+    async def classify(self, question: str) -> dict:
+        """
+        Classify a question into METRIC_QUERY, SCHEMA_QUESTION, or OUT_OF_SCOPE.
+
+        This method is async so that any 429 rate-limit back-off uses
+        asyncio.sleep() rather than time.sleep(), keeping the Uvicorn event
+        loop free to serve other requests during the wait.
+        """
         _DEFAULT = {
             "query_type": QueryType.METRIC_QUERY,
             "confidence": 0.5,
@@ -160,7 +170,8 @@ Respond with ONLY a JSON object, no other text:
             logger.warning("IntentClassifier LLM call failed (%s) — defaulting to METRIC_QUERY.", exc)
             # Honour the Retry-After delay so the very next request doesn't
             # immediately slam into the same rate-limit wall.
-            self._sleep_retry_after(exc)
+            # Uses asyncio.sleep() — does NOT block the event loop.
+            await self._sleep_retry_after(exc)
             return _DEFAULT
 
 
