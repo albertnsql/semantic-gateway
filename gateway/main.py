@@ -120,7 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── 4.5. SQL Template Cache (skips MetricFlow subprocess on repeat metric/dim combos) ──
     sql_template_cache = SQLTemplateCache(
         ttl_seconds=settings.sql_template_cache_ttl_seconds,
-        maxsize=200,
+        maxsize=settings.sql_template_cache_maxsize,
     )
     sql_generator._template_cache = sql_template_cache  # inject after construction
     logger.info(
@@ -174,9 +174,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # ── 6. Query result cache ────────────────────────────────────────────────
     _ttl = settings.cache_ttl_seconds
-    query_cache = QueryCache(ttl_seconds=_ttl, disk_path="./.query_cache.json")
+    query_cache = QueryCache(
+        ttl_seconds=_ttl,
+        maxsize=settings.query_cache_maxsize,
+        disk_path="./.query_cache.json",
+    )
     app.state.query_cache = query_cache
-    logger.info("✓ Query cache initialized (TTL: %ds, Disk: ./.query_cache.json).", _ttl)
+    logger.info(
+        "✓ Query cache initialized (TTL: %ds, maxsize: %d, Disk: ./.query_cache.json).",
+        _ttl,
+        settings.query_cache_maxsize,
+    )
 
     # ── 7. Intent classifier (two-stage routing) ───────────────────────────
     try:

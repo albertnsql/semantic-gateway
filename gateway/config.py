@@ -69,6 +69,19 @@ class Settings(BaseSettings):
     sql_template_cache_ttl_seconds: int = 86400  # Compiled SQL template TTL (default: 24 h)
     # Templates change only when the dbt semantic model is redeployed (gateway restart),
     # so a longer TTL is safe and avoids re-running MetricFlow unnecessarily.
+
+    # --------------------------------------------------------- Memory / capacity
+    # These caps protect against OOM on memory-constrained hosts (e.g. Render free tier
+    # which provides 512 MB RAM). Tune them via environment variables:
+    #
+    #   QUERY_CACHE_MAXSIZE=100        (full-tier default: 500)
+    #   SQL_TEMPLATE_CACHE_MAXSIZE=50  (full-tier default: 200)
+    #
+    # Rule of thumb for Render free tier:
+    #   query_cache_maxsize   ≤ 100  (each entry ~8 KB JSON payload)
+    #   sql_template_cache_maxsize ≤ 50  (each entry ~4 KB SQL string)
+    query_cache_maxsize: int = 500           # lower to 100 on 512 MB hosts
+    sql_template_cache_maxsize: int = 200    # lower to 50  on 512 MB hosts
     
     warmup_matrix: dict[str, list[str]] = {
         # MetricFlow-validated dimension names only.
@@ -78,6 +91,16 @@ class Settings(BaseSettings):
         #   session__      → fct_stream_sessions / session entity
         #   event__        → stg_recommendation_events / event entity
         #   payment__      → fct_payments / payment entity
+        #
+        # ⚠ On Render free tier (512 MB RAM): keep this to ≤ 6 total combinations.
+        # Each warm-up entry forks a MetricFlow subprocess (~80 MB spike each).
+        # The entries below (9 combos) are safe for 1 GB+ hosts. Trim to the
+        # commented-out subset for 512 MB:
+        #
+        # Render-safe subset (6 combos — comment the rest out):
+        #   "mrr":               ["subscription__plan_type", "subscriber__country"]
+        #   "total_subscribers": ["subscriber__plan_type"]
+        #   "churn_rate":        ["subscriber__plan_type"]
         "mrr":                   ["subscription__plan_type", "subscriber__country", "subscriber__cohort_month"],
         "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
         "churn_rate":            ["subscriber__plan_type", "subscriber__country", "subscriber__churn_reason"],

@@ -33,6 +33,7 @@ from core.exceptions import SnowflakeConnectionError, SQLGenerationError
 from core.sql_template_cache import (
     SQLTemplateCache,
     parameterize_sql_dates,
+    restore_sql_dates,
 )
 
 import importlib.util
@@ -290,17 +291,23 @@ class SQLGenerator:
 
                 if intent.time_range:
                     if not cached_tpl.get("has_time_filter", False):
-                        # We cannot safely inject dates into a query that wasn't compiled with them
-                        # Force a miss.
+                        # Template was stored without time-filter placeholders —
+                        # force a MetricFlow re-run so we get a properly dated query.
                         compiled_sql = None
                         logger.info("SQLTemplateCache MISS — template lacks time filter placeholders.")
                     else:
-                        # Template has a placeholder — inject the requested dates
-                        compiled_sql = tpl_sql.replace("{start_date}", intent.time_range.start_date)
-                        compiled_sql = compiled_sql.replace("{end_date}", intent.time_range.end_date)
+                        # Restore date literals using the same wrapper style that
+                        # MetricFlow used when the template was first compiled.
+                        compiled_sql = restore_sql_dates(
+                            tpl_sql,
+                            intent.time_range.start_date,
+                            intent.time_range.end_date,
+                            style=cached_tpl.get("date_style", "plain"),
+                        )
                         logger.info(
-                            "SQLTemplateCache HIT (parameterized) — skipping MetricFlow. Executing SQL directly. "
+                            "SQLTemplateCache HIT (parameterized, style=%s) — skipping MetricFlow. "
                             "Injected %s..%s.",
+                            cached_tpl.get("date_style", "plain"),
                             intent.time_range.start_date,
                             intent.time_range.end_date,
                         )
@@ -365,12 +372,15 @@ class SQLGenerator:
                 try:
                     sql_template = compiled_sql
                     has_placeholder = False
+                    date_style = "plain"
 
                     if intent.time_range:
-                        sql_template, has_placeholder = parameterize_sql_dates(
-                            compiled_sql, 
-                            intent.time_range.start_date, 
-                            intent.time_range.end_date
+                        # parameterize_sql_dates now returns a 3-tuple:
+                        # (parameterized_sql, success_bool, style_str)
+                        sql_template, has_placeholder, date_style = parameterize_sql_dates(
+                            compiled_sql,
+                            intent.time_range.start_date,
+                            intent.time_range.end_date,
                         )
 
                     self._template_cache.set(
@@ -378,6 +388,7 @@ class SQLGenerator:
                         intent.dimensions,
                         sql_template,
                         has_placeholder,
+                        date_style=date_style,
                     )
                 except Exception as tpl_exc:
                     logger.warning(
