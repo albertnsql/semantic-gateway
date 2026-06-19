@@ -2,16 +2,17 @@ import React from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   LayoutDashboard, MessageSquare, BarChart3, GitBranch,
-  Play, Terminal, PieChart,
+  Play, Terminal, PieChart, BookOpen,
 } from 'lucide-react';
 
 const NAV_ITEMS = [
-  { path: '/',          label: 'Overview',         icon: LayoutDashboard },
-  { path: '/dashboard', label: 'Dashboard',         icon: PieChart },
-  { path: '/query',     label: 'Query Interface',   icon: MessageSquare, dot: true },
-  { path: '/metrics',   label: 'Metrics Catalog',   icon: BarChart3 },
-  { path: '/lineage',   label: 'Lineage Explorer',  icon: GitBranch },
-  { path: '/demo',      label: 'Demo Scenarios',    icon: Play },
+  { path: '/',              label: 'Overview',         icon: LayoutDashboard },
+  { path: '/how-it-works',  label: 'How It Works',     icon: BookOpen },
+  { path: '/dashboard',     label: 'Dashboard',        icon: PieChart },
+  { path: '/query',         label: 'Query Interface',  icon: MessageSquare, dot: true },
+  { path: '/metrics',       label: 'Metrics Catalog',  icon: BarChart3 },
+  { path: '/lineage',       label: 'Lineage Explorer', icon: GitBranch },
+  { path: '/demo',          label: 'Demo Scenarios',   icon: Play },
 ];
 
 export default function Sidebar({ apiHealthy }) {

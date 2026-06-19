@@ -11,6 +11,7 @@ import DashboardPage        from './pages/DashboardPage';
 import MetricsCatalogPage   from './pages/MetricsCatalogPage';
 import LineageExplorerPage  from './pages/LineageExplorerPage';
 import DemoScenariosPage    from './pages/DemoScenariosPage';
+import HowItWorksPage       from './pages/HowItWorksPage';
 import { getHealth } from './api/metrics';
 
 function Layout({ children, apiHealthy }) {
@@ -76,12 +77,13 @@ export default function App() {
     <BrowserRouter>
       <Layout apiHealthy={apiHealthy}>
         <Routes>
-          <Route path="/"        element={<LandingPage />} />
-          <Route path="/dashboard" element={<DashboardPage />} />
-          <Route path="/query"   element={<QueryPage />} />
-          <Route path="/metrics" element={<MetricsCatalogPage />} />
-          <Route path="/lineage" element={<LineageExplorerPage />} />
-          <Route path="/demo"    element={<DemoScenariosPage />} />
+          <Route path="/"            element={<LandingPage />} />
+          <Route path="/how-it-works" element={<HowItWorksPage />} />
+          <Route path="/dashboard"    element={<DashboardPage />} />
+          <Route path="/query"        element={<QueryPage />} />
+          <Route path="/metrics"      element={<MetricsCatalogPage />} />
+          <Route path="/lineage"      element={<LineageExplorerPage />} />
+          <Route path="/demo"         element={<DemoScenariosPage />} />
           {/* Catch-all redirect to overview */}
           <Route path="*"        element={<LandingPage />} />
         </Routes>

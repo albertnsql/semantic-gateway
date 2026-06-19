@@ -4,7 +4,7 @@
 import { Link } from 'react-router-dom';
 import {
   Database, Server, Code2, Layers, Shield, Cpu, Monitor,
-  XCircle, CheckCircle2, ArrowRight,
+  XCircle, CheckCircle2, ArrowRight, BookOpen,
 } from 'lucide-react';
 import TopBar from '../components/TopBar';
 
@@ -116,6 +116,14 @@ export default function LandingPage() {
           >
             View Demo Scenarios →
           </Link>
+          <Link
+            to="/how-it-works"
+            className="flex items-center gap-2 text-[#0D9488] hover:text-[#0891B2] text-sm font-bold transition-colors mt-2 sm:mt-0 ml-2"
+            style={{ fontFamily: 'DM Sans, sans-serif' }}
+          >
+            <BookOpen size={14} />
+            Learn How It Works →
+          </Link>
         </div>
       </section>
 
@@ -137,6 +145,14 @@ export default function LandingPage() {
           <p className="text-[#4A7B76] text-sm" style={{ fontFamily: 'DM Sans, sans-serif' }}>
             Natural language in → governed, lineage-traced results out
           </p>
+          <Link
+            to="/how-it-works"
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-[#0D9488] hover:text-[#0891B2] transition-colors mt-3"
+            style={{ fontFamily: 'DM Sans, sans-serif' }}
+          >
+            <BookOpen size={13} />
+            Learn How It Works — step by step →
+          </Link>
         </div>
 
         <div className="pb-4 pt-2 px-2 w-full">
