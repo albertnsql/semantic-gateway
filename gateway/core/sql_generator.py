@@ -291,46 +291,42 @@ class SQLGenerator:
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
 
-                if intent.time_range:
-                    if not cached_tpl.get("has_time_filter", False):
-                        # Template was stored without time-filter placeholders —
-                        # force a MetricFlow re-run so we get a properly dated query.
+                if cached_tpl.get("has_time_filter", False):
+                    # Template requires dates. If the user didn't provide any (all-time),
+                    # we inject a massive date range to simulate all-time without breaking the SQL.
+                    _req_start = intent.time_range.start_date if intent.time_range else "2000-01-01"
+                    _req_end = intent.time_range.end_date if intent.time_range else "2099-12-31"
+
+                    _primary_metric = intent.metrics[0] if intent.metrics else ""
+                    _time_col = SQLGenerator._METRIC_TIME_COL.get(_primary_metric, "")
+                    
+                    _sql_start = apply_grain_rounding(_req_start, _time_col, is_start=True)
+                    _sql_end = apply_grain_rounding(_req_end, _time_col, is_start=False)
+                    
+                    compiled_sql = restore_sql_dates(
+                        tpl_sql,
+                        _sql_start,
+                        _sql_end,
+                        style=cached_tpl.get("date_style", "plain"),
+                    )
+                    logger.info(
+                        "SQLTemplateCache HIT (parameterized, style=%s) — skipping MetricFlow. "
+                        "User requested %s..%s → grain-adjusted %s..%s.",
+                        cached_tpl.get("date_style", "plain"),
+                        _req_start, _req_end, _sql_start, _sql_end
+                    )
+                    used_template_cache = True
+                else:
+                    if intent.time_range:
+                        # User wants dates, but template lacks placeholders.
+                        # Force a MetricFlow re-run to get a properly dated query.
                         compiled_sql = None
                         logger.info("SQLTemplateCache MISS — template lacks time filter placeholders.")
                     else:
-                        # Compute grain-adjusted dates matching what MetricFlow
-                        # embedded when the template was first compiled.
-                        # e.g. mrr (monthly grain): 2026-03-19 → 2026-03-01
-                        #                           2026-06-19 → 2026-07-01
-                        _primary_metric = intent.metrics[0] if intent.metrics else ""
-                        _time_col = SQLGenerator._METRIC_TIME_COL.get(_primary_metric, "")
-                        _sql_start = apply_grain_rounding(
-                            intent.time_range.start_date, _time_col, is_start=True
-                        )
-                        _sql_end = apply_grain_rounding(
-                            intent.time_range.end_date, _time_col, is_start=False
-                        )
-                        compiled_sql = restore_sql_dates(
-                            tpl_sql,
-                            _sql_start,
-                            _sql_end,
-                            style=cached_tpl.get("date_style", "plain"),
-                        )
-                        logger.info(
-                            "SQLTemplateCache HIT (parameterized, style=%s) — skipping MetricFlow. "
-                            "User %s..%s → grain-adjusted %s..%s.",
-                            cached_tpl.get("date_style", "plain"),
-                            intent.time_range.start_date,
-                            intent.time_range.end_date,
-                            _sql_start,
-                            _sql_end,
-                        )
+                        # User wants no dates, and template has no dates. Use as-is.
+                        compiled_sql = tpl_sql
+                        logger.info("SQLTemplateCache HIT — no time range injection needed.")
                         used_template_cache = True
-                else:
-                    # No time range requested — use as-is
-                    compiled_sql = tpl_sql
-                    logger.info("SQLTemplateCache HIT — no time range injection needed.")
-                    used_template_cache = True
 
         # ── MetricFlow subprocess & Speculative LLM Review ───────────
         mf_command = ""

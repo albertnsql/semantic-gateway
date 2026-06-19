@@ -72,8 +72,8 @@ class CacheWarmer:
                     logger.info("[CacheWarmer] Warm-up cancelled by shutdown.")
                     return
                 
-                # Construct intent
-                intent = QueryIntent(
+                # Construct intent FOR L2 CACHE KEY (no time range)
+                intent_key = QueryIntent(
                     original_query=f"Show {metric} by {dim}",
                     metrics=[metric],
                     dimensions=[dim],
@@ -82,7 +82,7 @@ class CacheWarmer:
                     filters=[]
                 )
                 
-                intent_dict = self._intent_to_dict(intent)
+                intent_dict = self._intent_to_dict(intent_key)
                 
                 # Check if already cached
                 if self.query_cache.get(intent_dict) is not None:
@@ -90,11 +90,26 @@ class CacheWarmer:
                     logger.info("[CacheWarmer] SKIP %s × %s — already cached", metric, dim)
                     continue
 
+                # Construct intent FOR METRICFLOW (with wide time range to force parameterizable template)
+                from core.intent_extractor import TimeRange
+                intent_exec = QueryIntent(
+                    original_query=f"Show {metric} by {dim} (warmup)",
+                    metrics=[metric],
+                    dimensions=[dim],
+                    time_range=TimeRange(
+                        start_date="2000-01-01",
+                        end_date="2099-12-31",
+                        relative="all time"
+                    ),
+                    aggregation_level=None,
+                    filters=[]
+                )
+
                 # Execute pipeline
                 start_time_single = time.perf_counter()
                 try:
-                    # 2. SQL Generation (bypass semantic validation as WARMUP_MATRIX is pre-certified)
-                    gen_query = self.sql_gen.generate(intent, None)
+                    # 2. SQL Generation using the wide time range to get a parameterized template
+                    gen_query = self.sql_gen.generate(intent_exec, None)
                     
                     # 3. Snowflake execution (max 500 rows to match UI default)
                     all_rows = self.sql_gen.execute_query(gen_query.compiled_sql)
@@ -106,9 +121,9 @@ class CacheWarmer:
                         "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                         "status": "success",
                         "query": {
-                            "original": intent.original_query,
-                            "interpreted_metrics": intent.metrics,
-                            "interpreted_dimensions": intent.dimensions,
+                            "original": intent_key.original_query,
+                            "interpreted_metrics": intent_key.metrics,
+                            "interpreted_dimensions": intent_key.dimensions,
                             "time_range": None
                         },
                         "validation": {
@@ -144,7 +159,7 @@ class CacheWarmer:
                     try:
                         from api.routes.query import _generate_narrative
                         payload["narrative_summary"] = _generate_narrative(
-                            intent.original_query, results, intent, self.settings
+                            intent_key.original_query, results, intent_key, self.settings
                         )
                     except Exception as narr_exc:
                         logger.warning("[CacheWarmer] Failed to generate narrative: %s", narr_exc)
