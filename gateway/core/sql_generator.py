@@ -33,6 +33,8 @@ from core.exceptions import SnowflakeConnectionError, SQLGenerationError
 from core.sql_template_cache import (
     SQLTemplateCache,
     parameterize_sql_dates,
+    parameterize_by_auto_extraction,
+    apply_grain_rounding,
     restore_sql_dates,
 )
 
@@ -296,20 +298,32 @@ class SQLGenerator:
                         compiled_sql = None
                         logger.info("SQLTemplateCache MISS — template lacks time filter placeholders.")
                     else:
-                        # Restore date literals using the same wrapper style that
-                        # MetricFlow used when the template was first compiled.
+                        # Compute grain-adjusted dates matching what MetricFlow
+                        # embedded when the template was first compiled.
+                        # e.g. mrr (monthly grain): 2026-03-19 → 2026-03-01
+                        #                           2026-06-19 → 2026-07-01
+                        _primary_metric = intent.metrics[0] if intent.metrics else ""
+                        _time_col = SQLGenerator._METRIC_TIME_COL.get(_primary_metric, "")
+                        _sql_start = apply_grain_rounding(
+                            intent.time_range.start_date, _time_col, is_start=True
+                        )
+                        _sql_end = apply_grain_rounding(
+                            intent.time_range.end_date, _time_col, is_start=False
+                        )
                         compiled_sql = restore_sql_dates(
                             tpl_sql,
-                            intent.time_range.start_date,
-                            intent.time_range.end_date,
+                            _sql_start,
+                            _sql_end,
                             style=cached_tpl.get("date_style", "plain"),
                         )
                         logger.info(
                             "SQLTemplateCache HIT (parameterized, style=%s) — skipping MetricFlow. "
-                            "Injected %s..%s.",
+                            "User %s..%s → grain-adjusted %s..%s.",
                             cached_tpl.get("date_style", "plain"),
                             intent.time_range.start_date,
                             intent.time_range.end_date,
+                            _sql_start,
+                            _sql_end,
                         )
                         used_template_cache = True
                 else:
@@ -375,13 +389,24 @@ class SQLGenerator:
                     date_style = "plain"
 
                     if intent.time_range:
-                        # parameterize_sql_dates now returns a 3-tuple:
-                        # (parameterized_sql, success_bool, style_str)
+                        # Strategy 1: search for user-provided dates directly.
+                        # Works for day-grain metrics where MetricFlow embeds them as-is.
                         sql_template, has_placeholder, date_style = parameterize_sql_dates(
                             compiled_sql,
                             intent.time_range.start_date,
                             intent.time_range.end_date,
                         )
+
+                        if not has_placeholder:
+                            # Strategy 2: auto-extraction.
+                            # MetricFlow grain-adjusted the dates before embedding them
+                            # (e.g. monthly-grain mrr: 2026-03-19 → 2026-03-01).
+                            # Scan the SQL for whatever date literals MetricFlow used.
+                            _primary = intent.metrics[0] if intent.metrics else ""
+                            _tcol = SQLGenerator._METRIC_TIME_COL.get(_primary, "")
+                            sql_template, has_placeholder, date_style = (
+                                parameterize_by_auto_extraction(compiled_sql, _tcol)
+                            )
 
                     self._template_cache.set(
                         intent.metrics,

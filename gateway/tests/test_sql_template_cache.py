@@ -22,6 +22,8 @@ import pytest
 
 from core.sql_template_cache import (
     SQLTemplateCache,
+    apply_grain_rounding,
+    parameterize_by_auto_extraction,
     parameterize_sql_dates,
     restore_sql_dates,
 )
@@ -391,3 +393,190 @@ class TestSQLTemplateCache:
         # The non-date parts must be untouched
         assert "is_active = TRUE" in restored
         assert "SUM(subq_3.mrr_usd) AS mrr" in restored
+
+
+# ─────────────────────── parameterize_by_auto_extraction (grain-adjusted dates)
+
+
+# What MetricFlow actually writes for mrr × plan_type with monthly grain.
+# User requested: start=2026-03-19, end=2026-06-19
+# MetricFlow embedded: start=2026-03-01 (floor to month), end=2026-07-01 (exclusive)
+SQL_MRR_GRAIN_ADJUSTED = (
+    "SELECT\n"
+    "  plan_type AS subscription__plan_type,\n"
+    "  SUM(mrr_usd) AS mrr\n"
+    "FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly sem_mrr_src_10000\n"
+    "WHERE\n"
+    "  period_month >= '2026-03-01'\n"
+    "  AND period_month < '2026-07-01'\n"
+    "GROUP BY plan_type"
+)
+
+# Realistic MetricFlow subquery with grain-adjusted dates and CAST wrapper
+SQL_MRR_GRAIN_CAST = (
+    "SELECT\n"
+    "  subq.plan_type AS subscription__plan_type,\n"
+    "  SUM(subq.mrr_usd) AS mrr\n"
+    "FROM (\n"
+    "  SELECT plan_type, mrr_usd\n"
+    "  FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly sem_mrr\n"
+    "  WHERE\n"
+    "    sem_mrr.period_month >= CAST('2026-03-01' AS DATE)\n"
+    "    AND sem_mrr.period_month < CAST('2026-07-01' AS DATE)\n"
+    "    AND sem_mrr.is_active = TRUE\n"
+    ") subq\n"
+    "GROUP BY subq.plan_type"
+)
+
+
+class TestParameterizeByAutoExtraction:
+
+    def test_extracts_grain_adjusted_dates_plain_style(self):
+        """
+        Core production case: user gave 2026-03-19 / 2026-06-19 but MetricFlow
+        wrote grain-adjusted dates 2026-03-01 / 2026-07-01.
+        Auto-extraction must find and replace those actual SQL dates.
+        """
+        sql, ok, style = parameterize_by_auto_extraction(
+            SQL_MRR_GRAIN_ADJUSTED, time_col="period_month"
+        )
+        assert ok is True
+        assert style == "plain"
+        assert "{start_date}" in sql
+        assert "{end_date}" in sql
+        # Grain-adjusted dates must be gone
+        assert "2026-03-01" not in sql
+        assert "2026-07-01" not in sql
+
+    def test_extracts_grain_adjusted_dates_cast_style(self):
+        """Auto-extraction works with CAST wrapper style."""
+        sql, ok, style = parameterize_by_auto_extraction(
+            SQL_MRR_GRAIN_CAST, time_col="period_month"
+        )
+        assert ok is True
+        assert style == "cast"
+        assert "{start_date}" in sql
+        assert "{end_date}" in sql
+        assert "2026-03-01" not in sql
+        assert "2026-07-01" not in sql
+        # Non-date filter must survive
+        assert "is_active = TRUE" in sql
+
+    def test_restore_after_auto_extraction_round_trip(self):
+        """
+        Full round-trip: auto-extract → store template → restore with new dates.
+        The restored SQL must contain grain-adjusted versions of the new user dates.
+        """
+        template, ok, style = parameterize_by_auto_extraction(
+            SQL_MRR_GRAIN_ADJUSTED, time_col="period_month"
+        )
+        assert ok is True
+
+        # New request: user asks for last 6 months (2025-12-19 → 2026-06-19)
+        # Grain-adjusted: 2025-12-01 → 2026-07-01
+        restored = restore_sql_dates(template, "2025-12-01", "2026-07-01", style=style)
+        assert "2025-12-01" in restored
+        assert "2026-07-01" in restored
+        assert "{start_date}" not in restored
+        assert "{end_date}" not in restored
+
+    def test_no_time_col_returns_false(self):
+        """Without a time_col hint, extraction must fail safely."""
+        _, ok, _ = parameterize_by_auto_extraction(SQL_MRR_GRAIN_ADJUSTED, time_col="")
+        assert ok is False
+
+    def test_no_dates_in_sql_returns_false(self):
+        """SQL with no date literals must return False without crashing."""
+        sql = "SELECT plan_type, SUM(mrr_usd) AS mrr FROM fct_mrr_monthly GROUP BY 1"
+        _, ok, _ = parameterize_by_auto_extraction(sql, time_col="period_month")
+        assert ok is False
+
+    def test_single_date_in_sql_returns_false(self):
+        """Fewer than 2 distinct dates → cannot determine start AND end."""
+        sql = "SELECT * FROM t WHERE period_month >= '2026-03-01'"
+        _, ok, _ = parameterize_by_auto_extraction(sql, time_col="period_month")
+        assert ok is False
+
+    def test_unrelated_date_is_preserved(self):
+        """A date literal unrelated to the time filter must survive extraction."""
+        sql = (
+            "SELECT plan_type, SUM(mrr_usd) AS mrr\n"
+            "FROM fct_mrr_monthly\n"
+            "WHERE period_month >= '2026-03-01'\n"
+            "  AND period_month < '2026-07-01'\n"
+            "  AND activation_date > '2020-01-01'\n"  # unrelated — must survive
+            "GROUP BY 1"
+        )
+        result, ok, _ = parameterize_by_auto_extraction(sql, time_col="period_month")
+        assert ok is True
+        assert "2020-01-01" in result   # unrelated date preserved
+
+
+# ─────────────────────────────────────── apply_grain_rounding
+
+
+class TestApplyGrainRounding:
+
+    # ── monthly grain (period_month)
+
+    def test_monthly_start_floors_to_first_of_month(self):
+        assert apply_grain_rounding("2026-03-19", "period_month", is_start=True) == "2026-03-01"
+
+    def test_monthly_start_already_first_of_month(self):
+        assert apply_grain_rounding("2026-03-01", "period_month", is_start=True) == "2026-03-01"
+
+    def test_monthly_end_advances_to_first_of_next_month(self):
+        assert apply_grain_rounding("2026-06-19", "period_month", is_start=False) == "2026-07-01"
+
+    def test_monthly_end_december_rolls_over_to_next_year(self):
+        assert apply_grain_rounding("2026-12-15", "period_month", is_start=False) == "2027-01-01"
+
+    def test_monthly_end_last_day_of_month_advances_correctly(self):
+        assert apply_grain_rounding("2026-06-30", "period_month", is_start=False) == "2026-07-01"
+
+    # ── daily grain (payment_date, session_start, signup_date, event_timestamp)
+
+    def test_day_grain_start_unchanged(self):
+        assert apply_grain_rounding("2026-03-19", "payment_date", is_start=True) == "2026-03-19"
+
+    def test_day_grain_end_unchanged(self):
+        assert apply_grain_rounding("2026-06-19", "payment_date", is_start=False) == "2026-06-19"
+
+    def test_session_start_day_grain_unchanged(self):
+        assert apply_grain_rounding("2026-01-15", "session_start", is_start=True) == "2026-01-15"
+
+    def test_signup_date_day_grain_unchanged(self):
+        assert apply_grain_rounding("2026-06-19", "signup_date", is_start=False) == "2026-06-19"
+
+    # ── unknown time column (defaults to day grain)
+
+    def test_unknown_time_col_defaults_to_day_unchanged(self):
+        assert apply_grain_rounding("2026-05-10", "unknown_col", is_start=True) == "2026-05-10"
+
+    # ── invalid date string
+
+    def test_invalid_date_string_returned_unchanged(self):
+        result = apply_grain_rounding("not-a-date", "period_month", is_start=True)
+        assert result == "not-a-date"
+
+    # ── production scenario: full grain-adjusted round-trip
+
+    def test_production_scenario_mrr_last_3_months(self):
+        """
+        User: start=2026-03-19, end=2026-06-19 for mrr (monthly grain).
+        Expected SQL bounds: 2026-03-01 and 2026-07-01.
+        """
+        sql_start = apply_grain_rounding("2026-03-19", "period_month", is_start=True)
+        sql_end   = apply_grain_rounding("2026-06-19", "period_month", is_start=False)
+        assert sql_start == "2026-03-01"
+        assert sql_end   == "2026-07-01"
+
+    def test_production_scenario_mrr_last_6_months(self):
+        """
+        User: start=2025-12-19, end=2026-06-19 for mrr (monthly grain).
+        Expected SQL bounds: 2025-12-01 and 2026-07-01.
+        """
+        sql_start = apply_grain_rounding("2025-12-19", "period_month", is_start=True)
+        sql_end   = apply_grain_rounding("2026-06-19", "period_month", is_start=False)
+        assert sql_start == "2025-12-01"
+        assert sql_end   == "2026-07-01"
