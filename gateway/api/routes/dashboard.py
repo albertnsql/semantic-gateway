@@ -142,20 +142,32 @@ LIMIT 2
 """.strip()
 
 
-def _sql_new_mrr_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
     year_filter = _year_clause(years, 'period_month')
+    plan_filter = _plan_clause(plans)
+    country_filter = _country_clause_sub(countries)
     return f"""
--- Dashboard: new_mrr_kpi — Total New MRR
-SELECT 
+-- Dashboard: net_mrr_growth_kpi — Net MRR Growth % vs prior month
+-- mrr_usd is always stored as a positive value in fct_mrr_monthly;
+-- contraction and churned rows are negated here to compute net change.
+WITH monthly AS (
+    SELECT
+        period_month,
+        SUM(CASE WHEN mrr_type IN ('new','expansion') THEN mrr_usd
+                 WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd
+                 ELSE 0 END) AS net_change,
+        SUM(CASE WHEN mrr_type != 'inactive' THEN mrr_usd ELSE 0 END) AS total_mrr
+    FROM {_DB}.marts.fct_mrr_monthly
+    WHERE 1=1 {year_filter}
+      {plan_filter}
+      {country_filter}
+    GROUP BY 1
+)
+SELECT
     period_month,
-    COALESCE(SUM(mrr_usd), 0) AS value
-FROM {_DB}.marts.fct_mrr_monthly
-WHERE 1=1 {year_filter}
-  AND mrr_type = 'new'
-  {_plan_clause(plans)}
-  {_country_clause_sub(countries)}
-GROUP BY 1
-ORDER BY 1 DESC
+    net_change / NULLIF(LAG(total_mrr) OVER (ORDER BY period_month), 0) AS value
+FROM monthly
+ORDER BY period_month DESC
 LIMIT 2
 """.strip()
 
@@ -178,20 +190,24 @@ LIMIT 2
 """.strip()
 
 
-def _sql_ltv_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    # fct_payments — plan_type not in schema; year applied to payment_date
-    year_clause = _year_clause(years, "payment_date") if years else ""
-    plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
+def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+    # Churn Rate = churned subscriptions / total active-or-churned subscriptions per month.
+    # Sourced directly from fct_mrr_monthly — same pattern as all other KPI tiles.
+    # Mirrors the certified MetricFlow metric (churned_subscribers / total_subscribers)
+    # without going through the MetricFlow query path (no MetricFlow runner in this route).
+    year_filter = _year_clause(years, 'period_month')
+    plan_filter = _plan_clause(plans)
+    country_filter = _country_clause_sub(countries)
     return f"""
--- Dashboard: ltv_kpi — Average lifetime value per subscriber
+-- Dashboard: churn_rate_kpi — Monthly churn rate (churned / total subscribers)
 SELECT
-    DATE_TRUNC('month', payment_date) AS period_month,
-    SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END)::FLOAT /
-    NULLIF(COUNT(DISTINCT subscriber_id), 0) AS value
-FROM {_DB}.marts.fct_payments
-WHERE 1=1 {year_clause}
+    period_month,
+    COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
+    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
+FROM {_DB}.marts.fct_mrr_monthly
+WHERE 1=1 {year_filter}
   {plan_filter}
-  {_country_clause_sub(countries)}
+  {country_filter}
 GROUP BY 1
 ORDER BY 1 DESC
 LIMIT 2
@@ -219,17 +235,25 @@ ORDER BY 2 DESC
 """.strip()
 
 
-def _sql_mrr_by_plan(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_mrr_bridge(plans: list[str], years: list[int], countries: list[str]) -> str:
+    # Returns one row per (period_month, mrr_type) for the last 12 months.
+    # mrr_usd is always positive in fct_mrr_monthly; contraction and churned rows
+    # are negated here so the frontend can stack them below the zero baseline.
+    plan_filter = _plan_clause(plans)
+    country_filter = _country_clause_sub(countries)
     return f"""
--- Dashboard: mrr_by_plan — MRR by plan type (bar chart)
-SELECT plan_type, SUM(mrr_usd) AS mrr
+-- Dashboard: mrr_bridge — MRR bridge by component (12 months, unpivoted)
+SELECT
+    period_month,
+    mrr_type,
+    SUM(CASE WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd ELSE mrr_usd END) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE is_active = TRUE
-  {_plan_clause(plans)}
-  {_year_clause(years, 'period_month')}
-  {_country_clause_sub(countries)}
-GROUP BY 1
-ORDER BY 2 DESC
+WHERE mrr_type IN ('new', 'expansion', 'contraction', 'churned')
+  AND period_month >= DATEADD(month, -12, CURRENT_DATE)
+  {plan_filter}
+  {country_filter}
+GROUP BY 1, 2
+ORDER BY 1
 """.strip()
 
 
@@ -299,17 +323,17 @@ ORDER BY value DESC
 # ── Widget registry — name → SQL builder function ──────────────────────────────
 
 _WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str]], str]] = {
-    "mrr_kpi":        _sql_mrr_kpi,
-    "subs_kpi":       _sql_subs_kpi,
-    "watch_time_kpi": _sql_watch_time_kpi,
-    "new_mrr_kpi":    _sql_new_mrr_kpi,
-    "engagement_kpi": _sql_engagement_kpi,
-    "ltv_kpi":        _sql_ltv_kpi,
-    "sub_dist":       _sql_sub_dist,
-    "mrr_by_plan":    _sql_mrr_by_plan,
-    "mrr_trend":      _sql_mrr_trend,
-    "retention_trend":_sql_retention_trend,
-    "sessions_trend": _sql_sessions_trend,
+    "mrr_kpi":              _sql_mrr_kpi,
+    "subs_kpi":             _sql_subs_kpi,
+    "watch_time_kpi":       _sql_watch_time_kpi,
+    "net_mrr_growth_kpi":   _sql_net_mrr_growth_kpi,
+    "engagement_kpi":       _sql_engagement_kpi,
+    "churn_rate_kpi":       _sql_churn_rate_kpi,
+    "sub_dist":             _sql_sub_dist,
+    "mrr_bridge":           _sql_mrr_bridge,
+    "mrr_trend":            _sql_mrr_trend,
+    "retention_trend":      _sql_retention_trend,
+    "sessions_trend":       _sql_sessions_trend,
     "watch_time_content_type": _sql_watch_time_content_type,
 }
 

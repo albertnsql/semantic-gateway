@@ -166,20 +166,20 @@ export default function DashboardPage() {
   const [chatContext, setChatContext] = useState(null);
 
   const [kpis, setKpis] = useState({
-    mrr:        { loading: true, data: null, error: null, trend:  4.2,  trendIsGood: true  },
-    subs:       { loading: true, data: null, error: null, trend:  8.5,  trendIsGood: true  },
-    watchTime:  { loading: true, data: null, error: null, trend:  2.4,  trendIsGood: true  },
-    newMrr:     { loading: true, data: null, error: null, trend:  8.1,  trendIsGood: true  },
-    engagement: { loading: true, data: null, error: null, trend: -1.2,  trendIsGood: false },
-    ltv:        { loading: true, data: null, error: null, trend:  5.4,  trendIsGood: true  },
+    mrr:           { loading: true, data: null, error: null, trend:  4.2,  trendIsGood: true  },
+    netMrrGrowth:  { loading: true, data: null, error: null, trend:  4.2,  trendIsGood: true  },
+    subs:          { loading: true, data: null, error: null, trend:  8.5,  trendIsGood: true  },
+    watchTime:     { loading: true, data: null, error: null, trend:  2.4,  trendIsGood: true  },
+    engagement:    { loading: true, data: null, error: null, trend: -1.2,  trendIsGood: false },
+    churnRate:     { loading: true, data: null, error: null, trend: -0.5,  trendIsGood: false },
   });
 
   const [charts, setCharts] = useState({
-    subDist:    { loading: true, data: null, isMock: false },
-    mrrPlan:    { loading: true, data: null, isMock: false },
-    mrrTrend:   { loading: true, data: null, isMock: false },
-    retentionTrend: { loading: true, data: null, isMock: false },
-    sessions:   { loading: true, data: null, isMock: false },
+    subDist:          { loading: true, data: null, isMock: false },
+    mrrBridge:        { loading: true, data: null, isMock: false },
+    mrrTrend:         { loading: true, data: null, isMock: false },
+    retentionTrend:   { loading: true, data: null, isMock: false },
+    sessions:         { loading: true, data: null, isMock: false },
     watchTimeContent: { loading: true, data: null, isMock: false },
   });
 
@@ -256,25 +256,51 @@ export default function DashboardPage() {
         .catch(e => ({ status: 'rejected', reason: e }));
 
       const [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] = await Promise.all([
-        widget('mrr_kpi'), widget('subs_kpi'), widget('watch_time_kpi'), widget('new_mrr_kpi'),
-        widget('engagement_kpi'), widget('ltv_kpi'), widget('sub_dist'), widget('mrr_by_plan'),
+        widget('mrr_kpi'), widget('net_mrr_growth_kpi'), widget('subs_kpi'), widget('watch_time_kpi'),
+        widget('engagement_kpi'), widget('churn_rate_kpi'), widget('sub_dist'), widget('mrr_bridge'),
         widget('mrr_trend'), widget('retention_trend'), widget('sessions_trend'), widget('watch_time_content_type')
       ]);
 
+      // Parse mrr_bridge: pivot unpivoted rows into per-month keyed objects
+      // API returns: [{ period_month, mrr_type, value }, ...]
+      // Target:      [{ period_month, new, expansion, contraction, churned }, ...]
+      const parseMrrBridge = (res) => {
+        try {
+          const rows = res?.value?.data;
+          if (!rows || rows.length === 0) throw new Error('No data');
+          const monthMap = {};
+          rows.forEach(row => {
+            const key = row.period_month || row.PERIOD_MONTH;
+            const type = (row.mrr_type || row.MRR_TYPE || '').toLowerCase();
+            const val  = Number(row.value ?? row.VALUE ?? 0);
+            if (!monthMap[key]) monthMap[key] = { period_month: key, new: 0, expansion: 0, contraction: 0, churned: 0 };
+            if (type in monthMap[key]) monthMap[key][type] = val;
+          });
+          const pivoted = Object.values(monthMap).sort((a, b) => a.period_month < b.period_month ? -1 : 1);
+          return { loading: false, data: pivoted, isMock: false };
+        } catch {
+          // Mock fallback — 3 months of illustrative bridge data
+          const mockBridge = ['Jan 26','Feb 26','Mar 26'].map((m) => ({
+            period_month: m, new: 12000, expansion: 3000, contraction: -1500, churned: -2200
+          }));
+          return { loading: false, data: mockBridge, isMock: true };
+        }
+      };
+
       setKpis({
-        mrr:        parseKpi(r0,  true),
-        subs:       parseKpi(r1,  true),
-        watchTime:  parseKpi(r2,  true),
-        newMrr:     parseKpi(r3,  true),
-        engagement: parseKpi(r4,  true),
-        ltv:        parseKpi(r5,  true),
+        mrr:          parseKpi(r0,  true),
+        netMrrGrowth: parseKpi(r1,  true),
+        subs:         parseKpi(r2,  true),
+        watchTime:    parseKpi(r3,  true),
+        engagement:   parseKpi(r4,  true),
+        churnRate:    parseKpi(r5,  false),
       });
       setCharts({
-        subDist:    parseChart(r6,  generateMockPie),
-        mrrPlan:    parseChart(r7,  generateMockBar),
-        mrrTrend:   parseChart(r8,  generateMockArea),
-        retentionTrend: parseChart(r9,  generateMockLine),
-        sessions:   parseChart(r10, generateMockSessions),
+        subDist:          parseChart(r6,  generateMockPie),
+        mrrBridge:        parseMrrBridge(r7),
+        mrrTrend:         parseChart(r8,  generateMockArea),
+        retentionTrend:   parseChart(r9,  generateMockLine),
+        sessions:         parseChart(r10, generateMockSessions),
         watchTimeContent: parseChart(r11, generateMockBar),
       });
 
@@ -307,12 +333,12 @@ export default function DashboardPage() {
       }
     };
 
-    addWidget('mrr_kpi', 'Total MRR', kpis.mrr, fmtCurrencyRaw);
-    addWidget('subs_kpi', 'Active Subscribers', kpis.subs, v => Number(v).toLocaleString());
-    addWidget('watch_time_kpi', 'Avg Watch Time', kpis.watchTime, v => `${Number(v).toFixed(1)} min`);
-    addWidget('new_mrr_kpi', 'New MRR', kpis.newMrr, fmtCurrencyRaw);
-    addWidget('engagement_kpi', 'Avg Engagement', kpis.engagement, v => `${Number(v).toFixed(1)}%`);
-    addWidget('ltv_kpi', 'Avg LTV', kpis.ltv, v => `$${Number(v).toFixed(1)}`);
+    addWidget('mrr_kpi',            'Total MRR',         kpis.mrr,          fmtCurrencyRaw);
+    addWidget('net_mrr_growth_kpi', 'Net MRR Growth %',  kpis.netMrrGrowth, v => `${(Number(v) * 100).toFixed(1)}%`);
+    addWidget('subs_kpi',           'Active Subscribers', kpis.subs,         v => Number(v).toLocaleString());
+    addWidget('watch_time_kpi',     'Avg Watch Time',     kpis.watchTime,    v => `${Number(v).toFixed(1)} min`);
+    addWidget('engagement_kpi',     'Avg Engagement',     kpis.engagement,   v => `${Number(v).toFixed(1)}%`);
+    addWidget('churn_rate_kpi',     'Churn Rate',         kpis.churnRate,    v => `${(Number(v) * 100).toFixed(1)}%`);
 
     setChatContext({
       active_filters: activeFilters,
@@ -400,9 +426,9 @@ export default function DashboardPage() {
 
     const prompts = [];
 
-    // 1. Data-driven prompt based on MRR or New MRR
-    if (kpis.newMrr.data != null && kpis.newMrr.trend != null && Math.abs(kpis.newMrr.trend) > 5) {
-      prompts.push(`Show me New MRR by plan type to investigate the recent change`);
+    // 1. Data-driven prompt based on MRR or Net MRR Growth
+    if (kpis.netMrrGrowth.data != null && kpis.netMrrGrowth.trend != null && Math.abs(kpis.netMrrGrowth.trend) > 5) {
+      prompts.push(`Break down MRR bridge by component to investigate the recent net MRR change`);
     } else if (kpis.mrr.data != null && kpis.mrr.trend != null) {
       prompts.push(`Break down Total MRR by country to see the recent trend`);
     } else {
@@ -537,12 +563,12 @@ export default function DashboardPage() {
               </div>
             )}
             <div className={`grid gap-4 ${drawerOpen ? 'grid-cols-2 xl:grid-cols-3' : 'grid-cols-2 lg:grid-cols-3 xl:grid-cols-6'}`}>
-              <KpiTile label="TOTAL MRR"          value={fmtCurrency(kpis.mrr.data)}        prevValue={kpis.mrr.prevData}        formatter={fmtCurrency}  trend={kpis.mrr.trend}        trendIsGood={kpis.mrr.trendIsGood}        loading={kpis.mrr.loading}        error={kpis.mrr.error} />
-              <KpiTile label="ACTIVE SUBSCRIBERS" value={fmtInt(kpis.subs.data)}             prevValue={kpis.subs.prevData}       formatter={fmtInt}       trend={kpis.subs.trend}       trendIsGood={kpis.subs.trendIsGood}       loading={kpis.subs.loading}       error={kpis.subs.error} />
-              <KpiTile label="AVG WATCH TIME"     value={fmtWatchTime(kpis.watchTime.data)}  prevValue={kpis.watchTime.prevData}  formatter={fmtWatchTime} trend={kpis.watchTime.trend}  trendIsGood={kpis.watchTime.trendIsGood}  loading={kpis.watchTime.loading}  error={kpis.watchTime.error} />
-              <KpiTile label="NEW MRR"            value={fmtCurrency(kpis.newMrr.data)}      prevValue={kpis.newMrr.prevData}     formatter={fmtCurrency}  trend={kpis.newMrr.trend}     trendIsGood={kpis.newMrr.trendIsGood}     loading={kpis.newMrr.loading}     error={kpis.newMrr.error} />
-              <KpiTile label="AVG ENGAGEMENT"     value={fmtPct(kpis.engagement.data)}       prevValue={kpis.engagement.prevData} formatter={fmtPct}       trend={kpis.engagement.trend} trendIsGood={kpis.engagement.trendIsGood} loading={kpis.engagement.loading} error={kpis.engagement.error} />
-              <KpiTile label="AVG LTV"            value={fmtDollar(kpis.ltv.data)}           prevValue={kpis.ltv.prevData}        formatter={fmtDollar}    trend={kpis.ltv.trend}        trendIsGood={kpis.ltv.trendIsGood}        loading={kpis.ltv.loading}        error={kpis.ltv.error} />
+              <KpiTile label="TOTAL MRR"        value={fmtCurrency(kpis.mrr.data)}                                       prevValue={kpis.mrr.prevData}          formatter={fmtCurrency}    trend={kpis.mrr.trend}          trendIsGood={kpis.mrr.trendIsGood}          loading={kpis.mrr.loading}          error={kpis.mrr.error} />
+              <KpiTile label="NET MRR GROWTH"   value={kpis.netMrrGrowth.data != null ? `${kpis.netMrrGrowth.data >= 0 ? '+' : ''}${(kpis.netMrrGrowth.data * 100).toFixed(1)}%` : '—'} prevValue={kpis.netMrrGrowth.prevData} formatter={v => `${(Number(v)*100).toFixed(1)}%`} trend={kpis.netMrrGrowth.trend} trendIsGood={kpis.netMrrGrowth.trendIsGood} loading={kpis.netMrrGrowth.loading} error={kpis.netMrrGrowth.error} />
+              <KpiTile label="ACTIVE SUBSCRIBERS" value={fmtInt(kpis.subs.data)}                                         prevValue={kpis.subs.prevData}         formatter={fmtInt}         trend={kpis.subs.trend}         trendIsGood={kpis.subs.trendIsGood}         loading={kpis.subs.loading}         error={kpis.subs.error} />
+              <KpiTile label="AVG WATCH TIME"   value={fmtWatchTime(kpis.watchTime.data)}                                prevValue={kpis.watchTime.prevData}    formatter={fmtWatchTime}   trend={kpis.watchTime.trend}    trendIsGood={kpis.watchTime.trendIsGood}    loading={kpis.watchTime.loading}    error={kpis.watchTime.error} />
+              <KpiTile label="AVG ENGAGEMENT"   value={fmtPct(kpis.engagement.data)}                                     prevValue={kpis.engagement.prevData}   formatter={fmtPct}         trend={kpis.engagement.trend}   trendIsGood={kpis.engagement.trendIsGood}   loading={kpis.engagement.loading}   error={kpis.engagement.error} />
+              <KpiTile label="CHURN RATE"        value={kpis.churnRate.data != null ? `${(kpis.churnRate.data * 100).toFixed(1)}%` : '—'}   prevValue={kpis.churnRate.prevData}    formatter={v => `${(Number(v)*100).toFixed(1)}%`} trend={kpis.churnRate.trend}    trendIsGood={kpis.churnRate.trendIsGood}    loading={kpis.churnRate.loading}    error={kpis.churnRate.error} />
             </div>
           </div>
 
@@ -571,17 +597,21 @@ export default function DashboardPage() {
               </ChartCard>
             </div>
             <div className="h-full min-w-0">
-              <ChartCard title="MRR by Plan" isMock={charts.mrrPlan.isMock}>
-                {charts.mrrPlan.loading ? <LoadingSpinner /> : (
+              <ChartCard title="MRR Bridge (12 months)" subtitle="Revenue growth and loss by driver" isMock={charts.mrrBridge.isMock}>
+                {charts.mrrBridge.loading ? <LoadingSpinner /> : (
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={charts.mrrPlan.data} margin={{ top:16, right:16, left:0, bottom:0 }} maxBarSize={60}>
+                    <BarChart data={charts.mrrBridge.data} margin={{ top:16, right:16, left:0, bottom:0 }} maxBarSize={28}>
                       <CartesianGrid vertical={false} stroke="rgba(13,148,136,0.08)" />
-                      <XAxis dataKey="name" axisLine={false} tickLine={false} fontSize={12} tick={{ fill:'#4A7B76', fontWeight: 500 }} dy={10} />
-                      <YAxis domain={[0, 'dataMax']} axisLine={false} tickLine={false} fontSize={11} tick={{ fill:'#4A7B76', fontWeight: 500 }} tickFormatter={fmtKilo} />
-                      <Tooltip cursor={{ fill:'#F8FAFC' }} content={<LightTooltip formatter={fmtCurrency} />} />
-                      <Bar dataKey="value" name="MRR" radius={[8, 8, 0, 0]}>
-                        {charts.mrrPlan.data?.map((_, i) => <Cell key={i} fill={PIE_COLORS[i%3]} />)}
-                      </Bar>
+                      <XAxis dataKey="period_month" axisLine={false} tickLine={false} fontSize={11} tick={{ fill:'#4A7B76', fontWeight: 500 }} dy={10} tickFormatter={fmtMonthYear} />
+                      <YAxis axisLine={false} tickLine={false} fontSize={11} tick={{ fill:'#4A7B76', fontWeight: 500 }} tickFormatter={fmtKilo} />
+                      <Tooltip cursor={{ fill:'rgba(13,148,136,0.04)' }} content={<MrrBridgeTooltip />} />
+                      <Legend content={<MrrBridgeLegend />} verticalAlign="top" />
+                      {/* Positive stacks — above zero */}
+                      <Bar dataKey="new"        name="New"        stackId="pos" fill="#0F766E" radius={[0,0,0,0]} />
+                      <Bar dataKey="expansion"  name="Expansion"  stackId="pos" fill="#2DD4BF" radius={[4,4,0,0]} />
+                      {/* Negative stacks — below zero (values are already negative from API) */}
+                      <Bar dataKey="contraction" name="Contraction" stackId="neg" fill="#F59E0B" radius={[0,0,0,0]} />
+                      <Bar dataKey="churned"    name="Churned"    stackId="neg" fill="#F43F5E" radius={[0,0,4,4]} />
                     </BarChart>
                   </ResponsiveContainer>
                 )}
@@ -719,6 +749,76 @@ function PieLegend({ payload, total }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ── MRR Bridge sub-components ──────────────────────────────────────────────
+
+const BRIDGE_COLORS = {
+  new:         { color: '#0F766E', label: 'New' },
+  expansion:   { color: '#2DD4BF', label: 'Expansion' },
+  contraction: { color: '#F59E0B', label: 'Contraction' },
+  churned:     { color: '#F43F5E', label: 'Churned' },
+};
+
+function MrrBridgeTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  // payload contains all 4 series for the hovered month
+  const fmtK = v => v == null ? '—' : `$${(Math.abs(Number(v))/1000).toFixed(1)}K`;
+  const fmtSigned = v => {
+    if (v == null) return '—';
+    const n = Number(v);
+    return `${n >= 0 ? '+' : '-'}$${(Math.abs(n)/1000).toFixed(1)}K`;
+  };
+  // Find the data object from the first payload entry
+  const d = payload[0]?.payload || {};
+  const net = (d.new || 0) + (d.expansion || 0) + (d.contraction || 0) + (d.churned || 0);
+  return (
+    <div
+      className="rounded-[20px] px-4 py-3 text-sm z-50 backdrop-blur-xl min-w-[180px]"
+      style={{ background: 'rgba(255,255,255,0.97)', boxShadow: CLAY_TT_SHADOW, fontFamily: 'DM Sans, sans-serif' }}
+    >
+      {label && (
+        <p className="text-[#4A7B76] text-xs mb-2 font-bold uppercase tracking-wider">
+          {typeof label === 'string' && /^\d{4}/.test(label)
+            ? (() => { const dt = new Date(label); return `${dt.toLocaleString('en-US',{month:'short'})} ${dt.getFullYear().toString().slice(-2)}`; })()
+            : label}
+        </p>
+      )}
+      {Object.entries(BRIDGE_COLORS).map(([key, { color, label: lbl }]) => (
+        d[key] !== undefined && (
+          <div key={key} className="flex items-center justify-between gap-4 mb-1">
+            <span className="flex items-center gap-1.5 text-[#4A7B76] text-xs">
+              <span className="w-2.5 h-2.5 rounded-sm inline-block flex-shrink-0" style={{ backgroundColor: color }} />
+              {lbl}
+            </span>
+            <span className="font-semibold text-[#1A3A38] text-xs">{fmtK(d[key])}</span>
+          </div>
+        )
+      ))}
+      <div className="border-t border-[#0D9488]/10 mt-2 pt-2 flex items-center justify-between">
+        <span className="text-xs font-bold text-[#1A3A38]">Net Change</span>
+        <span
+          className="text-xs font-black"
+          style={{ fontFamily: 'Nunito, sans-serif', color: net >= 0 ? '#0F766E' : '#F43F5E' }}
+        >
+          {fmtSigned(net)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function MrrBridgeLegend() {
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-1 justify-end px-1 pb-1">
+      {Object.entries(BRIDGE_COLORS).map(([key, { color, label }]) => (
+        <div key={key} className="flex items-center gap-1.5 text-[11px] text-[#4A7B76]" style={{ fontFamily: 'DM Sans, sans-serif' }}>
+          <span className="w-2.5 h-2.5 rounded-sm inline-block flex-shrink-0" style={{ backgroundColor: color }} />
+          {label}
+        </div>
+      ))}
     </div>
   );
 }

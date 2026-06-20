@@ -2,7 +2,7 @@ import React from 'react';
 
 const CLAY_SHADOW = `16px 16px 32px rgba(13,148,136,0.12), -10px -10px 24px rgba(255,255,255,0.9), inset 6px 6px 12px rgba(13,148,136,0.04), inset -6px -6px 12px rgba(255,255,255,1)`;
 
-export default function ChartCard({ title, badge, isMock, children }) {
+export default function ChartCard({ title, subtitle, badge, isMock, children }) {
   return (
     <div
       className="flex flex-col h-full rounded-[32px] overflow-hidden relative backdrop-blur-xl"
@@ -22,6 +22,11 @@ export default function ChartCard({ title, badge, isMock, children }) {
         >
           {title}
         </h3>
+        {subtitle && (
+          <p className="text-[11px] text-[#4A7B76] mt-0.5" style={{ fontFamily: 'DM Sans, sans-serif' }}>
+            {subtitle}
+          </p>
+        )}
 
         {isMock ? (
           <div className="relative group">
