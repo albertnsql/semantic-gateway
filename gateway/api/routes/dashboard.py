@@ -97,6 +97,7 @@ SELECT
     COALESCE(SUM(mrr_usd), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE 1=1 {year_filter}
+  AND period_month <= '2026-05-01'::date
   AND is_active = TRUE
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
@@ -115,6 +116,7 @@ SELECT
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE 1=1 {year_filter}
+  AND period_month <= '2026-05-01'::date
   AND is_active = TRUE
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
@@ -134,6 +136,7 @@ SELECT
     AVG(duration_minutes) AS value
 FROM {_DB}.marts.fct_stream_sessions
 WHERE 1=1 {year_clause}
+  AND session_start < '2026-06-01'::date
   {plan_filter}
   {_country_clause(countries)}
 GROUP BY 1
@@ -159,6 +162,7 @@ WITH monthly AS (
         SUM(CASE WHEN is_active = TRUE THEN mrr_usd ELSE 0 END) AS total_mrr
     FROM {_DB}.marts.fct_mrr_monthly
     WHERE 1=1 {year_filter}
+      AND period_month <= '2026-05-01'::date
       {plan_filter}
       {country_filter}
     GROUP BY 1
@@ -182,6 +186,7 @@ SELECT
     AVG(completion_pct) * 100.0 AS value
 FROM {_DB}.marts.fct_stream_sessions
 WHERE 1=1 {year_clause}
+  AND session_start < '2026-06-01'::date
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY 1
@@ -206,6 +211,7 @@ SELECT
     NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE 1=1 {year_filter}
+  AND period_month <= '2026-05-01'::date
   {plan_filter}
   {country_filter}
 GROUP BY 1
@@ -226,6 +232,7 @@ WHERE period_month = (
     SELECT MAX(period_month)
     FROM {_DB}.marts.fct_mrr_monthly
     WHERE 1=1 {year_filter}
+      AND period_month <= '2026-05-01'::date
 )
   AND is_active = TRUE
   {_plan_clause(plans)}
