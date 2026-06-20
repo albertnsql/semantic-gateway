@@ -625,7 +625,7 @@ export default function DashboardPage() {
               <ChartCard title="MRR Trend (12 months)" isMock={charts.mrrTrend.isMock}>
                 {charts.mrrTrend.loading ? <LoadingSpinner /> : (
                   <ResponsiveContainer width="100%" height="100%">
-                    <AreaChart data={charts.mrrTrend.data?.filter(d => d.name <= '2026-05-01')} margin={{ top:8, right:10, left:-8, bottom:0 }}>
+                    <AreaChart data={charts.mrrTrend.data} margin={{ top:8, right:10, left:-8, bottom:0 }}>
                       <defs>
                         <linearGradient id="gMrr" x1="0" y1="0" x2="0" y2="1">
                           <stop offset="0%"   stopColor="#0F766E" stopOpacity={0.2} />

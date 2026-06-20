@@ -249,7 +249,8 @@ SELECT
     SUM(CASE WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd ELSE mrr_usd END) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE mrr_type IN ('new', 'expansion', 'contraction', 'churned')
-  AND period_month >= DATEADD(month, -12, CURRENT_DATE)
+  AND period_month >= DATEADD(month, -12, '2026-05-01'::date)
+  AND period_month <= '2026-05-01'::date
   {plan_filter}
   {country_filter}
 GROUP BY 1, 2
@@ -265,7 +266,8 @@ SELECT
     SUM(mrr_usd)                AS mrr
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE is_active = TRUE
-  AND period_month >= DATEADD('month', -12, (SELECT MAX(period_month) FROM {_DB}.marts.fct_mrr_monthly))
+  AND period_month >= DATEADD('month', -12, '2026-05-01'::date)
+  AND period_month <= '2026-05-01'::date
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY period_month
@@ -284,7 +286,8 @@ SELECT
       NULLIF(COUNT(DISTINCT subscription_id), 0), 1
     ) AS retention_rate
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month >= DATEADD('month', -12, (SELECT MAX(period_month) FROM {_DB}.marts.fct_mrr_monthly))
+WHERE period_month >= DATEADD('month', -12, '2026-05-01'::date)
+  AND period_month <= '2026-05-01'::date
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY DATE_TRUNC('month', period_month), name
@@ -301,7 +304,8 @@ SELECT
     DATE_TRUNC('month', session_start)                       AS sort_key,
     COUNT(*)                                                     AS sessions
 FROM {_DB}.marts.fct_stream_sessions
-WHERE session_start >= DATEADD('month', -12, DATE_TRUNC('month', CURRENT_DATE()))
+WHERE session_start >= DATEADD('month', -12, '2026-05-01'::date)
+  AND session_start < '2026-06-01'::date
   {plan_filter}
   {_country_clause(countries)}
 GROUP BY DATE_TRUNC('month', session_start), name
