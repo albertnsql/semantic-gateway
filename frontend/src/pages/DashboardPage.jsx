@@ -622,7 +622,7 @@ export default function DashboardPage() {
           {/* ── Row 4: Area + Line ────────────────────────────────────── */}
           <div className="grid grid-cols-[3fr_2fr] gap-4 h-[320px]">
             <div className="h-full min-w-0">
-              <ChartCard title="MRR Trend (12 months)" badge={getLatestMonthBadge(charts.mrrTrend.data)} isMock={charts.mrrTrend.isMock}>
+              <ChartCard title="MRR Trend (12 months)" isMock={charts.mrrTrend.isMock}>
                 {charts.mrrTrend.loading ? <LoadingSpinner /> : (
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart data={charts.mrrTrend.data?.filter(d => d.name <= '2026-05-01')} margin={{ top:8, right:10, left:-8, bottom:0 }}>
@@ -643,7 +643,7 @@ export default function DashboardPage() {
               </ChartCard>
             </div>
             <div className="h-full min-w-0">
-              <ChartCard title="Retention Rate Trend (12 months)" badge={getLatestMonthBadge(charts.retentionTrend.data)} isMock={charts.retentionTrend.isMock}>
+              <ChartCard title="Retention Rate Trend (12 months)" isMock={charts.retentionTrend.isMock}>
                 {charts.retentionTrend.loading ? <LoadingSpinner /> : (
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={charts.retentionTrend.data} margin={{ top:8, right:10, left:-8, bottom:0 }}>
@@ -662,7 +662,7 @@ export default function DashboardPage() {
           {/* ── Row 5: Sessions + Forecast ───────────────────────────── */}
           <div className="grid grid-cols-2 gap-4 h-[300px]">
             <div className="h-full min-w-0">
-              <ChartCard title="Monthly Stream Sessions" badge={getLatestMonthBadge(charts.sessions.data)} isMock={charts.sessions.isMock}>
+              <ChartCard title="Monthly Stream Sessions" isMock={charts.sessions.isMock}>
                 {charts.sessions.loading ? <LoadingSpinner /> : (
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={charts.sessions.data} margin={{ top:8, right:10, left:-8, bottom:0 }} maxBarSize={40}>
