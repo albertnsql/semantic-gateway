@@ -295,7 +295,7 @@ class SQLGenerator:
                     # Template requires dates. If the user didn't provide any (all-time),
                     # we inject a massive date range to simulate all-time without breaking the SQL.
                     _req_start = intent.time_range.start_date if intent.time_range else "2000-01-01"
-                    _req_end = intent.time_range.end_date if intent.time_range else "2099-12-31"
+                    _req_end = intent.time_range.end_date if intent.time_range else "2039-12-31"
 
                     _primary_metric = intent.metrics[0] if intent.metrics else ""
                     _time_col = SQLGenerator._METRIC_TIME_COL.get(_primary_metric, "")

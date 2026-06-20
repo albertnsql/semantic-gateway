@@ -98,7 +98,7 @@ class CacheWarmer:
                     dimensions=[dim],
                     time_range=TimeRange(
                         start_date="2000-01-01",
-                        end_date="2099-12-31",
+                        end_date="2039-12-31",
                         relative="all time"
                     ),
                     aggregation_level=None,
