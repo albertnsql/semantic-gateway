@@ -187,4 +187,5 @@ class SnowflakePool:
             schema=s.snowflake_schema,
             network_timeout=_QUERY_TIMEOUT_SECONDS,
             login_timeout=15,
+            client_session_keep_alive=True,
         )
