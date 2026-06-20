@@ -156,7 +156,7 @@ WITH monthly AS (
         SUM(CASE WHEN mrr_type IN ('new','expansion') THEN mrr_usd
                  WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd
                  ELSE 0 END) AS net_change,
-        SUM(CASE WHEN mrr_type != 'inactive' THEN mrr_usd ELSE 0 END) AS total_mrr
+        SUM(CASE WHEN is_active = TRUE THEN mrr_usd ELSE 0 END) AS total_mrr
     FROM {_DB}.marts.fct_mrr_monthly
     WHERE 1=1 {year_filter}
       {plan_filter}

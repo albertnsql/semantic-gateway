@@ -23,11 +23,18 @@ subscription_periods as (
         m.period_month,
         s.billing_cycle,
         s.status,
-        case when s.status = 'active' then true else false end as is_active
+        case 
+            when s.status = 'active' then true
+            when m.period_month <= date_trunc('month', coalesce(s.end_date, current_date())) then true
+            else false 
+        end as is_active
     from subscriptions s
     join months m
         on m.period_month >= date_trunc('month', s.start_date)
-        and m.period_month <= date_trunc('month', coalesce(s.end_date, current_date()))
+        and m.period_month <= case 
+            when s.status = 'active' then date_trunc('month', current_date())
+            else dateadd(month, 1, date_trunc('month', coalesce(s.end_date, current_date())))
+        end
 )
 
 select * from subscription_periods
