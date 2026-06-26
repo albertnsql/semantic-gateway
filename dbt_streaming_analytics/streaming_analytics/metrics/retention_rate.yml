@@ -1,0 +1,9 @@
+metrics:
+  - name: retention_rate
+    description: Subscriber Retention Rate (1 - Churn Rate).
+    label: Subscriber Retention Rate
+    type: derived
+    type_params:
+      expr: 1 - churn_rate
+      metrics:
+        - name: churn_rate

@@ -1,0 +1,12 @@
+metrics:
+  - name: net_mrr_growth
+    description: Month-over-month Net MRR Growth rate.
+    label: Net MRR Growth
+    type: derived
+    type_params:
+      expr: (mrr - prev_mrr) / nullif(prev_mrr, 0)
+      metrics:
+        - name: mrr
+        - name: mrr
+          alias: prev_mrr
+          offset_window: 1 month
