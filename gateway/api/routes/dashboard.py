@@ -54,6 +54,65 @@ _ALLOWED_YEARS: frozenset[int] = frozenset({2021, 2022, 2023, 2024, 2025, 2026})
 _ALLOWED_CONTENT_TYPES: frozenset[str] = frozenset({"movie", "series", "documentary", "short"})
 _ALLOWED_COUNTRIES: frozenset[str] = frozenset({"US", "IN", "GB", "DE", "BR"})
 
+# ── YoY date parameters ────────────────────────────────────────────────────────
+# These define the dashboard's "data through" date and the corresponding prior-year
+# equivalents used by the KPI tile YoY comparison logic.
+#
+# When the frontend passes a years= filter (e.g. years=2026), these are computed
+# dynamically via _resolve_yoy_dates(). When no year is passed, defaults below apply.
+#
+# Rule: current year = max(selected_years), prior year = current year - 1.
+# Data-through date = last known data month within current year (hard-coded here
+# as 2026-05-01 since data is current through May 2026).
+
+_DEFAULT_DATA_THROUGH: str = "2026-05-01"   # Last available data month
+_DEFAULT_CURRENT_YEAR: int = 2026
+
+
+def _resolve_yoy_dates(years: list[int]) -> dict:
+    """
+    Compute YoY date parameters from the selected years filter.
+
+    Returns a dict with:
+      current_year          int    e.g. 2026
+      prior_year            int    e.g. 2025
+      data_through_date     str    e.g. '2026-05-01'  (last available month in current year)
+      current_year_start    str    e.g. '2026-01-01'
+      prior_year_start      str    e.g. '2025-01-01'
+      prior_year_equiv_end  str    e.g. '2025-05-01'  (same partial-year cut in prior year)
+      prior_year_same_month str    e.g. '2025-05-01'  (same calendar month, prior year)
+      selected_year_end     str    e.g. '2026-12-31' or '2025-12-31'
+    """
+    if years:
+        current_year = max(years)
+    else:
+        current_year = _DEFAULT_CURRENT_YEAR
+
+    prior_year = current_year - 1
+
+    # Data-through date: last known data month within current year.
+    # For 2026, data ends at 2026-05-01 (May). For any prior complete year, use Dec.
+    if current_year >= _DEFAULT_CURRENT_YEAR:
+        data_through_date = _DEFAULT_DATA_THROUGH          # 2026-05-01
+    else:
+        data_through_date = f"{current_year}-12-01"        # full year available
+
+    # Parse out the month number from data_through_date to find the equivalent prior-year month.
+    dthrough_month = int(data_through_date[5:7])  # e.g. 5 for May
+    prior_year_equiv_end = f"{prior_year}-{dthrough_month:02d}-01"
+
+    return {
+        "current_year":          current_year,
+        "prior_year":            prior_year,
+        "data_through_date":     data_through_date,
+        "current_year_start":    f"{current_year}-01-01",
+        "prior_year_start":      f"{prior_year}-01-01",
+        "prior_year_equiv_end":  prior_year_equiv_end,
+        "prior_year_same_month": prior_year_equiv_end,     # same date
+        "selected_year_end":     f"{current_year}-12-31",
+        "selected_year_end_cap": data_through_date,        # capped for current year
+    }
+
 
 # ── Filter clause builders (safe, whitelisted) ────────────────────────────────
 
@@ -88,72 +147,122 @@ def _country_clause(countries: list[str], col: str = "country") -> str:
 # Each function accepts (plans, years, content_types, countries) and returns a ready-to-execute SQL string.
 # SQL is static — only safe whitelisted filter values are interpolated.
 
-def _sql_mrr_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    year_filter = _year_clause(years, 'period_month')
+def _sql_revenue_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+    """
+    Total Revenue — FLOW metric.
+    Comparison: period-sum for Jan-through-datathrough of current year
+                vs the same partial-year range in the prior year.
+    Returns 2 rows: period_bucket IN ('current', 'prior_year') with summed value.
+    """
+    d = _resolve_yoy_dates(years)
     return f"""
--- Dashboard: mrr_kpi — Total MRR
-SELECT 
-    period_month,
+-- Dashboard: revenue_kpi — Total Revenue (flow metric, period-sum YoY)
+SELECT
+    CASE
+        WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
+        WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+    END AS period_bucket,
     COALESCE(SUM(mrr_usd), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE 1=1 {year_filter}
-  AND period_month <= '2026-05-01'::date
-  AND is_active = TRUE
+WHERE is_active = TRUE
+  AND (
+    period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
+    OR period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+  )
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
-LIMIT 2
+ORDER BY
+    CASE period_bucket WHEN 'current' THEN 0 ELSE 1 END
 """.strip()
 
 
+# Keep mrr_kpi as a backward-compatible alias (same underlying data, no label change in SQL)
+def _sql_mrr_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+    """Backward-compat alias — routes that still call mrr_kpi get revenue_kpi data."""
+    return _sql_revenue_kpi(plans, years, countries)
+
+
 def _sql_subs_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    year_filter = _year_clause(years, 'period_month')
+    """
+    Active Subscribers — STOCK metric (point-in-time snapshot).
+    Comparison: latest available month vs same calendar month, prior year.
+    Returns 2 rows ordered current first.
+    """
+    d = _resolve_yoy_dates(years)
     return f"""
--- Dashboard: subs_kpi — Active (non-churned) subscriber count
-SELECT 
+-- Dashboard: subs_kpi — Active subscriber count (stock snapshot YoY)
+SELECT
     period_month,
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE 1=1 {year_filter}
-  AND period_month <= '2026-05-01'::date
+WHERE period_month IN ('{d['data_through_date']}'::date, '{d['prior_year_same_month']}'::date)
   AND is_active = TRUE
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY 1
 ORDER BY 1 DESC
-LIMIT 2
 """.strip()
 
 
 def _sql_watch_time_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    year_clause = _year_clause(years, "session_start") if years else ""
+    """
+    Avg Watch Time — STOCK metric (point-in-time snapshot).
+    Comparison: latest available month vs same calendar month, prior year.
+    Source: fct_stream_sessions (session_start)
+    Returns 2 rows ordered current first.
+    """
+    d = _resolve_yoy_dates(years)
+    # next-month boundary for each snapshot window
+    curr_month_num  = int(d['data_through_date'][5:7])
+    curr_year_num   = int(d['data_through_date'][:4])
+    prior_year_num  = curr_year_num - 1
+    curr_next_month  = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
+    prior_next_month = f"{prior_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{prior_year_num + 1}-01-01"
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
     return f"""
--- Dashboard: watch_time_kpi — Average watch time
-SELECT 
+-- Dashboard: watch_time_kpi — Avg watch time (stock snapshot YoY)
+SELECT
     DATE_TRUNC('month', session_start) AS period_month,
     AVG(duration_minutes) AS value
 FROM {_DB}.marts.fct_stream_sessions
-WHERE 1=1 {year_clause}
-  AND session_start < '2026-06-01'::date
+WHERE (
+    (session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date)
+    OR (session_start >= '{d['prior_year_same_month']}'::date AND session_start < '{prior_next_month}'::date)
+  )
   {plan_filter}
   {_country_clause(countries)}
 GROUP BY 1
 ORDER BY 1 DESC
-LIMIT 2
 """.strip()
 
 
 def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    year_filter = _year_clause(years, 'period_month')
+    """
+    Net MRR Growth % — RATE metric (custom handling).
+    Comparison:
+      current  = growth rate for the latest available month (e.g. May 2026 vs Apr 2026)
+      prior_yr = growth rate for the same calendar month one year prior (e.g. May 2025 vs Apr 2025)
+    Returns 2 rows: ('current', rate) and ('prior_year', rate) ordered current first.
+    """
+    d = _resolve_yoy_dates(years)
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
+
+    # We need 2 months of data for each snapshot period to compute the LAG.
+    # Current window: data_through_date and one month prior.
+    # Prior-year window: prior_year_same_month and one month prior to that.
+    curr_month_num = int(d['data_through_date'][5:7])
+    curr_year_num  = int(d['data_through_date'][:4])
+    prior_yr_num   = curr_year_num - 1
+    prev_curr_month  = f"{curr_year_num}-{curr_month_num - 1:02d}-01" if curr_month_num > 1 else f"{curr_year_num - 1}-12-01"
+    prev_prior_month = f"{prior_yr_num}-{curr_month_num - 1:02d}-01" if curr_month_num > 1 else f"{prior_yr_num - 1}-12-01"
+
     return f"""
--- Dashboard: net_mrr_growth_kpi — Net MRR Growth % vs prior month
--- mrr_usd is always stored as a positive value in fct_mrr_monthly;
--- contraction and churned rows are negated here to compute net change.
-WITH monthly AS (
+-- Dashboard: net_mrr_growth_kpi — Net MRR Growth % (rate metric YoY)
+-- current  = MoM growth rate for {d['data_through_date']} vs {prev_curr_month}
+-- prior_yr = MoM growth rate for {d['prior_year_same_month']} vs {prev_prior_month}
+WITH base AS (
     SELECT
         period_month,
         SUM(CASE WHEN mrr_type IN ('new','expansion') THEN mrr_usd
@@ -161,79 +270,116 @@ WITH monthly AS (
                  ELSE 0 END) AS net_change,
         SUM(CASE WHEN is_active = TRUE THEN mrr_usd ELSE 0 END) AS total_mrr
     FROM {_DB}.marts.fct_mrr_monthly
-    WHERE 1=1 {year_filter}
-      AND period_month <= '2026-05-01'::date
+    WHERE period_month IN (
+        '{d['data_through_date']}'::date,
+        '{prev_curr_month}'::date,
+        '{d['prior_year_same_month']}'::date,
+        '{prev_prior_month}'::date
+    )
       {plan_filter}
       {country_filter}
     GROUP BY 1
+),
+with_growth AS (
+    SELECT
+        period_month,
+        net_change / NULLIF(LAG(total_mrr) OVER (ORDER BY period_month), 0) AS growth_rate
+    FROM base
 )
 SELECT
-    period_month,
-    net_change / NULLIF(LAG(total_mrr) OVER (ORDER BY period_month), 0) AS value
-FROM monthly
-ORDER BY period_month DESC
-LIMIT 2
+    CASE
+        WHEN period_month = '{d['data_through_date']}'::date THEN 'current'
+        WHEN period_month = '{d['prior_year_same_month']}'::date THEN 'prior_year'
+    END AS period_bucket,
+    growth_rate AS value
+FROM with_growth
+WHERE period_month IN ('{d['data_through_date']}'::date, '{d['prior_year_same_month']}'::date)
+  AND growth_rate IS NOT NULL
+ORDER BY
+    CASE period_bucket WHEN 'current' THEN 0 ELSE 1 END
 """.strip()
 
 
 def _sql_engagement_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    year_clause = _year_clause(years, "session_start") if years else ""
+    """
+    Avg Engagement — STOCK metric (point-in-time snapshot).
+    Comparison: latest available month vs same calendar month, prior year.
+    Source: fct_stream_sessions (session_start, completion_pct)
+    Returns 2 rows ordered current first.
+    """
+    d = _resolve_yoy_dates(years)
+    curr_month_num  = int(d['data_through_date'][5:7])
+    curr_year_num   = int(d['data_through_date'][:4])
+    prior_year_num  = curr_year_num - 1
+    curr_next_month  = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
+    prior_next_month = f"{prior_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{prior_year_num + 1}-01-01"
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
     return f"""
--- Dashboard: engagement_kpi — Average content completion rate
-SELECT 
+-- Dashboard: engagement_kpi — Avg content completion rate (stock snapshot YoY)
+SELECT
     DATE_TRUNC('month', session_start) AS period_month,
     AVG(completion_pct) * 100.0 AS value
 FROM {_DB}.marts.fct_stream_sessions
-WHERE 1=1 {year_clause}
-  AND session_start < '2026-06-01'::date
+WHERE (
+    (session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date)
+    OR (session_start >= '{d['prior_year_same_month']}'::date AND session_start < '{prior_next_month}'::date)
+  )
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY 1
 ORDER BY 1 DESC
-LIMIT 2
 """.strip()
 
 
 def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
-    # Churn Rate = churned subscriptions / total active-or-churned subscriptions per month.
-    # Sourced directly from fct_mrr_monthly — same pattern as all other KPI tiles.
-    # Mirrors the certified MetricFlow metric (churned_subscribers / total_subscribers)
-    # without going through the MetricFlow query path (no MetricFlow runner in this route).
-    year_filter = _year_clause(years, 'period_month')
+    """
+    Churn Rate — STOCK metric (point-in-time snapshot).
+    Comparison: latest available month vs same calendar month, prior year.
+    Formula unchanged: churned / total active-or-churned subscribers per month.
+    Returns 2 rows ordered current first.
+    """
+    d = _resolve_yoy_dates(years)
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
     return f"""
--- Dashboard: churn_rate_kpi — Monthly churn rate (churned / total subscribers)
+-- Dashboard: churn_rate_kpi — Monthly churn rate (stock snapshot YoY)
 SELECT
     period_month,
     COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
     NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE 1=1 {year_filter}
-  AND period_month <= '2026-05-01'::date
+WHERE period_month IN ('{d['data_through_date']}'::date, '{d['prior_year_same_month']}'::date)
   {plan_filter}
   {country_filter}
 GROUP BY 1
 ORDER BY 1 DESC
-LIMIT 2
 """.strip()
 
 
 def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str]) -> str:
-    year_filter = _year_clause(years, 'period_month')
+    """
+    Subscriber Distribution — STOCK metric (point-in-time snapshot).
+    Shows plan-mix as of the latest available month within the selected year.
+    For the current year (2026), cap at data_through_date (May 2026).
+    For prior complete years (2025), use Dec of that year.
+    Never averages across months — always a single-month snapshot.
+    """
+    d = _resolve_yoy_dates(years)
+    # Inner subquery resolves to the latest available month within the selected year window
+    selected_year_start = d['current_year_start']
+    selected_year_cap   = d['data_through_date']     # capped at last available data month
     return f"""
--- Dashboard: sub_dist — Subscriber count by plan type (pie chart)
-SELECT 
-    INITCAP(plan_type) AS name, 
+-- Dashboard: sub_dist — Subscriber count by plan type (stock snapshot, latest month in selected year)
+SELECT
+    INITCAP(plan_type) AS name,
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE period_month = (
     SELECT MAX(period_month)
     FROM {_DB}.marts.fct_mrr_monthly
-    WHERE 1=1 {year_filter}
-      AND period_month <= '2026-05-01'::date
-)
+    WHERE period_month BETWEEN '{selected_year_start}'::date AND '{selected_year_cap}'::date
+      AND is_active = TRUE
+  )
   AND is_active = TRUE
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
@@ -320,13 +466,31 @@ ORDER BY sort_key
 """.strip()
 
 def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: list[str]) -> str:
+    """
+    Avg Watch Time by Content Type — STOCK metric (point-in-time snapshot).
+    Now respects the Years filter: shows avg watch time for sessions in the
+    latest available month within the selected year (same snapshot convention
+    as the Avg Watch Time KPI tile and Subscriber Distribution chart).
+    """
+    d = _resolve_yoy_dates(years)
+    curr_month_num = int(d['data_through_date'][5:7])
+    curr_year_num  = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
+    plan_filter = f"AND s.subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
+    country_filter = _country_clause(countries, col="s.country") if countries else ""
     return f"""
--- Dashboard: watch_time_content_type — Avg Watch Time by Content Type
-SELECT c.content_type AS name, ROUND(AVG(s.duration_minutes), 1) AS value
+-- Dashboard: watch_time_content_type — Avg Watch Time by Content Type (stock snapshot, latest month in selected year)
+SELECT
+    c.content_type AS name,
+    ROUND(AVG(s.duration_minutes), 1) AS value
 FROM {_DB}.marts.fct_stream_sessions s
 JOIN {_DB}.marts.dim_content c
   ON s.content_id = c.content_id
-GROUP BY c.content_type 
+WHERE s.session_start >= '{d['data_through_date']}'::date
+  AND s.session_start < '{curr_next_month}'::date
+  {plan_filter}
+  {country_filter}
+GROUP BY c.content_type
 ORDER BY value DESC
 """.strip()
 
@@ -334,6 +498,9 @@ ORDER BY value DESC
 # ── Widget registry — name → SQL builder function ──────────────────────────────
 
 _WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str]], str]] = {
+    # revenue_kpi: Total Revenue (flow metric, period-sum YoY) — primary ID used by frontend
+    "revenue_kpi":          _sql_revenue_kpi,
+    # mrr_kpi: backward-compat alias — resolves to the same revenue_kpi SQL
     "mrr_kpi":              _sql_mrr_kpi,
     "subs_kpi":             _sql_subs_kpi,
     "watch_time_kpi":       _sql_watch_time_kpi,

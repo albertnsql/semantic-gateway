@@ -98,13 +98,13 @@ export default function KpiTile({
               <TrendIcon size={11} strokeWidth={2.5} />
               <span>{Math.abs(trend)}%</span>
             </div>
-            <span className="text-xs text-[#4A7B76]" style={{ fontFamily: 'DM Sans, sans-serif' }}>vs last month</span>
+            <span className="text-xs text-[#4A7B76]" style={{ fontFamily: 'DM Sans, sans-serif' }}>vs last year</span>
             
             {/* Custom Tooltip for Previous Month Value */}
             {prevValue != null && (
               <div className="absolute hidden group-hover/trend:block bottom-full left-0 mb-2 w-max px-3 py-1.5 rounded-[12px] text-xs font-bold text-[#1A3A38] z-20 backdrop-blur-xl animate-fade-in"
                    style={{ background: 'rgba(255,255,255,0.95)', boxShadow: CLAY_SHADOW, fontFamily: 'DM Sans, sans-serif' }}>
-                <span className="text-[#4A7B76] font-medium mr-1">Prev Month:</span>
+                <span className="text-[#4A7B76] font-medium mr-1">Prior Year:</span>
                 {formatter ? formatter(prevValue) : prevValue}
               </div>
             )}

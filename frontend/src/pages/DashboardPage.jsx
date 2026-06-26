@@ -134,7 +134,7 @@ export default function DashboardPage() {
   const [lastRefreshed, setLastRefreshed]   = useState(new Date());
 
   const [selectedPlans,  setSelectedPlans]  = useState([...ALL_PLANS]);
-  const [selectedYears,  setSelectedYears]  = useState([...ALL_YEARS]);
+  const [selectedYears,  setSelectedYears]  = useState([2026]);
   const [selectedCountries, setSelectedCountries] = useState([...ALL_COUNTRIES]);
 
   const [messages, setMessages] = useState(() => {
@@ -166,7 +166,7 @@ export default function DashboardPage() {
   const [chatContext, setChatContext] = useState(null);
 
   const [kpis, setKpis] = useState({
-    mrr:           { loading: true, data: null, error: null, trend:  4.2,  trendIsGood: true  },
+    revenue:       { loading: true, data: null, error: null, trend:  4.2,  trendIsGood: true  },
     netMrrGrowth:  { loading: true, data: null, error: null, trend:  4.2,  trendIsGood: true  },
     subs:          { loading: true, data: null, error: null, trend:  8.5,  trendIsGood: true  },
     watchTime:     { loading: true, data: null, error: null, trend:  2.4,  trendIsGood: true  },
@@ -208,23 +208,36 @@ export default function DashboardPage() {
       const rows = res.value?.data || [];
       if (!rows.length) return { loading: false, data: null, prevData: null, error: 'No data', trend: null, trendIsGood };
       
+      // Detect period_bucket rows (flow + rate metrics: revenue_kpi, net_mrr_growth_kpi)
+      // vs period_month rows (stock metrics: subs, watch_time, engagement, churn)
+      const hasBucket = rows[0] && ('period_bucket' in rows[0] || 'PERIOD_BUCKET' in rows[0]);
+
       const getVal = (r) => {
           if (!r) return null;
           if ('value' in r) return Number(r.value);
           if ('VALUE' in r) return Number(r.VALUE);
           const keys = Object.keys(r);
-          return Number(r[keys.find(k => k.toLowerCase() !== 'period_month') || keys[1]]);
+          return Number(r[keys.find(k => k.toLowerCase() !== 'period_month' && k.toLowerCase() !== 'period_bucket') || keys[1]]);
       };
 
-      const currentVal = getVal(rows[0]);
-      let prevVal = null;
-      let calculatedTrend = null;
+      let currentVal, prevVal;
+      if (hasBucket) {
+        // Rows are: { period_bucket: 'current'|'prior_year', value: number }
+        // Ordered current first by SQL (CASE WHEN ... THEN 0 ELSE 1 END)
+        const bucketKey = 'period_bucket' in rows[0] ? 'period_bucket' : 'PERIOD_BUCKET';
+        const currentRow  = rows.find(r => r[bucketKey] === 'current');
+        const priorRow    = rows.find(r => r[bucketKey] === 'prior_year');
+        currentVal = getVal(currentRow);
+        prevVal    = getVal(priorRow);
+      } else {
+        // Rows ordered by period_month DESC — first row is current, second is prior year
+        currentVal = getVal(rows[0]);
+        prevVal    = rows.length > 1 ? getVal(rows[1]) : null;
+      }
 
-      if (rows.length > 1) {
-          prevVal = getVal(rows[1]);
-          if (prevVal && prevVal !== 0) {
-              calculatedTrend = ((currentVal - prevVal) / Math.abs(prevVal)) * 100;
-          }
+      let calculatedTrend = null;
+      if (prevVal != null && prevVal !== 0) {
+        calculatedTrend = ((currentVal - prevVal) / Math.abs(prevVal)) * 100;
       }
 
       return { 
@@ -256,7 +269,7 @@ export default function DashboardPage() {
         .catch(e => ({ status: 'rejected', reason: e }));
 
       const [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] = await Promise.all([
-        widget('mrr_kpi'), widget('net_mrr_growth_kpi'), widget('subs_kpi'), widget('watch_time_kpi'),
+        widget('revenue_kpi'), widget('net_mrr_growth_kpi'), widget('subs_kpi'), widget('watch_time_kpi'),
         widget('engagement_kpi'), widget('churn_rate_kpi'), widget('sub_dist'), widget('mrr_bridge'),
         widget('mrr_trend'), widget('retention_trend'), widget('sessions_trend'), widget('watch_time_content_type')
       ]);
@@ -288,7 +301,7 @@ export default function DashboardPage() {
       };
 
       setKpis({
-        mrr:          parseKpi(r0,  true),
+        revenue:      parseKpi(r0,  true),
         netMrrGrowth: parseKpi(r1,  true),
         subs:         parseKpi(r2,  true),
         watchTime:    parseKpi(r3,  true),
@@ -333,7 +346,7 @@ export default function DashboardPage() {
       }
     };
 
-    addWidget('mrr_kpi',            'Total MRR',         kpis.mrr,          fmtCurrencyRaw);
+    addWidget('revenue_kpi',         'Total Revenue',      kpis.revenue,      fmtCurrencyRaw);
     addWidget('net_mrr_growth_kpi', 'Net MRR Growth %',  kpis.netMrrGrowth, v => `${(Number(v) * 100).toFixed(1)}%`);
     addWidget('subs_kpi',           'Active Subscribers', kpis.subs,         v => Number(v).toLocaleString());
     addWidget('watch_time_kpi',     'Avg Watch Time',     kpis.watchTime,    v => `${Number(v).toFixed(1)} min`);
@@ -415,8 +428,10 @@ export default function DashboardPage() {
     return v;
   };
 
+  // Default filter state: years=[2026] is the intended baseline — not "active filtering"
+  const DEFAULT_YEAR_IS_ACTIVE = !(selectedYears.length === 1 && selectedYears[0] === 2026);
   const filtersActive = selectedPlans.length < ALL_PLANS.length || 
-                        selectedYears.length < ALL_YEARS.length ||
+                        DEFAULT_YEAR_IS_ACTIVE ||
                         selectedCountries.length < ALL_COUNTRIES.length;
 
   const generateSuggestedPrompts = () => {
@@ -426,15 +441,15 @@ export default function DashboardPage() {
 
     const prompts = [];
 
-    // 1. Data-driven prompt based on MRR or Net MRR Growth
+    // 1. Data-driven prompt based on Total Revenue or Net MRR Growth
     if (kpis.netMrrGrowth.data != null && kpis.netMrrGrowth.trend != null && Math.abs(kpis.netMrrGrowth.trend) > 5) {
       prompts.push(`Break down MRR bridge by component to investigate the recent net MRR change`);
-    } else if (kpis.mrr.data != null && kpis.mrr.trend != null) {
-      prompts.push(`Break down Total MRR by country to see the recent trend`);
+    } else if (kpis.revenue.data != null && kpis.revenue.trend != null) {
+      prompts.push(`Break down Total Revenue by country to see the year-over-year trend`);
     } else {
-      let p = "What's our MRR this month?";
-      if (plansFiltered) p = `How does MRR trend for ${selectedPlans.join(" & ")} plans?`;
-      else if (countriesFiltered) p = `What's our MRR in ${selectedCountries.join(" & ")}?`;
+      let p = "What's our total revenue this year?";
+      if (plansFiltered) p = `How does revenue trend for ${selectedPlans.join(' & ')} plans?`;
+      else if (countriesFiltered) p = `What's our revenue in ${selectedCountries.join(' & ')}?`;
       prompts.push(p);
     }
 
@@ -533,9 +548,9 @@ export default function DashboardPage() {
                 <button
                   onClick={() => { 
                     setSelectedPlans([...ALL_PLANS]); 
-                    setSelectedYears([...ALL_YEARS]); 
+                    setSelectedYears([2026]); 
                     setSelectedCountries([...ALL_COUNTRIES]);
-                    loadDashboardData([...ALL_PLANS], [...ALL_YEARS], [...ALL_COUNTRIES]); 
+                    loadDashboardData([...ALL_PLANS], [2026], [...ALL_COUNTRIES]); 
                   }}
                   className="text-sm text-[#0D9488] hover:text-[#0D9488]/80 font-bold transition-colors"
                   style={{ fontFamily: 'DM Sans, sans-serif' }}
@@ -563,7 +578,7 @@ export default function DashboardPage() {
               </div>
             )}
             <div className={`grid gap-4 ${drawerOpen ? 'grid-cols-2 xl:grid-cols-3' : 'grid-cols-2 lg:grid-cols-3 xl:grid-cols-6'}`}>
-              <KpiTile label="TOTAL MRR"        value={fmtCurrency(kpis.mrr.data)}                                       prevValue={kpis.mrr.prevData}          formatter={fmtCurrency}    trend={kpis.mrr.trend}          trendIsGood={kpis.mrr.trendIsGood}          loading={kpis.mrr.loading}          error={kpis.mrr.error} />
+              <KpiTile label="TOTAL REVENUE"     value={fmtCurrency(kpis.revenue.data)}                                       prevValue={kpis.revenue.prevData}       formatter={fmtCurrency}    trend={kpis.revenue.trend}       trendIsGood={kpis.revenue.trendIsGood}       loading={kpis.revenue.loading}       error={kpis.revenue.error} />
               <KpiTile label="NET MRR GROWTH"   value={kpis.netMrrGrowth.data != null ? `${kpis.netMrrGrowth.data >= 0 ? '+' : ''}${(kpis.netMrrGrowth.data * 100).toFixed(1)}%` : '—'} prevValue={kpis.netMrrGrowth.prevData} formatter={v => `${(Number(v)*100).toFixed(1)}%`} trend={kpis.netMrrGrowth.trend} trendIsGood={kpis.netMrrGrowth.trendIsGood} loading={kpis.netMrrGrowth.loading} error={kpis.netMrrGrowth.error} />
               <KpiTile label="ACTIVE SUBSCRIBERS" value={fmtInt(kpis.subs.data)}                                         prevValue={kpis.subs.prevData}         formatter={fmtInt}         trend={kpis.subs.trend}         trendIsGood={kpis.subs.trendIsGood}         loading={kpis.subs.loading}         error={kpis.subs.error} />
               <KpiTile label="AVG WATCH TIME"   value={fmtWatchTime(kpis.watchTime.data)}                                prevValue={kpis.watchTime.prevData}    formatter={fmtWatchTime}   trend={kpis.watchTime.trend}    trendIsGood={kpis.watchTime.trendIsGood}    loading={kpis.watchTime.loading}    error={kpis.watchTime.error} />
