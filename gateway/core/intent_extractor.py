@@ -432,9 +432,9 @@ class IntentExtractor:
 {widget_summary}
 
 ## RULES FOR DASHBOARD CONTEXT:
-1. When the user asks about a metric visible on the dashboard without deeper breakdowns, reference the value already shown rather than re-querying. Do this by setting `metrics` to `[]`, `needs_clarification` to `true`, and writing your answer in `clarification_reason` starting with "Based on what's currently on your dashboard...".
-2. When the user asks for a breakdown or deeper slice not shown on the dashboard, route that to the semantic layer as a normal new query (extract metrics/dimensions).
-3. Always respect the active filter context. If filters are applied in the CURRENT DASHBOARD STATE, your extracted `filters` array MUST reflect that scope unless the user explicitly asks to ignore them.
+1. When the user asks about a metric visible on the dashboard without deeper breakdowns (AND their question does not ask for a different time period or filter than the active ones), reference the value already shown rather than re-querying. Do this by setting `metrics` to `[]`, `needs_clarification` to `true`, and writing your answer in `clarification_reason` starting with "Based on what's currently on your dashboard...".
+2. When the user asks for a breakdown, deeper slice, or a different time period/filter not currently shown on the dashboard, route that to the semantic layer as a normal new query (extract metrics/dimensions).
+3. Always respect the active filter context. If filters are applied in the CURRENT DASHBOARD STATE, your extracted `filters` array MUST reflect that scope unless the user explicitly asks to ignore them or change them.
 4. Never contradict the numbers currently visible on the dashboard.
 5. If the user changes a filter, the dashboard context will be re-injected — always use the most recent context provided.
 """
