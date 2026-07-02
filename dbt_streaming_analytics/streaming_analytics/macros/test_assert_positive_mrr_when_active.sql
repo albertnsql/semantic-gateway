@@ -7,7 +7,7 @@ with validation as (
 validation_errors as (
     select *
     from validation
-    where {{ column_name }} <= 0
+    where {{ column_name }} < 0
       and is_active = true
 )
 

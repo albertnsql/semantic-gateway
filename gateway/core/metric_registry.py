@@ -437,6 +437,7 @@ class MetricRegistry:
         _METRIC_TO_SEM: dict[str, str] = {
             "mrr": "sem_mrr",
             "expansion_mrr": "sem_mrr",
+            "total_revenue": "sem_mrr",
             "ltv": "sem_payments",
             "engagement_rate": "sem_stream_sessions",
             "avg_watch_time": "sem_stream_sessions",
