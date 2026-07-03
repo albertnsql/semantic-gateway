@@ -8,7 +8,7 @@ import KpiTile from '../components/dashboard/KpiTile';
 import ChartCard from '../components/dashboard/ChartCard';
 import ChatPanel from '../components/dashboard/ChatPanel';
 import LoadingSpinner from '../components/LoadingSpinner';
-import { fetchDashboardWidget } from '../api/dashboard';
+import { fetchDashboardWidget, fetchDashboardMetadata } from '../api/dashboard';
 import { postQuery } from '../api/query';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
@@ -132,6 +132,8 @@ export default function DashboardPage() {
   const [drawerOpen, setDrawerOpen]         = useState(true);
   const [globalError, setGlobalError]       = useState(false);
   const [lastRefreshed, setLastRefreshed]   = useState(new Date());
+  const [maxDateStr, setMaxDateStr] = useState('Loading latest data...');
+  const [dataAsOf, setDataAsOf] = useState('Loading...');
 
   const [selectedPlans,  setSelectedPlans]  = useState([...ALL_PLANS]);
   const [selectedYears,  setSelectedYears]  = useState([2026]);
@@ -150,7 +152,7 @@ export default function DashboardPage() {
     } catch (e) {}
     return [{
       role: 'agent', status: 'success',
-      content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through May 2026 and refreshed monthly."
+      content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through June 2026 and refreshed monthly."
     }];
   });
 
@@ -323,7 +325,26 @@ export default function DashboardPage() {
     }
   };
 
-  useEffect(() => { loadDashboardData(); }, []);
+  useEffect(() => { 
+    fetchDashboardMetadata().then(res => {
+      if (res.status === 'success' && res.maxDate) {
+        const d = new Date(res.maxDate + 'T00:00:00');
+        if (!isNaN(d.getTime())) {
+          const month = d.toLocaleString('en-US', { month: 'long' });
+          const shortMonth = d.toLocaleString('en-US', { month: 'short' });
+          setMaxDateStr(`Data through ${month} ${d.getFullYear()}`);
+          setDataAsOf(`${shortMonth} ${d.getFullYear()}`);
+        } else {
+          setMaxDateStr(`Data through ${res.maxDate}`);
+          setDataAsOf(res.maxDate);
+        }
+      } else {
+        setMaxDateStr('Data through June 2026');
+        setDataAsOf('June 2026');
+      }
+    });
+    loadDashboardData(); 
+  }, []);
 
   useEffect(() => {
     const activeFilters = {
@@ -356,7 +377,7 @@ export default function DashboardPage() {
     setChatContext({
       active_filters: activeFilters,
       visible_widgets: visibleWidgets,
-      data_as_of: 'May 2026',
+      data_as_of: dataAsOf,
       page: 'dashboard'
     });
   }, [selectedPlans, selectedYears, selectedCountries, kpis]);
@@ -405,7 +426,7 @@ export default function DashboardPage() {
   };
 
   const handleClearChat = () => {
-    setMessages([{ role: 'agent', status: 'success', content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through May 2026 and refreshed monthly." }]);
+    setMessages([{ role: 'agent', status: 'success', content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through June 2026 and refreshed monthly." }]);
     setShowPrompts(true);
     sessionStorage.removeItem('dashboard_chat_messages');
     sessionStorage.removeItem('dashboard_chat_input');
@@ -491,7 +512,7 @@ export default function DashboardPage() {
             <div>
               <h1 className="text-4xl font-black text-[#1A3A38] tracking-tight" style={{ fontFamily: 'Nunito, sans-serif' }}>Executive Overview</h1>
               <p className="text-sm text-[#4A7B76] mt-1" style={{ fontFamily: 'DM Sans, sans-serif' }}>Key metrics across your streaming SaaS business</p>
-              <p className="text-xs text-gray-400 mt-1" style={{ fontFamily: 'DM Sans, sans-serif' }}>⚠ Data available through May 2026</p>
+              <p className="text-xs text-gray-400 mt-1" style={{ fontFamily: 'DM Sans, sans-serif' }}>⚠ {maxDateStr}</p>
             </div>
             <div className="flex items-center gap-3 flex-wrap justify-end">
               <span
@@ -499,7 +520,7 @@ export default function DashboardPage() {
                 style={{ fontFamily: 'DM Sans, sans-serif' }}
               >
                 <Calendar size={12} className="text-[#4A7B76]" />
-                Data through May 2026
+                {maxDateStr}
               </span>
               <Button variant="outline" onClick={() => loadDashboardData(selectedPlans, selectedYears, selectedCountries)} title="Force refresh">
                 <RotateCw size={14} className="text-slate-500" /> Refresh

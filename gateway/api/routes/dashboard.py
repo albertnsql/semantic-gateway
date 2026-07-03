@@ -65,11 +65,11 @@ _ALLOWED_COUNTRIES: frozenset[str] = frozenset({"US", "IN", "GB", "DE", "BR"})
 # Data-through date = last known data month within current year (hard-coded here
 # as 2026-05-01 since data is current through May 2026).
 
-_DEFAULT_DATA_THROUGH: str = "2026-05-01"   # Last available data month
+_DEFAULT_DATA_THROUGH: str = "2026-06-01"   # Last available data month
 _DEFAULT_CURRENT_YEAR: int = 2026
 
 
-def _resolve_yoy_dates(years: list[int]) -> dict:
+def _resolve_yoy_dates(years: list[int], max_data_date: str) -> dict:
     """
     Compute YoY date parameters from the selected years filter.
 
@@ -147,14 +147,14 @@ def _country_clause(countries: list[str], col: str = "country") -> str:
 # Each function accepts (plans, years, content_types, countries) and returns a ready-to-execute SQL string.
 # SQL is static — only safe whitelisted filter values are interpolated.
 
-def _sql_revenue_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_revenue_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Total Revenue — FLOW metric.
     Comparison: period-sum for Jan-through-datathrough of current year
                 vs the same partial-year range in the prior year.
     Returns 2 rows: period_bucket IN ('current', 'prior_year') with summed value.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     return f"""
 -- Dashboard: revenue_kpi — Total Revenue (flow metric, period-sum YoY)
 SELECT
@@ -178,18 +178,18 @@ ORDER BY
 
 
 # Keep mrr_kpi as a backward-compatible alias (same underlying data, no label change in SQL)
-def _sql_mrr_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_mrr_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """Backward-compat alias — routes that still call mrr_kpi get revenue_kpi data."""
-    return _sql_revenue_kpi(plans, years, countries)
+    return _sql_revenue_kpi(plans, years, countries, max_data_date)
 
 
-def _sql_subs_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_subs_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Active Subscribers — STOCK metric (point-in-time snapshot).
     Comparison: latest available month vs same calendar month, prior year.
     Returns 2 rows ordered current first.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     return f"""
 -- Dashboard: subs_kpi — Active subscriber count (stock snapshot YoY)
 SELECT
@@ -205,14 +205,14 @@ ORDER BY 1 DESC
 """.strip()
 
 
-def _sql_watch_time_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_watch_time_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Avg Watch Time — STOCK metric (point-in-time snapshot).
     Comparison: latest available month vs same calendar month, prior year.
     Source: fct_stream_sessions (session_start)
     Returns 2 rows ordered current first.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     # next-month boundary for each snapshot window
     curr_month_num  = int(d['data_through_date'][5:7])
     curr_year_num   = int(d['data_through_date'][:4])
@@ -237,7 +237,7 @@ ORDER BY 1 DESC
 """.strip()
 
 
-def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Net MRR Growth % — RATE metric (custom handling).
     Comparison:
@@ -245,7 +245,7 @@ def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[
       prior_yr = growth rate for the same calendar month one year prior (e.g. May 2025 vs Apr 2025)
     Returns 2 rows: ('current', rate) and ('prior_year', rate) ordered current first.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
 
@@ -300,14 +300,14 @@ ORDER BY
 """.strip()
 
 
-def _sql_engagement_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_engagement_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Avg Engagement — STOCK metric (point-in-time snapshot).
     Comparison: latest available month vs same calendar month, prior year.
     Source: fct_stream_sessions (session_start, completion_pct)
     Returns 2 rows ordered current first.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     curr_month_num  = int(d['data_through_date'][5:7])
     curr_year_num   = int(d['data_through_date'][:4])
     prior_year_num  = curr_year_num - 1
@@ -331,14 +331,14 @@ ORDER BY 1 DESC
 """.strip()
 
 
-def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Churn Rate — STOCK metric (point-in-time snapshot).
     Comparison: latest available month vs same calendar month, prior year.
     Formula unchanged: churned / total active-or-churned subscribers per month.
     Returns 2 rows ordered current first.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
     return f"""
@@ -356,7 +356,7 @@ ORDER BY 1 DESC
 """.strip()
 
 
-def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Subscriber Distribution — STOCK metric (point-in-time snapshot).
     Shows plan-mix as of the latest available month within the selected year.
@@ -364,7 +364,7 @@ def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str]) -> s
     For prior complete years (2025), use Dec of that year.
     Never averages across months — always a single-month snapshot.
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     # Inner subquery resolves to the latest available month within the selected year window
     selected_year_start = d['current_year_start']
     selected_year_cap   = d['data_through_date']     # capped at last available data month
@@ -388,7 +388,7 @@ ORDER BY 2 DESC
 """.strip()
 
 
-def _sql_mrr_bridge(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_mrr_bridge(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     # Returns one row per (period_month, mrr_type) for the last 12 months.
     # mrr_usd is always positive in fct_mrr_monthly; contraction and churned rows
     # are negated here so the frontend can stack them below the zero baseline.
@@ -402,8 +402,8 @@ SELECT
     SUM(CASE WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd ELSE mrr_usd END) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE mrr_type IN ('new', 'expansion', 'contraction', 'churned')
-  AND period_month >= DATEADD(month, -12, '2026-05-01'::date)
-  AND period_month <= '2026-05-01'::date
+  AND period_month >= DATEADD(month, -12, '{max_data_date}'::date)
+  AND period_month <= '{max_data_date}'::date
   {plan_filter}
   {country_filter}
 GROUP BY 1, 2
@@ -411,7 +411,7 @@ ORDER BY 1
 """.strip()
 
 
-def _sql_mrr_trend(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_mrr_trend(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     return f"""
 -- Dashboard: mrr_trend — MRR by month for the selected period (area chart)
 SELECT
@@ -419,8 +419,8 @@ SELECT
     SUM(mrr_usd)                AS mrr
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE is_active = TRUE
-  AND period_month >= DATEADD('month', -12, '2026-05-01'::date)
-  AND period_month <= '2026-05-01'::date
+  AND period_month >= DATEADD('month', -12, '{max_data_date}'::date)
+  AND period_month <= '{max_data_date}'::date
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY period_month
@@ -428,7 +428,7 @@ ORDER BY period_month
 """.strip()
 
 
-def _sql_retention_trend(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_retention_trend(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     return f"""
 -- Dashboard: retention_trend — Retention Rate Trend (12 months)
 SELECT
@@ -439,8 +439,8 @@ SELECT
       NULLIF(COUNT(DISTINCT subscription_id), 0), 1
     ) AS retention_rate
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month >= DATEADD('month', -12, '2026-05-01'::date)
-  AND period_month <= '2026-05-01'::date
+WHERE period_month >= DATEADD('month', -12, '{max_data_date}'::date)
+  AND period_month <= '{max_data_date}'::date
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY DATE_TRUNC('month', period_month), name
@@ -448,7 +448,7 @@ ORDER BY sort_key ASC
 """.strip()
 
 
-def _sql_sessions_trend(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_sessions_trend(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
     return f"""
 -- Dashboard: sessions_trend — Stream session count by month, last 12 months (bar chart)
@@ -457,22 +457,22 @@ SELECT
     DATE_TRUNC('month', session_start)                       AS sort_key,
     COUNT(*)                                                     AS sessions
 FROM {_DB}.marts.fct_stream_sessions
-WHERE session_start >= DATEADD('month', -12, '2026-05-01'::date)
-  AND session_start < '2026-06-01'::date
+WHERE session_start >= DATEADD('month', -12, '{max_data_date}'::date)
+  AND session_start < DATEADD('month', 1, '{max_data_date}'::date)
   {plan_filter}
   {_country_clause(countries)}
 GROUP BY DATE_TRUNC('month', session_start), name
 ORDER BY sort_key
 """.strip()
 
-def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: list[str]) -> str:
+def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
     Avg Watch Time by Content Type — STOCK metric (point-in-time snapshot).
     Now respects the Years filter: shows avg watch time for sessions in the
     latest available month within the selected year (same snapshot convention
     as the Avg Watch Time KPI tile and Subscriber Distribution chart).
     """
-    d = _resolve_yoy_dates(years)
+    d = _resolve_yoy_dates(years, max_data_date)
     curr_month_num = int(d['data_through_date'][5:7])
     curr_year_num  = int(d['data_through_date'][:4])
     curr_next_month = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
@@ -497,7 +497,7 @@ ORDER BY value DESC
 
 # ── Widget registry — name → SQL builder function ──────────────────────────────
 
-_WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str]], str]] = {
+_WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str], str], str]] = {
     # revenue_kpi: Total Revenue (flow metric, period-sum YoY) — primary ID used by frontend
     "revenue_kpi":          _sql_revenue_kpi,
     # mrr_kpi: backward-compat alias — resolves to the same revenue_kpi SQL
@@ -519,7 +519,34 @@ _WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str]], str]] = {
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get(
+    "/dashboard/metadata",
+    summary="Fetch dashboard metadata",
+    tags=["Dashboard"],
+)
+async def get_dashboard_metadata(request: Request) -> JSONResponse:
+    query_cache = getattr(request.app.state, "query_cache", None)
+    max_date = _DEFAULT_DATA_THROUGH
+    if query_cache is not None:
+        cached_md = query_cache.get({"type": "max_date"})
+        if cached_md:
+            max_date = cached_md["date"]
+        else:
+            try:
+                rows = request.app.state.sql_generator.execute_query(
+                    f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE"
+                )
+                if rows and rows[0].get("MAX_DATE"):
+                    max_date = str(rows[0]["MAX_DATE"])[:10]
+                elif rows and rows[0].get("max_date"):
+                    max_date = str(rows[0]["max_date"])[:10]
+                query_cache.set({"type": "max_date"}, {"date": max_date})
+            except Exception as e:
+                pass
+    return JSONResponse(content={"max_date": max_date})
+
+@router.get(
     "/dashboard/widgets",
+
     summary="List all available dashboard widget IDs",
     description="Returns the set of widget IDs accepted by GET /api/v1/dashboard/{widget}.",
     tags=["Dashboard"],

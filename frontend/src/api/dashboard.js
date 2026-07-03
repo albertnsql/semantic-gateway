@@ -41,6 +41,15 @@ export async function fetchDashboardWidget(widgetId, { planTypes = [], years = [
   }
 }
 
+export async function fetchDashboardMetadata() {
+  try {
+    const response = await apiClient.get('/dashboard/metadata');
+    return { status: 'success', maxDate: response.data.max_date };
+  } catch (error) {
+    return { status: 'error', error: error.message };
+  }
+}
+
 /**
  * Legacy: Fetch dashboard data via the full NL query pipeline.
  * Kept as a fallback — do NOT use this for dashboard widgets.
