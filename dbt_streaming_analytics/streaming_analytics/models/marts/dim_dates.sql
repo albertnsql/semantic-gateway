@@ -5,7 +5,7 @@
 
 with date_spine as (
     select dateadd(day, seq4(), '2022-01-01'::date) as date_day
-    from table(generator(rowcount => 1096)) -- 3 years of days (2022 to 2024 inclusive)
+    from table(generator(rowcount => 2192)) -- 6 years of days (2022 to 2027 inclusive)
 ),
 
 final as (

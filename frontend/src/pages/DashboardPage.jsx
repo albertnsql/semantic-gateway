@@ -375,7 +375,7 @@ export default function DashboardPage() {
       countries: selectedCountries.length === ALL_COUNTRIES.length ? ['all'] : selectedCountries
     };
 
-    const fmtCurrencyRaw = v => v == null ? '—' : `$${(Number(v)).toLocaleString()}`;
+    const fmtCurrencyRaw = v => v == null ? '—' : `$${Number(v).toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`;
     
     const visibleWidgets = [];
     const addWidget = (id, label, kpiObj, format) => {

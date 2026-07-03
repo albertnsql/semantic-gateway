@@ -163,7 +163,12 @@ class MetricRegistry:
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:
                     m_def.certified_dimensions.extend(sub_sem.dimensions + sub_sem.time_dimensions)
-            elif m_name in ("engagement_rate", "recommendation_ctr"):
+            elif m_name in (
+                "engagement_rate", "recommendation_ctr", 
+                "total_recommendations", "clicked_recommendations",
+                "avg_watch_time", "total_watch_time",
+                "avg_buffering_events", "total_buffering_events", "total_sessions"
+            ):
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:
                     m_def.certified_dimensions.extend(sub_sem.dimensions + sub_sem.time_dimensions)
@@ -438,11 +443,16 @@ class MetricRegistry:
             "mrr": "sem_mrr",
             "expansion_mrr": "sem_mrr",
             "total_revenue": "sem_mrr",
+            "net_mrr_growth": "sem_mrr",
             "ltv": "sem_payments",
             "engagement_rate": "sem_stream_sessions",
             "avg_watch_time": "sem_stream_sessions",
             "total_watch_time": "sem_stream_sessions",
+            "avg_buffering_events": "sem_stream_sessions",
+            "total_buffering_events": "sem_stream_sessions",
+            "total_sessions": "sem_stream_sessions",
             "churn_rate": "sem_subscribers",
+            "retention_rate": "sem_subscribers",
             "total_subscribers": "sem_subscribers",
             "churned_subscribers": "sem_subscribers",
             "recommendation_ctr": "sem_recommendation_events",
