@@ -422,10 +422,7 @@ export default function DashboardPage() {
     const next = selectedYears.includes(year) ? selectedYears.filter(y => y !== year) : [...selectedYears, year];
     setSelectedYears(next);
   };
-  const selectAllYears = () => {
-    const next = selectedYears.length === ALL_YEARS.length ? [] : [...ALL_YEARS];
-    setSelectedYears(next);
-  };
+
 
   // ── Chat handlers ─────────────────────────────────────────────────────────
   const handleSendChat = async (text) => {
