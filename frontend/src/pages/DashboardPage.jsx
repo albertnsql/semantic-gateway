@@ -25,7 +25,7 @@ const generateMockForecast = () => MONTHS.map((name, i) => ({ name, value: Math.
 const PIE_COLORS = ['#0F766E', '#14B8A6', '#2DD4BF'];
 
 const ALL_PLANS = ['basic', 'standard', 'premium'];
-const ALL_YEARS = [2023, 2024, 2025, 2026];
+// ALL_YEARS is built dynamically from the metadata endpoint — see initYears state below
 const ALL_COUNTRIES = ['US', 'IN', 'GB', 'DE', 'BR'];
 
 // ── Filter Dropdown Component ─────────────────────────────────────────────
@@ -135,6 +135,9 @@ export default function DashboardPage() {
   const [maxDateStr, setMaxDateStr] = useState('Loading latest data...');
   const [dataAsOf, setDataAsOf] = useState('Loading...');
 
+  const [allYears, setAllYears] = useState([2021, 2022, 2023, 2024, 2025, 2026]);
+  const [latestYear, setLatestYear] = useState(2026);
+
   const [selectedPlans,  setSelectedPlans]  = useState([...ALL_PLANS]);
   const [selectedYears,  setSelectedYears]  = useState([2026]);
   const [selectedCountries, setSelectedCountries] = useState([...ALL_COUNTRIES]);
@@ -152,7 +155,7 @@ export default function DashboardPage() {
     } catch (e) {}
     return [{
       role: 'agent', status: 'success',
-      content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through June 2026 and refreshed monthly."
+      content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below."
     }];
   });
 
@@ -191,7 +194,7 @@ export default function DashboardPage() {
     setCharts(prev => { const s={}; Object.keys(prev).forEach(k => s[k]={...prev[k], loading:true}); return s; });
 
     const allPlansSelected = plans.length === ALL_PLANS.length;
-    const allYearsSelected = years.length === ALL_YEARS.length;
+    const allYearsSelected = years.length === allYears.length;
     const allCountriesSelected = countries.length === ALL_COUNTRIES.length;
 
     const filterPlanTypes    = allPlansSelected ? [] : plans;
@@ -332,15 +335,34 @@ export default function DashboardPage() {
         if (!isNaN(d.getTime())) {
           const month = d.toLocaleString('en-US', { month: 'long' });
           const shortMonth = d.toLocaleString('en-US', { month: 'short' });
-          setMaxDateStr(`Data through ${month} ${d.getFullYear()}`);
-          setDataAsOf(`${shortMonth} ${d.getFullYear()}`);
+          const year = d.getFullYear();
+          setMaxDateStr(`Data through ${month} ${year}`);
+          setDataAsOf(`${shortMonth} ${year}`);
+
+          // Build dynamic year list: 2021 → latest data year
+          const latestYr = year;
+          const years = [];
+          for (let y = 2021; y <= latestYr; y++) years.push(y);
+          setAllYears(years);
+          setLatestYear(latestYr);
+          setSelectedYears([latestYr]);
+
+          // Update welcome message with live data date
+          const dateLabel = `${month} ${year}`;
+          const welcomeMsg = `Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through ${dateLabel} and refreshed monthly.`;
+          setMessages(prev => {
+            if (prev.length === 1 && prev[0].role === 'agent') {
+              return [{ ...prev[0], content: welcomeMsg }];
+            }
+            return prev;
+          });
         } else {
           setMaxDateStr(`Data through ${res.maxDate}`);
           setDataAsOf(res.maxDate);
         }
       } else {
-        setMaxDateStr('Data through June 2026');
-        setDataAsOf('June 2026');
+        setMaxDateStr('Data through latest available');
+        setDataAsOf('Latest available');
       }
     });
     loadDashboardData(); 
@@ -426,7 +448,8 @@ export default function DashboardPage() {
   };
 
   const handleClearChat = () => {
-    setMessages([{ role: 'agent', status: 'success', content: "Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below. Note: Data is current through June 2026 and refreshed monthly." }]);
+    const dateLabel = dataAsOf !== 'Loading...' ? ` Note: Data is current through ${dataAsOf} and refreshed monthly.` : '';
+    setMessages([{ role: 'agent', status: 'success', content: `Hi! I'm your Semantic Gateway. I can answer questions about MRR, churn, engagement, and LTV — all grain-validated before execution. Try one of the suggestions below.${dateLabel}` }]);
     setShowPrompts(true);
     sessionStorage.removeItem('dashboard_chat_messages');
     sessionStorage.removeItem('dashboard_chat_input');
@@ -449,8 +472,8 @@ export default function DashboardPage() {
     return v;
   };
 
-  // Default filter state: years=[2026] is the intended baseline — not "active filtering"
-  const DEFAULT_YEAR_IS_ACTIVE = !(selectedYears.length === 1 && selectedYears[0] === 2026);
+  // Default filter state: single latest year selected is the baseline — not "active filtering"
+  const DEFAULT_YEAR_IS_ACTIVE = !(selectedYears.length === 1 && selectedYears[0] === latestYear);
   const filtersActive = selectedPlans.length < ALL_PLANS.length || 
                         DEFAULT_YEAR_IS_ACTIVE ||
                         selectedCountries.length < ALL_COUNTRIES.length;
@@ -537,7 +560,10 @@ export default function DashboardPage() {
             }}
           >
             <FilterDropdown label="Plans" options={ALL_PLANS} selected={selectedPlans} onToggle={togglePlan} onSelectAll={selectAllPlans} icon={Filter} />
-            <FilterDropdown label="Years" options={ALL_YEARS} selected={selectedYears} onToggle={toggleYear} onSelectAll={selectAllYears} icon={Calendar} />
+            <FilterDropdown label="Years" options={allYears} selected={selectedYears} onToggle={toggleYear} onSelectAll={() => {
+              const next = selectedYears.length === allYears.length ? [] : [...allYears];
+              setSelectedYears(next);
+            }} icon={Calendar} />
 
             <div className="h-6 w-px mx-1" style={{ background: 'rgba(13,148,136,0.15)' }} />
 
@@ -569,9 +595,9 @@ export default function DashboardPage() {
                 <button
                   onClick={() => { 
                     setSelectedPlans([...ALL_PLANS]); 
-                    setSelectedYears([2026]); 
+                    setSelectedYears([latestYear]); 
                     setSelectedCountries([...ALL_COUNTRIES]);
-                    loadDashboardData([...ALL_PLANS], [2026], [...ALL_COUNTRIES]); 
+                    loadDashboardData([...ALL_PLANS], [latestYear], [...ALL_COUNTRIES]); 
                   }}
                   className="text-sm text-[#0D9488] hover:text-[#0D9488]/80 font-bold transition-colors"
                   style={{ fontFamily: 'DM Sans, sans-serif' }}

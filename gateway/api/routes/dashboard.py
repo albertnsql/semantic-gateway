@@ -48,8 +48,9 @@ _DB = "STREAMING_ANALYTICS"
 # Whitelisted plan values — must match actual PLAN_TYPE values in fct_mrr_monthly / dim_subscribers
 _ALLOWED_PLANS: frozenset[str] = frozenset({"basic", "standard", "premium"})
 
-# Whitelisted year values — expand as needed
-_ALLOWED_YEARS: frozenset[int] = frozenset({2021, 2022, 2023, 2024, 2025, 2026})
+# Whitelisted year values — dynamically covers 2021 through the current calendar year.
+import datetime as _dt
+_ALLOWED_YEARS: frozenset[int] = frozenset(range(2021, _dt.date.today().year + 1))
 
 _ALLOWED_CONTENT_TYPES: frozenset[str] = frozenset({"movie", "series", "documentary", "short"})
 _ALLOWED_COUNTRIES: frozenset[str] = frozenset({"US", "IN", "GB", "DE", "BR"})
@@ -62,11 +63,11 @@ _ALLOWED_COUNTRIES: frozenset[str] = frozenset({"US", "IN", "GB", "DE", "BR"})
 # dynamically via _resolve_yoy_dates(). When no year is passed, defaults below apply.
 #
 # Rule: current year = max(selected_years), prior year = current year - 1.
-# Data-through date = last known data month within current year (hard-coded here
-# as 2026-05-01 since data is current through May 2026).
+# Data-through date = fetched live from Snowflake (MAX(period_month)); this constant
+# is only used as a last-resort fallback when the DB is unreachable.
 
-_DEFAULT_DATA_THROUGH: str = "2026-06-01"   # Last available data month
-_DEFAULT_CURRENT_YEAR: int = 2026
+_DEFAULT_DATA_THROUGH: str = "2026-06-01"   # Fallback only — overridden by live Snowflake query
+_DEFAULT_CURRENT_YEAR: int = _dt.date.today().year
 
 
 def _resolve_yoy_dates(years: list[int], max_data_date: str) -> dict:
@@ -533,7 +534,7 @@ async def get_dashboard_metadata(request: Request) -> JSONResponse:
         else:
             try:
                 rows = request.app.state.sql_generator.execute_query(
-                    f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE"
+                    f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE AND mrr_type = 'new'"
                 )
                 if rows and rows[0].get("MAX_DATE"):
                     max_date = str(rows[0]["MAX_DATE"])[:10]
@@ -678,16 +679,46 @@ async def get_dashboard_widget(
                 headers={"X-Cache": "HIT"},
             )
 
-    # ── 4. Build pre-certified SQL ────────────────────────────────────────────
+    # ── 4. Resolve max_data_date (live from Snowflake, cached) ───────────────
+    max_data_date = _DEFAULT_DATA_THROUGH
+    sql_gen = request.app.state.sql_generator
+    if query_cache is not None:
+        cached_md = query_cache.get({"type": "max_date"})
+        if cached_md:
+            max_data_date = cached_md["date"]
+        else:
+            try:
+                md_rows = sql_gen.execute_query(
+                    f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE AND mrr_type = 'new'"
+                )
+                if md_rows and md_rows[0].get("MAX_DATE"):
+                    max_data_date = str(md_rows[0]["MAX_DATE"])[:10]
+                elif md_rows and md_rows[0].get("max_date"):
+                    max_data_date = str(md_rows[0]["max_date"])[:10]
+                query_cache.set({"type": "max_date"}, {"date": max_data_date})
+            except Exception:
+                pass  # fall back to _DEFAULT_DATA_THROUGH
+    else:
+        try:
+            md_rows = sql_gen.execute_query(
+                f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE AND mrr_type = 'new'"
+            )
+            if md_rows and md_rows[0].get("MAX_DATE"):
+                max_data_date = str(md_rows[0]["MAX_DATE"])[:10]
+            elif md_rows and md_rows[0].get("max_date"):
+                max_data_date = str(md_rows[0]["max_date"])[:10]
+        except Exception:
+            pass
+
+    # ── 5. Build pre-certified SQL ────────────────────────────────────────────
     sql_fn = _WIDGET_SQL[widget]
-    compiled_sql = sql_fn(parsed_plans, parsed_years, parsed_countries)
+    compiled_sql = sql_fn(parsed_plans, parsed_years, parsed_countries, max_data_date)
     logger.info(
-        "[%s] Dashboard widget=%s plans=%s years=%s countries=%s — executing SQL",
-        request_id, widget, parsed_plans or "all", parsed_years or "all", parsed_countries or "all"
+        "[%s] Dashboard widget=%s plans=%s years=%s countries=%s max_date=%s — executing SQL",
+        request_id, widget, parsed_plans or "all", parsed_years or "all", parsed_countries or "all", max_data_date
     )
 
-    # ── 5. Execute against Snowflake pool ────────────────────────────────────
-    sql_gen = request.app.state.sql_generator
+    # ── 6. Execute against Snowflake pool ────────────────────────────────────
     try:
         rows: list[dict] = sql_gen.execute_query(compiled_sql)
     except Exception as exc:
@@ -710,7 +741,7 @@ async def get_dashboard_widget(
         "cache_hit": False,
     }
 
-    # ── 6. Store in cache ─────────────────────────────────────────────────────
+    # ── 7. Store in cache ─────────────────────────────────────────────────────
     payload = make_json_safe(payload)
     if query_cache is not None:
         query_cache.set(cache_key, payload)
