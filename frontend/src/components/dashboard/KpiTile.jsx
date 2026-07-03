@@ -110,7 +110,7 @@ export default function KpiTile({
             )}
           </div>
         ) : (
-          <div className="mt-2.5 text-xs text-[#4A7B76]">—</div>
+          <div className="mt-2.5 h-[20px]" />
         )}
       </div>
 

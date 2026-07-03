@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { RotateCw, ShieldCheck, ChevronDown, Check, Filter, Database, Zap, Calendar, Cloud, Download } from 'lucide-react';
+import { RotateCw, ShieldCheck, ChevronDown, Check, Filter, Database, Zap, Calendar, Cloud, Download, Info } from 'lucide-react';
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, Tooltip, ResponsiveContainer, Legend, CartesianGrid, Label
@@ -616,6 +616,12 @@ export default function DashboardPage() {
 
           {/* ── Row 2: KPIs ─────────────────────────────────────────────── */}
           <div>
+            {selectedYears.length > 1 && (
+              <div className="mb-4 flex items-center gap-2 p-3 rounded-xl bg-amber-50/50 border border-amber-100 text-amber-800 text-sm animate-fade-in font-medium">
+                <Info size={16} />
+                Year-over-year comparisons are shown only when a single year is selected.
+              </div>
+            )}
             {filtersActive && (
               <div className="flex items-center justify-end gap-1.5 text-xs font-bold text-amber-600 mb-2 px-1 animate-fade-in">
                 <Filter size={12} /> Filtered View Active

@@ -1,7 +1,9 @@
 /**
  * pages/LandingPage.jsx — Overview / hero page. Claymorphism theme.
  */
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
+import { getMetrics } from '../api/metrics';
 import {
   Database, Server, Code2, Layers, Shield, Cpu, Monitor,
   XCircle, CheckCircle2, ArrowRight, BookOpen,
@@ -33,10 +35,10 @@ const PREVENTS = [
   },
 ];
 
-const GUARANTEES = [
+const getGuarantees = (metricCount) => [
   {
     title: 'Certified Metrics Only',
-    desc:  '10 MetricFlow-certified metrics exposed through the gateway. No ad-hoc column references allowed.',
+    desc:  `${metricCount} MetricFlow-certified metrics exposed through the gateway. No ad-hoc column references allowed.`,
   },
   {
     title: 'Grain-Aware Validation',
@@ -53,6 +55,18 @@ const CLAY_SHADOW_HOVER = `20px 20px 40px rgba(13,148,136,0.18), -12px -12px 28p
 const CLAY_BTN_SHADOW = `12px 12px 24px rgba(13,148,136,0.30), -8px -8px 16px rgba(255,255,255,0.4), inset 4px 4px 8px rgba(255,255,255,0.4), inset -4px -4px 8px rgba(0,0,0,0.08)`;
 
 export default function LandingPage() {
+  const [metricCount, setMetricCount] = useState('10');
+
+  useEffect(() => {
+    getMetrics().then(metrics => {
+      if (metrics && metrics.length > 0) {
+        setMetricCount(metrics.length.toString());
+      }
+    }).catch(err => console.error("Failed to fetch metric count:", err));
+  }, []);
+
+  const guarantees = getGuarantees(metricCount);
+
   return (
     <div className="max-w-5xl mx-auto flex flex-col gap-14 animate-fade-in relative z-10">
       {/* ── Hero ── */}
@@ -258,7 +272,7 @@ export default function LandingPage() {
           <span className="text-emerald-500">Guarantees</span>
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-8">
-          {GUARANTEES.map(({ title, desc }) => (
+          {guarantees.map(({ title, desc }) => (
             <div
               key={title}
               className="card-hover p-8 flex flex-col gap-6 rounded-[32px]"

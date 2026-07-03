@@ -3,7 +3,9 @@
  * Premium product-page layout: full-width alternating step cards.
  * Pipeline node step labels verified against actual gateway code (query.py).
  */
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
+import { getMetrics } from '../api/metrics';
 import {
   MessageSquare, Brain, Map, Code2, ShieldCheck, Zap, GitBranch,
   ArrowRight, Database, Server, Layers, Shield, Cpu, Monitor,
@@ -240,6 +242,16 @@ function StepCard({ step, flip }) {
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 export default function HowItWorksPage() {
+  const [metricCount, setMetricCount] = useState('10');
+
+  useEffect(() => {
+    getMetrics().then(metrics => {
+      if (metrics && metrics.length > 0) {
+        setMetricCount(metrics.length.toString());
+      }
+    }).catch(err => console.error("Failed to fetch metric count:", err));
+  }, []);
+
   return (
     <div className="max-w-5xl mx-auto flex flex-col gap-10 animate-fade-in relative z-10 pb-12">
 
@@ -289,7 +301,7 @@ export default function HowItWorksPage() {
             { v: '7',  l: 'Pipeline steps' },
             { v: '3',  l: 'Intent classes'  },
             { v: '2',  l: 'Cache layers'    },
-            { v: '10', l: 'Certified metrics' },
+            { v: metricCount, l: 'Certified metrics' },
           ].map(({ v, l }, i) => (
             <div key={l}
               className={`flex flex-col items-center gap-1 py-6 ${i < 3 ? 'border-r border-[#0D9488]/10' : ''}`}>

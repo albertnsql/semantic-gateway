@@ -155,6 +155,22 @@ def _sql_revenue_kpi(plans: list[str], years: list[int], countries: list[str], m
                 vs the same partial-year range in the prior year.
     Returns 2 rows: period_bucket IN ('current', 'prior_year') with summed value.
     """
+    if len(years) > 1:
+        year_filter = _year_clause(years, "period_month")
+        return f"""
+-- Dashboard: revenue_kpi — Total Revenue (flow metric, multi-year sum)
+SELECT
+    'current' AS period_bucket,
+    COALESCE(SUM(mrr_usd), 0) AS value
+FROM {_DB}.marts.fct_mrr_monthly
+WHERE is_active = TRUE
+  {year_filter}
+  {_plan_clause(plans)}
+  {_country_clause_sub(countries)}
+GROUP BY 1
+ORDER BY 1
+""".strip()
+
     d = _resolve_yoy_dates(years, max_data_date)
     return f"""
 -- Dashboard: revenue_kpi — Total Revenue (flow metric, period-sum YoY)
@@ -191,6 +207,22 @@ def _sql_subs_kpi(plans: list[str], years: list[int], countries: list[str], max_
     Returns 2 rows ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
+    
+    if len(years) > 1:
+        return f"""
+-- Dashboard: subs_kpi — Active subscriber count (stock snapshot latest)
+SELECT
+    period_month,
+    COUNT(DISTINCT subscriber_id) AS value
+FROM {_DB}.marts.fct_mrr_monthly
+WHERE period_month = '{d['data_through_date']}'::date
+  AND is_active = TRUE
+  {_plan_clause(plans)}
+  {_country_clause_sub(countries)}
+GROUP BY 1
+ORDER BY 1 DESC
+""".strip()
+
     return f"""
 -- Dashboard: subs_kpi — Active subscriber count (stock snapshot YoY)
 SELECT
@@ -221,6 +253,21 @@ def _sql_watch_time_kpi(plans: list[str], years: list[int], countries: list[str]
     curr_next_month  = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
     prior_next_month = f"{prior_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{prior_year_num + 1}-01-01"
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
+    
+    if len(years) > 1:
+        return f"""
+-- Dashboard: watch_time_kpi — Avg watch time (stock snapshot latest)
+SELECT
+    DATE_TRUNC('month', session_start) AS period_month,
+    AVG(duration_minutes) AS value
+FROM {_DB}.marts.fct_stream_sessions
+WHERE session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date
+  {plan_filter}
+  {_country_clause(countries)}
+GROUP BY 1
+ORDER BY 1 DESC
+""".strip()
+
     return f"""
 -- Dashboard: watch_time_kpi — Avg watch time (stock snapshot YoY)
 SELECT
@@ -258,6 +305,39 @@ def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[
     prior_yr_num   = curr_year_num - 1
     prev_curr_month  = f"{curr_year_num}-{curr_month_num - 1:02d}-01" if curr_month_num > 1 else f"{curr_year_num - 1}-12-01"
     prev_prior_month = f"{prior_yr_num}-{curr_month_num - 1:02d}-01" if curr_month_num > 1 else f"{prior_yr_num - 1}-12-01"
+
+    if len(years) > 1:
+        return f"""
+-- Dashboard: net_mrr_growth_kpi — Net MRR Growth % (stock snapshot latest)
+WITH base AS (
+    SELECT
+        period_month,
+        SUM(CASE WHEN mrr_type IN ('new','expansion') THEN mrr_usd
+                 WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd
+                 ELSE 0 END) AS net_change,
+        SUM(CASE WHEN is_active = TRUE THEN mrr_usd ELSE 0 END) AS total_mrr
+    FROM {_DB}.marts.fct_mrr_monthly
+    WHERE period_month IN (
+        '{d['data_through_date']}'::date,
+        '{prev_curr_month}'::date
+    )
+      {plan_filter}
+      {country_filter}
+    GROUP BY 1
+),
+with_growth AS (
+    SELECT
+        period_month,
+        net_change / NULLIF(LAG(total_mrr) OVER (ORDER BY period_month), 0) AS growth_rate
+    FROM base
+)
+SELECT
+    'current' AS period_bucket,
+    growth_rate AS value
+FROM with_growth
+WHERE period_month = '{d['data_through_date']}'::date
+  AND growth_rate IS NOT NULL
+""".strip()
 
     return f"""
 -- Dashboard: net_mrr_growth_kpi — Net MRR Growth % (rate metric YoY)
@@ -315,6 +395,21 @@ def _sql_engagement_kpi(plans: list[str], years: list[int], countries: list[str]
     curr_next_month  = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
     prior_next_month = f"{prior_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{prior_year_num + 1}-01-01"
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
+    
+    if len(years) > 1:
+        return f"""
+-- Dashboard: engagement_kpi — Avg content completion rate (stock snapshot latest)
+SELECT
+    DATE_TRUNC('month', session_start) AS period_month,
+    AVG(completion_pct) * 100.0 AS value
+FROM {_DB}.marts.fct_stream_sessions
+WHERE session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date
+  {plan_filter}
+  {_country_clause_sub(countries)}
+GROUP BY 1
+ORDER BY 1 DESC
+""".strip()
+
     return f"""
 -- Dashboard: engagement_kpi — Avg content completion rate (stock snapshot YoY)
 SELECT
@@ -342,6 +437,22 @@ def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]
     d = _resolve_yoy_dates(years, max_data_date)
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
+    
+    if len(years) > 1:
+        return f"""
+-- Dashboard: churn_rate_kpi — Monthly churn rate (stock snapshot latest)
+SELECT
+    period_month,
+    COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
+    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
+FROM {_DB}.marts.fct_mrr_monthly
+WHERE period_month = '{d['data_through_date']}'::date
+  {plan_filter}
+  {country_filter}
+GROUP BY 1
+ORDER BY 1 DESC
+""".strip()
+
     return f"""
 -- Dashboard: churn_rate_kpi — Monthly churn rate (stock snapshot YoY)
 SELECT
