@@ -371,7 +371,7 @@ export default function DashboardPage() {
   useEffect(() => {
     const activeFilters = {
       plans: selectedPlans.length === ALL_PLANS.length ? ['all'] : selectedPlans,
-      years: selectedYears.length === ALL_YEARS.length ? ['all'] : selectedYears,
+      years: selectedYears.length === allYears.length ? ['all'] : selectedYears,
       countries: selectedCountries.length === ALL_COUNTRIES.length ? ['all'] : selectedCountries
     };
 
@@ -477,7 +477,7 @@ export default function DashboardPage() {
 
   const generateSuggestedPrompts = () => {
     const plansFiltered = selectedPlans.length !== ALL_PLANS.length && selectedPlans.length > 0;
-    const yearsFiltered = selectedYears.length !== ALL_YEARS.length && selectedYears.length > 0;
+    const yearsFiltered = selectedYears.length !== allYears.length && selectedYears.length > 0;
     const countriesFiltered = selectedCountries.length !== ALL_COUNTRIES.length && selectedCountries.length > 0;
 
     const prompts = [];
