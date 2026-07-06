@@ -44,7 +44,12 @@ function NarrativeSummary({ text, query, lineagePath }) {
           className="px-5 py-4 rounded-[20px] rounded-tl-[4px] text-sm text-[#1A3A38] leading-relaxed max-w-[85%] animate-fade-in"
           style={{ background: 'rgba(255,255,255,0.75)', boxShadow: CLAY_CARD, fontFamily: 'DM Sans, sans-serif' }}
         >
-          {text}
+          {text.split(/(\*\*.*?\*\*)/g).map((part, i) => {
+            if (part.startsWith('**') && part.endsWith('**')) {
+              return <strong key={i} className="text-[#0D9488] font-black">{part.slice(2, -2)}</strong>;
+            }
+            return part;
+          })}
         </div>
       </div>
       {lineagePath?.length > 0 && (

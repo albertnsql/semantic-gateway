@@ -124,7 +124,8 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "1. If this is a dimensional breakdown, name the top and bottom segments explicitly using the values provided. Do not summarize without referencing specific dimension values. "
             "2. Always use the provided metric_value, max_value, and min_value — never estimate numbers from the preview rows. "
             "3. Produce exactly 2 sentences. First sentence: the breakdown with specific names and numbers. Second sentence: the business interpretation. "
-            "4. Do NOT use markdown formatting, bullet points, or headers. Write as if speaking directly to the analyst."
+            "4. Format all revenue and monetary values with a '$' sign, commas, and 2 decimal places (e.g., $1,234.56). Format percentages with a '%' sign and up to 2 decimal places (e.g., 25.4%). "
+            "5. Wrap all numbers, percentages, and monetary values in double asterisks so they can be highlighted (e.g., **$1,234.56**, **25.4%**, or **1,234**). Do NOT use any other markdown formatting (no headers, no bullet points)."
         )
         user_prompt = (
             f"The analyst asked: \"{query}\"\n\n"

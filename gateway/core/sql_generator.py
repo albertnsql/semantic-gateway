@@ -290,7 +290,10 @@ class SQLGenerator:
         compiled_sql: str | None = None
         used_template_cache = False
 
-        if self._template_cache is not None and intent.metrics and intent.dimensions:
+        # Filtered queries are NOT eligible for the template cache — the compiled SQL
+        # contains hard-coded WHERE predicates (e.g., country = 'US') that cannot be
+        # reused for a different filter value or an unfiltered version of the same query.
+        if self._template_cache is not None and intent.metrics and intent.dimensions and not intent.filters:
             cached_tpl = self._template_cache.get(intent.metrics, intent.dimensions)
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
@@ -384,7 +387,9 @@ class SQLGenerator:
             # WHERE to anchor to instead of appending after GROUP BY.
             # CRITICAL: We ONLY cache if mf_success is True. We never cache
             # fallback SQL to avoid poisoning the cache with LLM hallucinations.
-            if self._template_cache is not None and intent.metrics and intent.dimensions and mf_success:
+            # CRITICAL: We ONLY cache if mf_success is True AND the query has no
+            # filters. Filtered SQL is query-specific and must not be reused.
+            if self._template_cache is not None and intent.metrics and intent.dimensions and mf_success and not intent.filters:
                 try:
                     sql_template = compiled_sql
                     has_placeholder = False
@@ -532,6 +537,43 @@ class SQLGenerator:
         if intent.time_range:
             parts.append(f"--start-time {intent.time_range.start_date}")
             parts.append(f"--end-time {intent.time_range.end_date}")
+
+        if intent.filters:
+            global_dim_map = build_dimension_prefix_map()
+            primary_metric = intent.metrics[0] if intent.metrics else ""
+            dim_map = global_dim_map.get(primary_metric, {})
+            _OP_MAP = {"eq": "=", "neq": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+            where_parts: list[str] = []
+            for f in intent.filters:
+                col = f.column
+                # Resolve to fully-prefixed MetricFlow dimension name
+                if "__" not in col:
+                    if col in dim_map:
+                        col = dim_map[col]
+                    elif _bare_dimension_name(col) in dim_map:
+                        col = dim_map[_bare_dimension_name(col)]
+                    else:
+                        logger.warning(
+                            "Filter column '%s' not found in dim_map for metric '%s' — passing raw.",
+                            col, primary_metric,
+                        )
+                if f.operator == "in":
+                    vals = f.value if isinstance(f.value, list) else [f.value]
+                    val_str = ", ".join(f"'{v}'" for v in vals)
+                    where_parts.append(f"Dimension('{col}') IN ({val_str})")
+                else:
+                    op = _OP_MAP.get(f.operator, "=")
+                    raw_val = str(f.value)
+                    try:
+                        float(raw_val)
+                        val_str = raw_val
+                    except ValueError:
+                        val_str = f"'{raw_val}'"
+                    where_parts.append(f"Dimension('{col}') {op} {val_str}")
+            if where_parts:
+                where_clause = " AND ".join(where_parts)
+                parts.append(f'--where "{where_clause}"')
+                logger.info("MetricFlow --where clause: %s", where_clause)
 
         if intent.limit:
             parts.append(f"--limit {intent.limit}")

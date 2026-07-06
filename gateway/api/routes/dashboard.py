@@ -624,16 +624,26 @@ def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: 
     curr_next_month = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
     plan_filter = f"AND s.subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
     country_filter = _country_clause(countries, col="s.country") if countries else ""
+    # Use the selected year range to scope the query
+    year_start = f"{min(years)}-01-01" if years else f"{_DEFAULT_CURRENT_YEAR - 1}-01-01"
+    year_end   = f"{max(years)}-12-31" if years else f"{_DEFAULT_CURRENT_YEAR}-12-31"
     return f"""
--- Dashboard: watch_time_content_type — Avg Watch Time by Content Type (stock snapshot, latest month in selected year)
+-- Dashboard: watch_time_content_type — Avg Watch Time by Content Type (latest available month in selected year)
+WITH latest_month AS (
+    SELECT DATE_TRUNC('month', MAX(s.session_start)) AS max_month
+    FROM {_DB}.marts.fct_stream_sessions s
+    WHERE s.session_start >= '{year_start}'::date
+      AND s.session_start <= '{year_end}'::date
+)
 SELECT
     c.content_type AS name,
     ROUND(AVG(s.duration_minutes), 1) AS value
 FROM {_DB}.marts.fct_stream_sessions s
 JOIN {_DB}.marts.dim_content c
   ON s.content_id = c.content_id
-WHERE s.session_start >= '{d['data_through_date']}'::date
-  AND s.session_start < '{curr_next_month}'::date
+JOIN latest_month lm
+  ON DATE_TRUNC('month', s.session_start) = lm.max_month
+WHERE 1=1
   {plan_filter}
   {country_filter}
 GROUP BY c.content_type

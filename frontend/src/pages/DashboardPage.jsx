@@ -681,7 +681,7 @@ export default function DashboardPage() {
                       <Bar dataKey="expansion"  name="Expansion"  stackId="pos" fill="#2DD4BF" radius={[4,4,0,0]} />
                       {/* Negative stacks — below zero (values are already negative from API) */}
                       <Bar dataKey="contraction" name="Contraction" stackId="neg" fill="#F59E0B" radius={[0,0,0,0]} />
-                      <Bar dataKey="churned"    name="Churned"    stackId="neg" fill="#F43F5E" radius={[0,0,4,4]} />
+                      <Bar dataKey="churned"    name="Churned"    stackId="neg" fill="#F43F5E" radius={[4,4,0,0]} />
                     </BarChart>
                   </ResponsiveContainer>
                 )}
