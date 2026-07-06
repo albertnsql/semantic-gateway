@@ -66,7 +66,40 @@ _ALLOWED_COUNTRIES: frozenset[str] = frozenset({"US", "IN", "GB", "DE", "BR"})
 # Data-through date = fetched live from Snowflake (MAX(period_month)); this constant
 # is only used as a last-resort fallback when the DB is unreachable.
 
-_DEFAULT_DATA_THROUGH: str = "2026-06-01"   # Fallback only — overridden by live Snowflake query
+# _DEFAULT_DATA_THROUGH: computed at module load from today's date so this fallback
+# is always the last fully-completed calendar month, even after a cold restart without
+# Snowflake connectivity. Never needs manual updating.
+def _compute_default_data_through() -> str:
+    """Return the first day of the last fully-completed calendar month as YYYY-MM-DD."""
+    today = _dt.date.today()
+    first_of_this_month = today.replace(day=1)
+    if first_of_this_month.month == 1:
+        last_completed = first_of_this_month.replace(year=first_of_this_month.year - 1, month=12)
+    else:
+        last_completed = first_of_this_month.replace(month=first_of_this_month.month - 1)
+    return last_completed.strftime("%Y-%m-%d")
+
+_DEFAULT_DATA_THROUGH: str = _compute_default_data_through()  # e.g. "2026-06-01" as of July 2026
+
+def _cap_to_last_completed_month(date_str: str) -> str:
+    """
+    Ensure the data-through date never exceeds the last fully-completed calendar month.
+    e.g. if today is 2026-07-06, the last completed month is 2026-06-01.
+    This prevents in-progress / partial months (like the current month) from leaking
+    into dashboard charts.
+    """
+    today = _dt.date.today()
+    # First day of the current calendar month
+    first_of_this_month = today.replace(day=1)
+    # Last completed month = first day of the month before the current month
+    if first_of_this_month.month == 1:
+        last_completed = first_of_this_month.replace(year=first_of_this_month.year - 1, month=12)
+    else:
+        last_completed = first_of_this_month.replace(month=first_of_this_month.month - 1)
+    last_completed_str = last_completed.strftime("%Y-%m-%d")
+    # Return whichever is earlier: fetched date or last-completed-month boundary
+    return min(date_str, last_completed_str)
+
 _DEFAULT_CURRENT_YEAR: int = _dt.date.today().year
 
 
@@ -77,11 +110,11 @@ def _resolve_yoy_dates(years: list[int], max_data_date: str) -> dict:
     Returns a dict with:
       current_year          int    e.g. 2026
       prior_year            int    e.g. 2025
-      data_through_date     str    e.g. '2026-05-01'  (last available month in current year)
+      data_through_date     str    e.g. '2026-06-01'  (last available month in current year)
       current_year_start    str    e.g. '2026-01-01'
       prior_year_start      str    e.g. '2025-01-01'
-      prior_year_equiv_end  str    e.g. '2025-05-01'  (same partial-year cut in prior year)
-      prior_year_same_month str    e.g. '2025-05-01'  (same calendar month, prior year)
+      prior_year_equiv_end  str    e.g. '2025-06-01'  (same partial-year cut in prior year)
+      prior_year_same_month str    e.g. '2025-06-01'  (same calendar month, prior year)
       selected_year_end     str    e.g. '2026-12-31' or '2025-12-31'
     """
     if years:
@@ -92,9 +125,10 @@ def _resolve_yoy_dates(years: list[int], max_data_date: str) -> dict:
     prior_year = current_year - 1
 
     # Data-through date: last known data month within current year.
-    # For 2026, data ends at 2026-05-01 (May). For any prior complete year, use Dec.
+    # For the current year, falls back to _DEFAULT_DATA_THROUGH (itself dynamic).
+    # For any prior complete year, use Dec.
     if current_year >= _DEFAULT_CURRENT_YEAR:
-        data_through_date = _DEFAULT_DATA_THROUGH          # 2026-05-01
+        data_through_date = _DEFAULT_DATA_THROUGH          # dynamically computed last-completed month
     else:
         data_through_date = f"{current_year}-12-01"        # full year available
 
@@ -289,8 +323,8 @@ def _sql_net_mrr_growth_kpi(plans: list[str], years: list[int], countries: list[
     """
     Net MRR Growth % — RATE metric (custom handling).
     Comparison:
-      current  = growth rate for the latest available month (e.g. May 2026 vs Apr 2026)
-      prior_yr = growth rate for the same calendar month one year prior (e.g. May 2025 vs Apr 2025)
+      current  = growth rate for the latest available month (e.g. last-completed month vs prior month)
+      prior_yr = growth rate for the same calendar month one year prior
     Returns 2 rows: ('current', rate) and ('prior_year', rate) ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
@@ -472,7 +506,7 @@ def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str], max_
     """
     Subscriber Distribution — STOCK metric (point-in-time snapshot).
     Shows plan-mix as of the latest available month within the selected year.
-    For the current year (2026), cap at data_through_date (May 2026).
+    For the current year, cap at data_through_date (last completed month).
     For prior complete years (2025), use Dec of that year.
     Never averages across months — always a single-month snapshot.
     """
@@ -641,7 +675,8 @@ async def get_dashboard_metadata(request: Request) -> JSONResponse:
     if query_cache is not None:
         cached_md = query_cache.get({"type": "max_date"})
         if cached_md:
-            max_date = cached_md["date"]
+            # Always re-apply cap on read — guards against stale disk cache entries
+            max_date = _cap_to_last_completed_month(cached_md["date"])
         else:
             try:
                 rows = request.app.state.sql_generator.execute_query(
@@ -651,6 +686,8 @@ async def get_dashboard_metadata(request: Request) -> JSONResponse:
                     max_date = str(rows[0]["MAX_DATE"])[:10]
                 elif rows and rows[0].get("max_date"):
                     max_date = str(rows[0]["max_date"])[:10]
+                # Cap to last fully-completed month — never expose an in-progress month
+                max_date = _cap_to_last_completed_month(max_date)
                 query_cache.set({"type": "max_date"}, {"date": max_date})
             except Exception as e:
                 pass
@@ -796,7 +833,8 @@ async def get_dashboard_widget(
     if query_cache is not None:
         cached_md = query_cache.get({"type": "max_date"})
         if cached_md:
-            max_data_date = cached_md["date"]
+            # Always re-apply cap on read — guards against stale disk cache entries
+            max_data_date = _cap_to_last_completed_month(cached_md["date"])
         else:
             try:
                 md_rows = sql_gen.execute_query(
@@ -806,6 +844,8 @@ async def get_dashboard_widget(
                     max_data_date = str(md_rows[0]["MAX_DATE"])[:10]
                 elif md_rows and md_rows[0].get("max_date"):
                     max_data_date = str(md_rows[0]["max_date"])[:10]
+                # Cap to last fully-completed month — never expose an in-progress month
+                max_data_date = _cap_to_last_completed_month(max_data_date)
                 query_cache.set({"type": "max_date"}, {"date": max_data_date})
             except Exception:
                 pass  # fall back to _DEFAULT_DATA_THROUGH
@@ -818,6 +858,8 @@ async def get_dashboard_widget(
                 max_data_date = str(md_rows[0]["MAX_DATE"])[:10]
             elif md_rows and md_rows[0].get("max_date"):
                 max_data_date = str(md_rows[0]["max_date"])[:10]
+            # Cap to last fully-completed month — never expose an in-progress month
+            max_data_date = _cap_to_last_completed_month(max_data_date)
         except Exception:
             pass
 

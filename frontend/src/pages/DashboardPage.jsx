@@ -297,8 +297,13 @@ export default function DashboardPage() {
           const pivoted = Object.values(monthMap).sort((a, b) => a.period_month < b.period_month ? -1 : 1);
           return { loading: false, data: pivoted, isMock: false };
         } catch {
-          // Mock fallback — 3 months of illustrative bridge data
-          const mockBridge = ['Jan 26','Feb 26','Mar 26'].map((m) => ({
+          // Mock fallback — 3 most-recent completed months of illustrative bridge data
+          const _now = new Date();
+          const _mockMonths = [-2, -1, 0].map(offset => {
+            const d = new Date(_now.getFullYear(), _now.getMonth() - 1 + offset, 1);
+            return d.toLocaleString('en-US', { month: 'short' }) + ' ' + String(d.getFullYear()).slice(-2);
+          });
+          const mockBridge = _mockMonths.map((m) => ({
             period_month: m, new: 12000, expansion: 3000, contraction: -1500, churned: -2200
           }));
           return { loading: false, data: mockBridge, isMock: true };
