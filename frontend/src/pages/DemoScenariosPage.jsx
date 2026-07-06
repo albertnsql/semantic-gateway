@@ -31,7 +31,8 @@ const SCENARIOS = [
     badgeGradient: 'from-teal-400 to-teal-600',
     badgeLabel: 'SUCCESS',
     btnVariant: 'primary',
-    defaultTab: 'Results',
+    defaultTab: 'Tabular Results',
+    whyItMatters: 'This is the everyday case: a plain question turned into governed, correct SQL without anyone writing a join by hand.',
   },
   {
     id: 'grain-mismatch',
@@ -43,7 +44,8 @@ const SCENARIOS = [
     badgeGradient: 'from-rose-400 to-rose-600',
     badgeLabel: 'REJECTED',
     btnVariant: 'outline-red',
-    defaultTab: 'Results',
+    defaultTab: 'Tabular Results',
+    whyItMatters: "This is the kind of grain error that normally slips into a dashboard and silently produces wrong numbers — here it's caught before it reaches Snowflake.",
   },
   {
     id: 'ltv-lineage',
@@ -56,6 +58,7 @@ const SCENARIOS = [
     badgeLabel: 'LINEAGE',
     btnVariant: 'outline-amber',
     defaultTab: 'Lineage',
+    whyItMatters: 'This shows the query passed grain and governance validation before execution, with a traceable path back to raw source tables.',
   },
 ];
 
@@ -154,8 +157,15 @@ function ScenarioCard({ scenario }) {
 
         {/* Expected */}
         <div className="flex flex-col gap-1">
-          <span className="text-xs text-[#4A7B76] font-bold uppercase tracking-wide" style={{ fontFamily: 'DM Sans, sans-serif' }}>Expected Outcome</span>
-          <p className="text-[#4A7B76] text-sm" style={{ fontFamily: 'DM Sans, sans-serif' }}>{scenario.expected}</p>
+          {(!response && !lastRun) ? (
+            <>
+              <span className="text-xs text-[#4A7B76] font-bold uppercase tracking-wide" style={{ fontFamily: 'DM Sans, sans-serif' }}>Expected Outcome</span>
+              <p className="text-[#4A7B76] text-sm" style={{ fontFamily: 'DM Sans, sans-serif' }}>{scenario.expected}</p>
+            </>
+          ) : (
+            <p className="text-xs text-gray-400" style={{ fontFamily: 'DM Sans, sans-serif' }}>Expected Outcome: {scenario.expected}</p>
+          )}
+          <p className="text-xs italic text-[#4A7B76]/80 mt-1" style={{ fontFamily: 'DM Sans, sans-serif' }}>{scenario.whyItMatters}</p>
         </div>
       </div>
 
