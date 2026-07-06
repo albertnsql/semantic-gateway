@@ -290,10 +290,33 @@ class SQLGenerator:
         compiled_sql: str | None = None
         used_template_cache = False
 
+        # ── Pre-process filters to strip redundant group-by dimensions ──
+        # (e.g. "show churn by plan type" → plan_type in dims AND in filters).
+        # This ensures they don't incorrectly disable the SQL Template Cache.
+        effective_filters = []
+        if intent.filters:
+            global_dim_map = build_dimension_prefix_map()
+            primary_metric = intent.metrics[0] if intent.metrics else ""
+            dim_map = global_dim_map.get(primary_metric, {})
+            for f in intent.filters:
+                col = f.column
+                if "__" not in col:
+                    if col in dim_map:
+                        col = dim_map[col]
+                    elif _bare_dimension_name(col) in dim_map:
+                        col = dim_map[_bare_dimension_name(col)]
+                if col in (intent.dimensions or []):
+                    logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
+                    continue
+                effective_filters.append(f)
+        
+        # Override the intent filters so format_mf_query receives the clean list
+        intent.filters = effective_filters
+
         # Filtered queries are NOT eligible for the template cache — the compiled SQL
         # contains hard-coded WHERE predicates (e.g., country = 'US') that cannot be
         # reused for a different filter value or an unfiltered version of the same query.
-        if self._template_cache is not None and intent.metrics and intent.dimensions and not intent.filters:
+        if self._template_cache is not None and intent.metrics and intent.dimensions and not effective_filters:
             cached_tpl = self._template_cache.get(intent.metrics, intent.dimensions)
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
