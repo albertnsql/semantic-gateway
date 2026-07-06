@@ -539,6 +539,7 @@ class SQLGenerator:
             parts.append(f"--end-time {intent.time_range.end_date}")
 
         if intent.filters:
+            import json as _json
             global_dim_map = build_dimension_prefix_map()
             primary_metric = intent.metrics[0] if intent.metrics else ""
             dim_map = global_dim_map.get(primary_metric, {})
@@ -557,8 +558,33 @@ class SQLGenerator:
                             "Filter column '%s' not found in dim_map for metric '%s' — passing raw.",
                             col, primary_metric,
                         )
+
+                # ── Guard: skip if this dimension is already in intent.dimensions ──
+                # e.g. "show churn by plan type" → plan_type in dims AND in filters
+                # (LLM sometimes adds an IN(all_plans) filter redundantly).
+                if col in (intent.dimensions or []):
+                    logger.info(
+                        "Skipping filter on '%s' — already used as a group-by dimension.", col
+                    )
+                    continue
+
                 if f.operator == "in":
-                    vals = f.value if isinstance(f.value, list) else [f.value]
+                    # Robustly parse the value — LLM may return a real list OR a
+                    # string that looks like a Python/JSON list: "['a','b','c']"
+                    raw_list = f.value
+                    if isinstance(raw_list, str):
+                        # Try JSON first, then ast.literal_eval as fallback
+                        import ast as _ast
+                        try:
+                            parsed = _json.loads(raw_list)
+                            raw_list = parsed if isinstance(parsed, list) else [parsed]
+                        except (_json.JSONDecodeError, ValueError):
+                            try:
+                                parsed = _ast.literal_eval(raw_list)
+                                raw_list = parsed if isinstance(parsed, list) else [parsed]
+                            except Exception:
+                                raw_list = [raw_list]  # treat whole string as one value
+                    vals = raw_list if isinstance(raw_list, list) else [raw_list]
                     val_str = ", ".join(f"'{v}'" for v in vals)
                     where_parts.append(f"Dimension('{col}') IN ({val_str})")
                 else:
