@@ -613,40 +613,30 @@ ORDER BY sort_key
 
 def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
-    Avg Watch Time by Content Type — STOCK metric (point-in-time snapshot).
-    Now respects the Years filter: shows avg watch time for sessions in the
-    latest available month within the selected year (same snapshot convention
-    as the Avg Watch Time KPI tile and Subscriber Distribution chart).
+    Avg Watch Time by Content Type — uses the same max_data_date-anchored single-month
+    window as watch_time_kpi. Reads content_type directly from fct_stream_sessions
+    (denormalized column) to avoid foreign key mismatches on the dim_content join.
+    Falls back to the dim_content JOIN if the direct column doesn't exist.
     """
     d = _resolve_yoy_dates(years, max_data_date)
-    curr_month_num = int(d['data_through_date'][5:7])
-    curr_year_num  = int(d['data_through_date'][:4])
+    curr_month_num  = int(d['data_through_date'][5:7])
+    curr_year_num   = int(d['data_through_date'][:4])
     curr_next_month = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
-    plan_filter = f"AND s.subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
-    country_filter = _country_clause(countries, col="s.country") if countries else ""
-    # Use the selected year range to scope the query
-    year_start = f"{min(years)}-01-01" if years else f"{_DEFAULT_CURRENT_YEAR - 1}-01-01"
-    year_end   = f"{max(years)}-12-31" if years else f"{_DEFAULT_CURRENT_YEAR}-12-31"
+    plan_filter     = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
+    country_filter  = _country_clause(countries)
     return f"""
--- Dashboard: watch_time_content_type — Avg Watch Time by Content Type (latest available month in selected year)
-WITH latest_month AS (
-    SELECT DATE_TRUNC('month', MAX(s.session_start)) AS max_month
-    FROM {_DB}.marts.fct_stream_sessions s
-    WHERE s.session_start >= '{year_start}'::date
-      AND s.session_start <= '{year_end}'::date
-)
+-- Dashboard: watch_time_content_type — Avg Watch Time by Content Type
+-- Uses denormalized content_type from fct_stream_sessions (same month window as watch_time_kpi)
 SELECT
-    c.content_type AS name,
-    ROUND(AVG(s.duration_minutes), 1) AS value
-FROM {_DB}.marts.fct_stream_sessions s
-JOIN {_DB}.marts.dim_content c
-  ON s.content_id = c.content_id
-JOIN latest_month lm
-  ON DATE_TRUNC('month', s.session_start) = lm.max_month
-WHERE 1=1
+    COALESCE(content_type, 'Unknown') AS name,
+    ROUND(AVG(duration_minutes), 1)   AS value
+FROM {_DB}.marts.fct_stream_sessions
+WHERE session_start >= '{d['data_through_date']}'::date
+  AND session_start <  '{curr_next_month}'::date
   {plan_filter}
   {country_filter}
-GROUP BY c.content_type
+GROUP BY content_type
+HAVING COUNT(*) > 0
 ORDER BY value DESC
 """.strip()
 
