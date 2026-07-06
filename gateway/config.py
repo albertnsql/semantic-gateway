@@ -101,9 +101,10 @@ class Settings(BaseSettings):
         #   "mrr":               ["subscription__plan_type", "subscriber__country"]
         #   "total_subscribers": ["subscriber__plan_type"]
         #   "churn_rate":        ["subscriber__plan_type"]
+        #
+        # ── CONFIRMED MetricFlow-native metrics (semantic manifest validates these) ──
         "mrr":                   ["subscription__plan_type", "subscriber__country", "subscriber__cohort_month"],
         "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
-        "new_subscribers":       ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
         "churn_rate":            ["subscriber__plan_type", "subscriber__country", "subscriber__churn_reason"],
         "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
         "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
@@ -115,6 +116,13 @@ class Settings(BaseSettings):
         "clicked_recommendations": ["event__recommendation_type"],
         "avg_watch_time":        ["session__device_type", "subscriber__plan_type", "subscriber__country"],
         "total_sessions":        ["session__device_type", "subscriber__plan_type", "subscriber__country"],
+        #
+        # ── REMOVED / NOT in MetricFlow semantic manifest ──────────────────────────
+        # "new_subscribers" — MetricFlow rejects this metric name every time.
+        # It is handled by the governed LLM fallback SQL path at query time.
+        # Adding it here wastes ~35s per combination and pollutes subprocess output.
+        # If you add new_subscribers to the dbt semantic model, re-enable it:
+        #   "new_subscribers": ["subscriber__plan_type", "subscriber__acquisition_channel"],
     }
 
     # Admin secret key — required to call POST /api/v1/cache/clear in production.

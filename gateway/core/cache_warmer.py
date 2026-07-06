@@ -18,6 +18,14 @@ from core.intent_extractor import QueryIntent
 
 logger = logging.getLogger(__name__)
 
+# Metrics known to NOT exist in the MetricFlow semantic manifest.
+# These are handled by the governed LLM fallback SQL path at query time.
+# Listing them here prevents the cache warmer from wasting ~35s per combination
+# on MetricFlow subprocess failures, polluting logs and output buffers.
+_METRICFLOW_UNSUPPORTED: frozenset[str] = frozenset({
+    "new_subscribers",  # Not in dbt semantic model — uses fallback SQL via mrr_type='new'
+})
+
 
 class CacheWarmer:
     """
@@ -71,6 +79,16 @@ class CacheWarmer:
                 if self._stop_event.is_set():
                     logger.info("[CacheWarmer] Warm-up cancelled by shutdown.")
                     return
+
+                # Skip metrics that are not in the MetricFlow semantic manifest.
+                # They are handled by the governed LLM fallback at query time.
+                if metric in _METRICFLOW_UNSUPPORTED:
+                    skipped += 1
+                    logger.info(
+                        "[CacheWarmer] SKIP %s × %s — not a MetricFlow metric (fallback-only).",
+                        metric, dim,
+                    )
+                    continue
                 
                 # Construct intent FOR L2 CACHE KEY (no time range)
                 intent_key = QueryIntent(
