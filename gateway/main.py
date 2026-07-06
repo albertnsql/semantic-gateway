@@ -121,11 +121,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     sql_template_cache = SQLTemplateCache(
         ttl_seconds=settings.sql_template_cache_ttl_seconds,
         maxsize=settings.sql_template_cache_maxsize,
+        disk_path="./.sql_template_cache.json",
     )
     sql_generator._template_cache = sql_template_cache  # inject after construction
     logger.info(
-        "✓ SQLTemplateCache ready (TTL: %ds). MetricFlow subprocess will be skipped "
-        "for any metric+dimension combination seen before.",
+        "✓ SQLTemplateCache ready (TTL: %ds, disk: ./.sql_template_cache.json). "
+        "Compiled SQL templates survive restarts — MetricFlow subprocess skipped for "
+        "any previously-seen metric+dimension combination.",
         settings.sql_template_cache_ttl_seconds,
     )
     

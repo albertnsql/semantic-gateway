@@ -38,6 +38,12 @@ final as (
         sub.cohort_month as subscriber_cohort_month,
         c.primary_genre as content_primary_genre,
         sub.plan_type,
+        sub.age_group,
+        sub.acquisition_channel,
+        sub.subscription_status,
+        sub.churn_reason,
+        sub.signup_date,
+        sub.churn_date,
         case when s.completion_pct >= 0.90 then true else false end as is_completed,
         case 
             when s.quality_streamed = '4K' then 'premium'

@@ -44,6 +44,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -224,15 +225,49 @@ class SQLTemplateCache:
     semantic model changes only happen on dbt deploys, which restart the gateway.
     """
 
-    def __init__(self, ttl_seconds: int = 86400, maxsize: int = 200) -> None:
+    def __init__(self, ttl_seconds: int = 86400, maxsize: int = 200, disk_path: Optional[str] = None) -> None:
         """
         Args:
             ttl_seconds: How long a compiled template stays valid.  Default 24 h.
             maxsize:     Maximum entries before LRU eviction.  Default 200.
+            disk_path:   Optional filepath to persist compiled SQL templates across restarts.
+                         When set, templates are loaded on startup and saved after every write,
+                         so the 32s MetricFlow subprocess is not re-paid after a gateway restart.
         """
         self._store: OrderedDict = OrderedDict()
         self._ttl = ttl_seconds
         self._maxsize = maxsize
+        self._disk_path = disk_path
+        self._load()
+
+    # ──────────────────────────────────────────────── disk persistence
+
+    def _load(self) -> None:
+        """Load persisted templates from disk on startup. Skips gracefully on any error."""
+        if not self._disk_path or not os.path.exists(self._disk_path):
+            return
+        try:
+            with open(self._disk_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.items():
+                self._store[k] = v
+            active = sum(1 for e in self._store.values() if e["expires_at"] > time.time())
+            logger.info(
+                "SQLTemplateCache: loaded %d entries from disk (%d still valid) at '%s'.",
+                len(self._store), active, self._disk_path,
+            )
+        except Exception as exc:
+            logger.warning("SQLTemplateCache: failed to load disk cache from '%s': %s", self._disk_path, exc)
+
+    def _save(self) -> None:
+        """Persist the current store to disk. Skips gracefully on any error."""
+        if not self._disk_path:
+            return
+        try:
+            with open(self._disk_path, "w", encoding="utf-8") as f:
+                json.dump(dict(self._store), f)
+        except Exception as exc:
+            logger.warning("SQLTemplateCache: failed to save disk cache to '%s': %s", self._disk_path, exc)
 
     # ──────────────────────────────────────────────── key helpers
 
@@ -323,15 +358,18 @@ class SQLTemplateCache:
             "SQLTemplateCache SET for %s × %s (key %s…, parameterizable=%s, style=%s)",
             metrics, dimensions, key[:8], has_time_filter, date_style,
         )
+        self._save()
 
     def invalidate(self, metrics: list[str], dimensions: list[str]) -> None:
         """Remove a specific template entry."""
         key = self.make_key(metrics, dimensions)
         self._store.pop(key, None)
+        self._save()
 
     def clear(self) -> None:
         """Evict all template entries."""
         self._store.clear()
+        self._save()
         logger.info("SQLTemplateCache cleared.")
 
     def stats(self) -> dict:

@@ -103,6 +103,7 @@ class Settings(BaseSettings):
         #   "churn_rate":        ["subscriber__plan_type"]
         "mrr":                   ["subscription__plan_type", "subscriber__country", "subscriber__cohort_month"],
         "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
+        "new_subscribers":       ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
         "churn_rate":            ["subscriber__plan_type", "subscriber__country", "subscriber__churn_reason"],
         "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
         "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],

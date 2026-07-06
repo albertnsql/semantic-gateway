@@ -31,7 +31,23 @@ semantic_models:
         type: categorical
       - name: content_primary_genre
         type: categorical
+      - name: age_group
+        type: categorical
+      - name: acquisition_channel
+        type: categorical
+      - name: subscription_status
+        type: categorical
+      - name: churn_reason
+        type: categorical
       - name: session_start
+        type: time
+        type_params:
+          time_granularity: day
+      - name: signup_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: churn_date
         type: time
         type_params:
           time_granularity: day

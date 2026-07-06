@@ -197,6 +197,10 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                     
                 m_dim_map[dim_name] = chosen
                 
+        # Add common LLM abbreviation aliases
+        if 'content_primary_genre' in m_dim_map:
+            m_dim_map['primary_genre'] = m_dim_map['content_primary_genre']
+            
         metric_map[m_name] = m_dim_map
         
     logger.info("Dimension prefix map built: %d metrics mapped", len(metric_map))
@@ -378,7 +382,9 @@ class SQLGenerator:
             # the hygiene WHERE clause (is_active, plan_type IN …) that the
             # reviewer adds.  This guarantees that inject_time_filter can find a
             # WHERE to anchor to instead of appending after GROUP BY.
-            if self._template_cache is not None and intent.metrics and intent.dimensions:
+            # CRITICAL: We ONLY cache if mf_success is True. We never cache
+            # fallback SQL to avoid poisoning the cache with LLM hallucinations.
+            if self._template_cache is not None and intent.metrics and intent.dimensions and mf_success:
                 try:
                     sql_template = compiled_sql
                     has_placeholder = False

@@ -1,0 +1,3 @@
+# Runtime cache files — generated at startup, not source code
+.sql_template_cache.json
+.query_cache.json

@@ -75,7 +75,7 @@ class QueryIntent(BaseModel):
 
     original_query: str
     metrics: list[str]
-    dimensions: list[str]
+    dimensions: list[str] = []
     filters: list[FilterClause] = []
     time_range: TimeRange | None = None
     aggregation_level: str | None = None  # monthly | weekly | daily

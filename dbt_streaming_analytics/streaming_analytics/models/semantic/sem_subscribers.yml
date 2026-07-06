@@ -35,6 +35,11 @@ semantic_models:
         expr: case when is_churned = true then subscriber_id else null end
         agg: count
         agg_time_dimension: signup_date
+      - name: new_subscribers
+        description: Count of new subscribers
+        expr: subscriber_id
+        agg: count
+        agg_time_dimension: signup_date
       - name: total_subscribers
         description: Total subscribers
         expr: subscriber_id
