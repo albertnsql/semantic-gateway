@@ -166,17 +166,16 @@ export default function QueryPage() {
   };
 
   return (
-    <div className="absolute inset-0 flex flex-col pointer-events-none">
+    <div className="absolute inset-0 overflow-y-auto pointer-events-auto" ref={threadContainerRef}>
       
-      {/* Top panel (scrollable thread area) */}
-      <div className="flex-1 overflow-y-auto px-8 pointer-events-auto" ref={threadContainerRef}>
-        <div className="max-w-4xl mx-auto pt-6 pb-12 flex flex-col min-h-full">
-          <TopBar title="Query Interface" breadcrumb={['Gateway', 'Query']} />
+      {/* Top panel (thread area) */}
+      <div className="max-w-4xl mx-auto pt-6 pb-4 px-8 flex flex-col">
+        <TopBar title="Query Interface" breadcrumb={['Gateway', 'Query']} />
 
-          <div className="flex-1 flex flex-col mt-8">
-            {history.length === 0 && !loading && (
-              <div className="m-auto text-center text-neu-muted font-dm max-w-2xl">
-                <p className="mb-8 text-[#1A3A38] text-[22px] font-bold tracking-tight" style={{ fontFamily: 'Nunito, sans-serif' }}>
+        <div className="flex flex-col mt-8">
+          {history.length === 0 && !loading && (
+            <div className="m-auto text-center text-neu-muted font-dm max-w-2xl mt-12 mb-12">
+              <p className="mb-8 text-[#1A3A38] text-[22px] font-bold tracking-tight" style={{ fontFamily: 'Nunito, sans-serif' }}>
                   Ask a natural language query to begin.
                 </p>
                 <div className="flex flex-wrap justify-center gap-3 animate-fade-in">
@@ -249,16 +248,15 @@ export default function QueryPage() {
             )}
           </div>
         </div>
-      </div>
-
-      {/* Bottom panel (sticky input bar) */}
-      <div className="shrink-0 px-8 pt-4 pb-6 backdrop-blur-2xl bg-[rgba(248,250,252,0.85)] pointer-events-auto z-20" style={{ boxShadow: '0 -20px 40px rgba(248,250,252,0.9)' }}>
-        <div className="max-w-4xl mx-auto">
-          <form 
-            onSubmit={handleSubmit} 
-            className="flex flex-col gap-4 p-6 rounded-[32px] transition-all duration-300"
-            style={{ background: 'rgba(255,255,255,0.7)', boxShadow: CLAY_SHADOW }}
-          >
+        
+        {/* Sticky input bar */}
+        <div className="sticky bottom-0 z-20 pt-4 pb-6 px-8 max-w-4xl mx-auto w-full pointer-events-none">
+          <div className="pointer-events-auto">
+            <form 
+              onSubmit={handleSubmit} 
+              className="flex flex-col gap-4 p-6 rounded-[32px] transition-all duration-300"
+              style={{ background: 'rgba(255,255,255,0.7)', boxShadow: CLAY_SHADOW }}
+            >
             <div className="flex items-center justify-between px-2">
               <label
                 htmlFor="query-input"

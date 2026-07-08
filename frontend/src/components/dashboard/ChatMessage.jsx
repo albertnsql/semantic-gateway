@@ -204,7 +204,12 @@ export default function ChatMessage({ message, onSuggest, onSuggestPopulate }) {
     >
       {(raw?.narrative_summary || message.content) && (
         <p className="text-sm text-[#1A3A38] leading-relaxed mb-3 whitespace-pre-line" style={{ fontFamily: 'DM Sans, sans-serif' }}>
-          {raw?.narrative_summary || message.content}
+          {(raw?.narrative_summary || message.content).split(/(\*\*.*?\*\*)/g).map((part, i) => {
+            if (part.startsWith('**') && part.endsWith('**')) {
+              return <strong key={i} className="text-[#0D9488] font-black">{part.slice(2, -2)}</strong>;
+            }
+            return part;
+          })}
         </p>
       )}
       {raw && (

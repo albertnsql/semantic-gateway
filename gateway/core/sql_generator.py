@@ -306,8 +306,11 @@ class SQLGenerator:
                     elif _bare_dimension_name(col) in dim_map:
                         col = dim_map[_bare_dimension_name(col)]
                 if col in (intent.dimensions or []):
-                    logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
-                    continue
+                    # Only strip if the LLM hallucinated a generic value, not a real filter value like 'US'
+                    val_str = str(f.value).lower()
+                    if val_str in ("all", "any", str(f.column).lower(), str(col).lower()):
+                        logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
+                        continue
                 effective_filters.append(f)
         
         # Override the intent filters so format_mf_query receives the clean list
@@ -586,10 +589,12 @@ class SQLGenerator:
                 # e.g. "show churn by plan type" → plan_type in dims AND in filters
                 # (LLM sometimes adds an IN(all_plans) filter redundantly).
                 if col in (intent.dimensions or []):
-                    logger.info(
-                        "Skipping filter on '%s' — already used as a group-by dimension.", col
-                    )
-                    continue
+                    val_str = str(f.value).lower()
+                    if val_str in ("all", "any", str(f.column).lower(), str(col).lower()):
+                        logger.info(
+                            "Skipping filter on '%s' — already used as a group-by dimension.", col
+                        )
+                        continue
 
                 if f.operator == "in":
                     # Robustly parse the value — LLM may return a real list OR a
@@ -609,7 +614,7 @@ class SQLGenerator:
                                 raw_list = [raw_list]  # treat whole string as one value
                     vals = raw_list if isinstance(raw_list, list) else [raw_list]
                     val_str = ", ".join(f"'{v}'" for v in vals)
-                    where_parts.append(f"Dimension('{col}') IN ({val_str})")
+                    where_parts.append(f"{col} IN ({val_str})")
                 else:
                     op = _OP_MAP.get(f.operator, "=")
                     raw_val = str(f.value)
@@ -618,7 +623,7 @@ class SQLGenerator:
                         val_str = raw_val
                     except ValueError:
                         val_str = f"'{raw_val}'"
-                    where_parts.append(f"Dimension('{col}') {op} {val_str}")
+                    where_parts.append(f"{col} {op} {val_str}")
             if where_parts:
                 where_clause = " AND ".join(where_parts)
                 parts.append(f'--where "{where_clause}"')
