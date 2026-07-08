@@ -595,6 +595,11 @@ class SQLGenerator:
                             "Skipping filter on '%s' — already used as a group-by dimension.", col
                         )
                         continue
+                
+                # ── Guard: skip time-based filters if time_range handles it ──
+                if intent.time_range and any(t in col.lower() for t in ("time", "date", "month", "year", "day", "quarter", "week")):
+                    logger.info("Skipping time-based filter on '%s' because time_range is set.", col)
+                    continue
 
                 if f.operator == "in":
                     # Robustly parse the value — LLM may return a real list OR a
