@@ -306,27 +306,8 @@ class SQLGenerator:
                     elif _bare_dimension_name(col) in dim_map:
                         col = dim_map[_bare_dimension_name(col)]
                 if col in (intent.dimensions or []):
-                    # Only strip if the LLM hallucinated a generic value, not a real filter value like 'US'
-                    val_str = str(f.value).lower()
-                    if val_str in ("all", "any", str(f.column).lower(), str(col).lower()):
-                        logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
-                        continue
-
-                    # The LLM sometimes hallucinates an IN filter containing all possible values for a dimension.
-                    # Since we are already grouping by this dimension, filtering on ALL values is redundant
-                    # and breaks the SQLTemplateCache.
-                    if isinstance(f.value, list):
-                        v_set = {str(v).lower() for v in f.value}
-                        known_enums = [
-                            {"basic", "standard", "premium"},
-                            {"paused", "churned", "active"},
-                            {"movie", "documentary", "short", "series"},
-                            {"high", "medium", "low"},
-                            {"new", "expansion", "contraction", "churned", "inactive", "retained"}
-                        ]
-                        if v_set in known_enums:
-                            logger.info("Stripping redundant full-enum filter on '%s' before cache check.", col)
-                            continue
+                    logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
+                    continue
 
                 effective_filters.append(f)
         
@@ -606,12 +587,10 @@ class SQLGenerator:
                 # e.g. "show churn by plan type" → plan_type in dims AND in filters
                 # (LLM sometimes adds an IN(all_plans) filter redundantly).
                 if col in (intent.dimensions or []):
-                    val_str = str(f.value).lower()
-                    if val_str in ("all", "any", str(f.column).lower(), str(col).lower()):
-                        logger.info(
-                            "Skipping filter on '%s' — already used as a group-by dimension.", col
-                        )
-                        continue
+                    logger.info(
+                        "Skipping filter on '%s' — already used as a group-by dimension.", col
+                    )
+                    continue
                 
                 # ── Guard: skip time-based filters if time_range handles it ──
                 if intent.time_range and any(t in col.lower() for t in ("time", "date", "month", "year", "day", "quarter", "week")):
