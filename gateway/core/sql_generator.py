@@ -311,6 +311,23 @@ class SQLGenerator:
                     if val_str in ("all", "any", str(f.column).lower(), str(col).lower()):
                         logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
                         continue
+
+                    # The LLM sometimes hallucinates an IN filter containing all possible values for a dimension.
+                    # Since we are already grouping by this dimension, filtering on ALL values is redundant
+                    # and breaks the SQLTemplateCache.
+                    if isinstance(f.value, list):
+                        v_set = {str(v).lower() for v in f.value}
+                        known_enums = [
+                            {"basic", "standard", "premium"},
+                            {"paused", "churned", "active"},
+                            {"movie", "documentary", "short", "series"},
+                            {"high", "medium", "low"},
+                            {"new", "expansion", "contraction", "churned", "inactive", "retained"}
+                        ]
+                        if v_set in known_enums:
+                            logger.info("Stripping redundant full-enum filter on '%s' before cache check.", col)
+                            continue
+
                 effective_filters.append(f)
         
         # Override the intent filters so format_mf_query receives the clean list
