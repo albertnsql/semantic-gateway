@@ -317,7 +317,7 @@ class SQLGenerator:
         # Filtered queries are NOT eligible for the template cache — the compiled SQL
         # contains hard-coded WHERE predicates (e.g., country = 'US') that cannot be
         # reused for a different filter value or an unfiltered version of the same query.
-        if self._template_cache is not None and intent.metrics and intent.dimensions and not effective_filters:
+        if self._template_cache is not None and intent.metrics and not effective_filters:
             cached_tpl = self._template_cache.get(intent.metrics, intent.dimensions)
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
@@ -413,7 +413,7 @@ class SQLGenerator:
             # fallback SQL to avoid poisoning the cache with LLM hallucinations.
             # CRITICAL: We ONLY cache if mf_success is True AND the query has no
             # filters. Filtered SQL is query-specific and must not be reused.
-            if self._template_cache is not None and intent.metrics and intent.dimensions and mf_success and not intent.filters:
+            if self._template_cache is not None and intent.metrics and mf_success and not intent.filters:
                 try:
                     sql_template = compiled_sql
                     has_placeholder = False
