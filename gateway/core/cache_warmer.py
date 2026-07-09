@@ -65,7 +65,7 @@ class CacheWarmer:
     def _run(self) -> None:
         """Background loop executing the warm-up matrix."""
         matrix = self.settings.warmup_matrix
-        total_combinations = sum(len(dims) for dims in matrix.values())
+        total_combinations = sum(len(dims) + 1 for dims in matrix.values())
         
         logger.info("[CacheWarmer] Starting warm-up: %d combinations queued", total_combinations)
         start_time_all = time.perf_counter()
@@ -75,7 +75,7 @@ class CacheWarmer:
         failed = 0
 
         for metric, dimensions in matrix.items():
-            for dim in dimensions:
+            for dim in [None] + dimensions:
                 if self._stop_event.is_set():
                     logger.info("[CacheWarmer] Warm-up cancelled by shutdown.")
                     return
@@ -86,15 +86,16 @@ class CacheWarmer:
                     skipped += 1
                     logger.info(
                         "[CacheWarmer] SKIP %s × %s — not a MetricFlow metric (fallback-only).",
-                        metric, dim,
+                        metric, dim if dim else "bare",
                     )
                     continue
                 
                 # Construct intent FOR L2 CACHE KEY (no time range)
+                dims = [dim] if dim else []
                 intent_key = QueryIntent(
-                    original_query=f"Show {metric} by {dim}",
+                    original_query=f"Show {metric} by {dim}" if dim else f"Show {metric}",
                     metrics=[metric],
-                    dimensions=[dim],
+                    dimensions=dims,
                     time_range=None,
                     aggregation_level=None,
                     filters=[]
@@ -105,15 +106,15 @@ class CacheWarmer:
                 # Check if already cached
                 if self.query_cache.get(intent_dict) is not None:
                     skipped += 1
-                    logger.info("[CacheWarmer] SKIP %s × %s — already cached", metric, dim)
+                    logger.info("[CacheWarmer] SKIP %s × %s — already cached", metric, dim if dim else "bare")
                     continue
 
                 # Construct intent FOR METRICFLOW (with wide time range to force parameterizable template)
                 from core.intent_extractor import TimeRange
                 intent_exec = QueryIntent(
-                    original_query=f"Show {metric} by {dim} (warmup)",
+                    original_query=f"Show {metric} by {dim} (warmup)" if dim else f"Show {metric} (warmup)",
                     metrics=[metric],
-                    dimensions=[dim],
+                    dimensions=dims,
                     time_range=TimeRange(
                         start_date="2000-01-01",
                         end_date="2039-12-31",
@@ -187,11 +188,11 @@ class CacheWarmer:
                     
                     elapsed = time.perf_counter() - start_time_single
                     warmed += 1
-                    logger.info("[CacheWarmer] Warmed %s × %s (%.1fs elapsed)", metric, dim, elapsed)
+                    logger.info("[CacheWarmer] Warmed %s × %s (%.1fs elapsed)", metric, dim if dim else "bare", elapsed)
                     
                 except Exception as exc:
                     failed += 1
-                    logger.error("[CacheWarmer] FAILED %s × %s — %s", metric, dim, exc)
+                    logger.error("[CacheWarmer] FAILED %s × %s — %s", metric, dim if dim else "bare", exc)
 
         total_elapsed = time.perf_counter() - start_time_all
         logger.info(

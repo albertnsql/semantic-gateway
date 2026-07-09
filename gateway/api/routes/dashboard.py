@@ -297,7 +297,7 @@ SELECT
 FROM {_DB}.marts.fct_stream_sessions
 WHERE session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date
   {plan_filter}
-  {_country_clause(countries)}
+  {_country_clause_sub(countries)}
 GROUP BY 1
 ORDER BY 1 DESC
 """.strip()
@@ -313,7 +313,7 @@ WHERE (
     OR (session_start >= '{d['prior_year_same_month']}'::date AND session_start < '{prior_next_month}'::date)
   )
   {plan_filter}
-  {_country_clause(countries)}
+  {_country_clause_sub(countries)}
 GROUP BY 1
 ORDER BY 1 DESC
 """.strip()
@@ -606,7 +606,7 @@ FROM {_DB}.marts.fct_stream_sessions
 WHERE session_start >= DATEADD('month', -12, '{max_data_date}'::date)
   AND session_start < DATEADD('month', 1, '{max_data_date}'::date)
   {plan_filter}
-  {_country_clause(countries)}
+  {_country_clause_sub(countries)}
 GROUP BY DATE_TRUNC('month', session_start), name
 ORDER BY sort_key
 """.strip()
@@ -623,19 +623,20 @@ def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: 
     curr_year_num   = int(d['data_through_date'][:4])
     curr_next_month = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
     plan_filter     = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
-    country_filter  = _country_clause(countries)
+    country_filter  = _country_clause_sub(countries)
     return f"""
 -- Dashboard: watch_time_content_type — Avg Watch Time by Content Type
--- Uses denormalized content_type from fct_stream_sessions (same month window as watch_time_kpi)
+-- Uses dim_content JOIN since content_type is not in fct_stream_sessions
 SELECT
-    COALESCE(content_type, 'Unknown') AS name,
-    ROUND(AVG(duration_minutes), 1)   AS value
-FROM {_DB}.marts.fct_stream_sessions
-WHERE session_start >= '{d['data_through_date']}'::date
-  AND session_start <  '{curr_next_month}'::date
+    COALESCE(c.content_type, 'Unknown') AS name,
+    ROUND(AVG(f.duration_minutes), 1)   AS value
+FROM {_DB}.marts.fct_stream_sessions f
+LEFT JOIN {_DB}.marts.dim_content c ON f.content_id = c.content_id
+WHERE f.session_start >= '{d['data_through_date']}'::date
+  AND f.session_start <  '{curr_next_month}'::date
   {plan_filter}
   {country_filter}
-GROUP BY content_type
+GROUP BY c.content_type
 HAVING COUNT(*) > 0
 ORDER BY value DESC
 """.strip()
