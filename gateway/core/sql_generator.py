@@ -615,7 +615,7 @@ class SQLGenerator:
                                 raw_list = [raw_list]  # treat whole string as one value
                     vals = raw_list if isinstance(raw_list, list) else [raw_list]
                     val_str = ", ".join(f"'{v}'" for v in vals)
-                    where_parts.append(f"{col} IN ({val_str})")
+                    where_parts.append(f"Dimension('{col}') IN ({val_str})")
                 else:
                     op = _OP_MAP.get(f.operator, "=")
                     raw_val = str(f.value)
@@ -624,7 +624,7 @@ class SQLGenerator:
                         val_str = raw_val
                     except ValueError:
                         val_str = f"'{raw_val}'"
-                    where_parts.append(f"{col} {op} {val_str}")
+                    where_parts.append(f"Dimension('{col}') {op} {val_str}")
             if where_parts:
                 where_clause = " AND ".join(where_parts)
                 parts.append(f'--where "{where_clause}"')
