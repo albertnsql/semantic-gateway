@@ -110,7 +110,9 @@ class Settings(BaseSettings):
         "churn_rate":            ["subscription__plan_type", "subscriber__country", "subscriber__churn_reason"],
         "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
         "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
-        "total_revenue":         ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
+        # total_revenue's measure is mrr_usd on sem_mrr — payment__ dims are NOT
+        # reachable (MetricFlow rejects them; confirmed via precompile failures).
+        "total_revenue":         ["subscription__plan_type", "subscriber__plan_type", "subscriber__country"],
         "expansion_mrr":         ["subscription__plan_type", "subscriber__country"],
         # engagement_rate joins fct_stream_sessions → session entity; plan_type is on subscriber entity
         "engagement_rate":       ["session__device_type", "subscriber__plan_type", "subscriber__country"],

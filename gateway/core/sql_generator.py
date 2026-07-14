@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import concurrent.futures
 import sys
@@ -140,10 +141,12 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                 used_sms.append(sm)
                 
         primary_entities = []
+        model_entities = []   # ALL entities (primary + foreign) on the metric's models
         for sm in used_sms:
             for e in sm.get('entities', []):
                 if e.get('type') == 'primary':
                     primary_entities.append(e['name'])
+                model_entities.append(e['name'])
                     
         m_dim_map = {}
         for dim_name, prefixes in global_dims.items():
@@ -203,7 +206,18 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                         if any(p.startswith(pe + '__') for pe in primary_entities):
                             chosen = p
                             break
-                            
+
+                if not chosen:
+                    # Foreign entities on the metric's models are valid MetricFlow
+                    # join paths (e.g. total_revenue on sem_mrr → subscriber__country
+                    # via the foreign 'subscriber' entity). Prefer these over an
+                    # arbitrary prefixes[0], which picks unreachable dims like
+                    # session__country and fails query resolution.
+                    for p in prefixes:
+                        if any(p.startswith(me + '__') for me in model_entities):
+                            chosen = p
+                            break
+
                 if not chosen:
                     chosen = prefixes[0]
                     
@@ -924,6 +938,7 @@ class SQLGenerator:
         _METRIC_TABLE: dict[str, str] = {
             "mrr": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "expansion_mrr": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
+            "total_revenue": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "ltv": "STREAMING_ANALYTICS.marts.fct_payments",
             "engagement_rate": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
             "churn_rate": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
@@ -938,6 +953,7 @@ class SQLGenerator:
         _METRIC_EXPR: dict[str, str] = {
             "mrr": "SUM(mrr_usd) AS mrr",
             "expansion_mrr": "SUM(CASE WHEN mrr_type = 'expansion' THEN mrr_usd ELSE 0 END) AS expansion_mrr",
+            "total_revenue": "SUM(mrr_usd) AS total_revenue",
             "ltv": "SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END) AS ltv",
             "engagement_rate": "AVG(completion_pct) AS engagement_rate",
             # Monthly event-based churn on fct_mrr_monthly — mirrors the governed
@@ -984,9 +1000,33 @@ class SQLGenerator:
         select_parts.append(metric_expr)
 
         where_clauses: list[str] = []
+
+        # Apply user filters with bare physical column names. Without this, a
+        # filtered query that falls back here would silently return UNFILTERED
+        # numbers (e.g. worldwide revenue presented as "for country US").
+        _FALLBACK_OP_MAP = {"eq": "=", "neq": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+        for f in (intent.filters or []):
+            col = _bare_dimension_name(f.column)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", col):
+                logger.warning("Fallback SQL: skipping filter on unsafe column name '%s'.", f.column)
+                continue
+            if f.operator == "in":
+                vals = f.value if isinstance(f.value, list) else [f.value]
+                val_str = ", ".join("'{}'".format(str(v).replace("'", "''")) for v in vals)
+                where_clauses.append(f"{col} IN ({val_str})")
+            else:
+                op = _FALLBACK_OP_MAP.get(f.operator, "=")
+                raw_val = str(f.value)
+                try:
+                    float(raw_val)
+                    val_str = raw_val
+                except ValueError:
+                    val_str = "'{}'".format(raw_val.replace("'", "''"))
+                where_clauses.append(f"{col} {op} {val_str}")
+
         if intent.time_range:
             # Use the appropriate physical time column based on the metric
-            if primary_metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate"):
+            if primary_metric in ("mrr", "expansion_mrr", "total_revenue", "churn_rate", "retention_rate"):
                 time_col = "period_month"
             elif primary_metric == "ltv":
                 time_col = "payment_date"
