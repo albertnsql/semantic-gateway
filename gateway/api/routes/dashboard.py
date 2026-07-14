@@ -611,32 +611,40 @@ GROUP BY DATE_TRUNC('month', session_start), name
 ORDER BY sort_key
 """.strip()
 
-def _sql_watch_time_content_type(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
+def _sql_sessions_by_referral(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
-    Avg Watch Time by Content Type — uses the same max_data_date-anchored single-month
-    window as watch_time_kpi. Reads content_type directly from fct_stream_sessions
-    (denormalized column) to avoid foreign key mismatches on the dim_content join.
-    Falls back to the dim_content JOIN if the direct column doesn't exist.
+    Sessions by Referral Source — how viewers discover what they watch
+    (recommendation / home_page / continue_watching / search / external).
+
+    Replaces the former "Avg Watch Time by Content Type" widget, which relied on
+    the fct_stream_sessions -> dim_content join (content_id sets are disjoint in the
+    synthetic data: 0 matches, so it only ever rendered a single 'Unknown' bar).
+    referral_source is a NATIVE column on fct_stream_sessions — no join, no NULL
+    bucket — and unlike avg watch time (flat ~54 min across every dimension) it
+    carries real signal. Ties thematically to the recommendation_ctr metric.
+
+    Same max_data_date-anchored single-month window as the other session widgets.
+    Returns {name, value} rows (value = session count) ordered largest-first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
     curr_month_num  = int(d['data_through_date'][5:7])
     curr_year_num   = int(d['data_through_date'][:4])
     curr_next_month = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
     plan_filter     = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
-    country_filter  = _country_clause_sub(countries)
+    # Native country column on fct_stream_sessions — filter directly rather than via
+    # the subscriber_id subquery (that join is unreliable for session rows).
+    country_filter  = _country_clause(countries, col="country")
     return f"""
--- Dashboard: watch_time_content_type — Avg Watch Time by Content Type
--- Uses dim_content JOIN since content_type is not in fct_stream_sessions
+-- Dashboard: sessions_by_referral — Sessions by Referral Source
 SELECT
-    COALESCE(c.content_type, 'Unknown') AS name,
-    ROUND(AVG(f.duration_minutes), 1)   AS value
-FROM {_DB}.marts.fct_stream_sessions f
-LEFT JOIN {_DB}.marts.dim_content c ON f.content_id = c.content_id
-WHERE f.session_start >= '{d['data_through_date']}'::date
-  AND f.session_start <  '{curr_next_month}'::date
+    COALESCE(referral_source, 'Unknown') AS name,
+    COUNT(*)                             AS value
+FROM {_DB}.marts.fct_stream_sessions
+WHERE session_start >= '{d['data_through_date']}'::date
+  AND session_start <  '{curr_next_month}'::date
   {plan_filter}
   {country_filter}
-GROUP BY c.content_type
+GROUP BY referral_source
 HAVING COUNT(*) > 0
 ORDER BY value DESC
 """.strip()
@@ -659,7 +667,7 @@ _WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str], str], str]] = 
     "mrr_trend":            _sql_mrr_trend,
     "retention_trend":      _sql_retention_trend,
     "sessions_trend":       _sql_sessions_trend,
-    "watch_time_content_type": _sql_watch_time_content_type,
+    "sessions_by_referral": _sql_sessions_by_referral,
 }
 
 

@@ -185,7 +185,7 @@ export default function DashboardPage() {
     mrrTrend:         { loading: true, data: null, isMock: false },
     retentionTrend:   { loading: true, data: null, isMock: false },
     sessions:         { loading: true, data: null, isMock: false },
-    watchTimeContent: { loading: true, data: null, isMock: false },
+    sessionsReferral: { loading: true, data: null, isMock: false },
   });
 
   const loadDashboardData = async (plans = selectedPlans, years = selectedYears, countries = selectedCountries) => {
@@ -276,7 +276,7 @@ export default function DashboardPage() {
       const [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11] = await Promise.all([
         widget('revenue_kpi'), widget('net_mrr_growth_kpi'), widget('subs_kpi'), widget('watch_time_kpi'),
         widget('engagement_kpi'), widget('churn_rate_kpi'), widget('sub_dist'), widget('mrr_bridge'),
-        widget('mrr_trend'), widget('retention_trend'), widget('sessions_trend'), widget('watch_time_content_type')
+        widget('mrr_trend'), widget('retention_trend'), widget('sessions_trend'), widget('sessions_by_referral')
       ]);
 
       // Parse mrr_bridge: pivot unpivoted rows into per-month keyed objects
@@ -324,7 +324,7 @@ export default function DashboardPage() {
         mrrTrend:         parseChart(r8,  generateMockArea),
         retentionTrend:   parseChart(r9,  generateMockLine),
         sessions:         parseChart(r10, generateMockSessions),
-        watchTimeContent: parseChart(r11, generateMockBar),
+        sessionsReferral: parseChart(r11, generateMockBar),
       });
 
       setLastRefreshed(new Date());
@@ -747,17 +747,17 @@ export default function DashboardPage() {
               </ChartCard>
             </div>
             <div className="h-full min-w-0">
-              <ChartCard title="Avg Watch Time by Content Type" isMock={charts.watchTimeContent.isMock}>
-                {charts.watchTimeContent.loading ? <LoadingSpinner /> : (
+              <ChartCard title="Sessions by Referral Source" isMock={charts.sessionsReferral.isMock}>
+                {charts.sessionsReferral.loading ? <LoadingSpinner /> : (
                   <ResponsiveContainer width="100%" height="100%">
-                    <BarChart layout="vertical" data={charts.watchTimeContent.data} margin={{ top:8, right:10, left:100, bottom:15 }} maxBarSize={40}>
+                    <BarChart layout="vertical" data={charts.sessionsReferral.data} margin={{ top:8, right:10, left:100, bottom:15 }} maxBarSize={40}>
                       <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(13,148,136,0.08)" />
-                      <XAxis type="number" axisLine={false} tickLine={false} fontSize={11} tick={{ fill:'#4A7B76', fontWeight: 500 }} tickFormatter={(v) => v}>
-                        <Label value="Minutes" position="bottom" fill="#4A7B76" fontSize={11} offset={0} />
+                      <XAxis type="number" axisLine={false} tickLine={false} fontSize={11} tick={{ fill:'#4A7B76', fontWeight: 500 }} tickFormatter={(v) => v >= 1000 ? `${Math.round(v/1000)}k` : v}>
+                        <Label value="Sessions" position="bottom" fill="#4A7B76" fontSize={11} offset={0} />
                       </XAxis>
                       <YAxis type="category" dataKey="name" axisLine={false} tickLine={false} fontSize={11} tick={{ fill:'#4A7B76', fontWeight: 500, textTransform: 'capitalize' }} />
-                      <Tooltip cursor={{ fill:'rgba(13,148,136,0.04)' }} content={<LightTooltip formatter={(v) => v} />} />
-                      <Bar dataKey="value" name="Avg Watch Time" fill="#0F766E" radius={[0, 8, 8, 0]} />
+                      <Tooltip cursor={{ fill:'rgba(13,148,136,0.04)' }} content={<LightTooltip formatter={(v) => Number(v).toLocaleString()} />} />
+                      <Bar dataKey="value" name="Sessions" fill="#0F766E" radius={[0, 8, 8, 0]} />
                     </BarChart>
                   </ResponsiveContainer>
                 )}
