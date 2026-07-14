@@ -92,35 +92,45 @@ class Settings(BaseSettings):
         #   event__        → stg_recommendation_events / event entity
         #   payment__      → fct_payments / payment entity
         #
-        # ⚠ On Render free tier (512 MB RAM): keep this to ≤ 6 total combinations.
-        # Each warm-up entry forks a MetricFlow subprocess (~80 MB spike each).
-        # The entries below (9 combos) are safe for 1 GB+ hosts. Trim to the
-        # commented-out subset for 512 MB:
+        # NOTE: In production the runtime CacheWarmer is disabled (DISABLE_CACHE_WARMER=true);
+        # this matrix is consumed OFFLINE by precompile_templates.py, whose output
+        # (.sql_template_cache.json) ships as a committed build artifact. So matrix size
+        # only affects local precompile time, not Render RAM — the old "≤6 combos on
+        # 512 MB" warning no longer applies.
         #
-        # Render-safe subset (6 combos — comment the rest out):
-        #   "mrr":               ["subscription__plan_type", "subscriber__country"]
-        #   "total_subscribers": ["subscriber__plan_type"]
-        #   "churn_rate":        ["subscriber__plan_type"]
+        # DIMENSION DISCIPLINE (see referential-integrity analysis):
+        #   - fct_mrr_monthly / dim_subscribers / fct_payments joins are sound → these
+        #     metrics may be sliced by subscription__ / subscriber__ / payment__ dims.
+        #   - fct_stream_sessions → subscriber/content joins break for the latest-month
+        #     append, so SESSION metrics are warmed by NATIVE session dims ONLY
+        #     (session__device_type/quality_streamed/referral_source). Never warm a
+        #     session metric by subscriber__* — it returns a null-dominated breakdown
+        #     for the current month.
         #
-        # ── CONFIRMED MetricFlow-native metrics (semantic manifest validates these) ──
+        # ── MRR family (fct_mrr_monthly — subscriber join 100%) ──
         "mrr":                   ["subscription__plan_type", "subscriber__country", "subscriber__cohort_month"],
-        "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
-        # churn_rate lives on fct_mrr_monthly (monthly event-based definition):
-        # subscription__plan_type is native; subscriber__ dims join via the subscriber entity.
-        "churn_rate":            ["subscription__plan_type", "subscriber__country", "subscriber__churn_reason"],
-        "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
-        "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
-        # total_revenue's measure is mrr_usd on sem_mrr — payment__ dims are NOT
-        # reachable (MetricFlow rejects them; confirmed via precompile failures).
-        "total_revenue":         ["subscription__plan_type", "subscriber__plan_type", "subscriber__country"],
         "expansion_mrr":         ["subscription__plan_type", "subscriber__country"],
-        # engagement_rate joins fct_stream_sessions → session entity; plan_type is on subscriber entity
-        "engagement_rate":       ["session__device_type", "subscriber__plan_type", "subscriber__country"],
+        "total_revenue":         ["subscription__plan_type", "subscriber__country"],
+        # net_mrr_growth is intentionally NOT warmed: it's a derived offset_window
+        # (month-over-month) metric, so MetricFlow can't compile it without a
+        # metric_time grouping and it always falls back. The dashboard net_mrr_growth_kpi
+        # widget computes it via its own SQL builder; NL queries use the governed fallback.
+        # churn_rate/retention_rate: monthly event-based, on fct_mrr_monthly.
+        "churn_rate":            ["subscription__plan_type", "subscriber__country", "subscriber__churn_reason"],
+        "retention_rate":        ["subscription__plan_type", "subscriber__country"],
+        # ── Subscriber counts (dim_subscribers — base table, no join risk) ──
+        "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
+        "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
+        # ── LTV (fct_payments — subscriber join ~86%) ──
+        "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
+        # ── Session metrics (fct_stream_sessions — NATIVE session dims only) ──
+        "avg_watch_time":        ["session__device_type", "session__quality_streamed", "session__referral_source"],
+        "total_sessions":        ["session__device_type", "session__quality_streamed", "session__referral_source"],
+        "engagement_rate":       ["session__device_type", "session__quality_streamed"],
+        # ── Recommendation metrics (stg_recommendation_events — native) ──
         "recommendation_ctr":    ["event__recommendation_type"],
         "total_recommendations": ["event__recommendation_type"],
         "clicked_recommendations": ["event__recommendation_type"],
-        "avg_watch_time":        ["session__device_type", "subscriber__plan_type", "subscriber__country"],
-        "total_sessions":        ["session__device_type", "subscriber__plan_type", "subscriber__country"],
         #
         # ── REMOVED / NOT in MetricFlow semantic manifest ──────────────────────────
         # "new_subscribers" — MetricFlow rejects this metric name every time.
