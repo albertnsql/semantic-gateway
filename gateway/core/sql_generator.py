@@ -151,11 +151,23 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                 m_dim_map[dim_name] = prefixes[0]
             else:
                 chosen = None
-                if m_name in ['total_subscribers', 'churned_subscribers', 'churn_rate']:
+                if m_name in ['total_subscribers', 'churned_subscribers']:
                     for p in prefixes:
                         if p.startswith('subscriber__'):
                             chosen = p
                             break
+                elif m_name in ['churn_rate', 'retention_rate']:
+                    # churn_rate/retention_rate now live on fct_mrr_monthly:
+                    # prefer native subscription__ dims, fall back to subscriber__ joins.
+                    for p in prefixes:
+                        if p.startswith('subscription__'):
+                            chosen = p
+                            break
+                    if not chosen:
+                        for p in prefixes:
+                            if p.startswith('subscriber__'):
+                                chosen = p
+                                break
                 elif m_name == 'ltv':
                     # ltv spans fct_payments (payment entity) AND dim_subscribers.
                     # Prefer payment__ prefix for payment-domain dims, subscriber__ for subscriber dims.
@@ -248,7 +260,10 @@ class SQLGenerator:
         "expansion_mrr":          "period_month",
         "ltv":                    "payment_date",
         "engagement_rate":        "session_start",
-        "churn_rate":             "signup_date",
+        # churn_rate/retention_rate live on fct_mrr_monthly (monthly event-based
+        # definition) — time filters select the month churn HAPPENED, not signup.
+        "churn_rate":             "period_month",
+        "retention_rate":         "period_month",
         "total_subscribers":      "signup_date",
         "churned_subscribers":    "signup_date",
         "recommendation_ctr":     "event_timestamp",
@@ -911,7 +926,8 @@ class SQLGenerator:
             "expansion_mrr": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "ltv": "STREAMING_ANALYTICS.marts.fct_payments",
             "engagement_rate": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
-            "churn_rate": "STREAMING_ANALYTICS.marts.dim_subscribers",
+            "churn_rate": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
+            "retention_rate": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "total_subscribers": "STREAMING_ANALYTICS.marts.dim_subscribers",
             "churned_subscribers": "STREAMING_ANALYTICS.marts.dim_subscribers",
             "recommendation_ctr": "STREAMING_ANALYTICS.staging.stg_recommendation_events",
@@ -924,9 +940,15 @@ class SQLGenerator:
             "expansion_mrr": "SUM(CASE WHEN mrr_type = 'expansion' THEN mrr_usd ELSE 0 END) AS expansion_mrr",
             "ltv": "SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END) AS ltv",
             "engagement_rate": "AVG(completion_pct) AS engagement_rate",
+            # Monthly event-based churn on fct_mrr_monthly — mirrors the governed
+            # MetricFlow definition and the dashboard churn_rate_kpi formula.
             "churn_rate": (
-                "COUNT(CASE WHEN is_churned = TRUE THEN subscriber_id END)::FLOAT / "
-                "NULLIF(COUNT(subscriber_id), 0) AS churn_rate"
+                "COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT / "
+                "NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS churn_rate"
+            ),
+            "retention_rate": (
+                "1 - COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT / "
+                "NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS retention_rate"
             ),
             "total_subscribers": "COUNT(DISTINCT subscriber_id) AS total_subscribers",
             "churned_subscribers": "COUNT(DISTINCT CASE WHEN is_churned = TRUE THEN subscriber_id END) AS churned_subscribers",
@@ -964,13 +986,13 @@ class SQLGenerator:
         where_clauses: list[str] = []
         if intent.time_range:
             # Use the appropriate physical time column based on the metric
-            if primary_metric in ("mrr", "expansion_mrr"):
+            if primary_metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate"):
                 time_col = "period_month"
             elif primary_metric == "ltv":
                 time_col = "payment_date"
             elif primary_metric == "engagement_rate":
                 time_col = "session_start"  # fct_stream_sessions physical column
-            elif primary_metric in ("churn_rate", "total_subscribers", "churned_subscribers"):
+            elif primary_metric in ("total_subscribers", "churned_subscribers"):
                 time_col = "signup_date"
             elif primary_metric in ("recommendation_ctr", "total_recommendations", "clicked_recommendations"):
                 time_col = "event_timestamp"  # stg_recommendation_events physical column

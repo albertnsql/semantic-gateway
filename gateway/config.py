@@ -105,7 +105,9 @@ class Settings(BaseSettings):
         # ── CONFIRMED MetricFlow-native metrics (semantic manifest validates these) ──
         "mrr":                   ["subscription__plan_type", "subscriber__country", "subscriber__cohort_month"],
         "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
-        "churn_rate":            ["subscriber__plan_type", "subscriber__country", "subscriber__churn_reason"],
+        # churn_rate lives on fct_mrr_monthly (monthly event-based definition):
+        # subscription__plan_type is native; subscriber__ dims join via the subscriber entity.
+        "churn_rate":            ["subscription__plan_type", "subscriber__country", "subscriber__churn_reason"],
         "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
         "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
         "total_revenue":         ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],

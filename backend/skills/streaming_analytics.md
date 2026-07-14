@@ -55,6 +55,7 @@ Only fall back to raw SQL if the requested metric is not in this list or if Metr
 - **MRR Aggregation:** MRR (Monthly Recurring Revenue) is a monthly snapshot metric. NEVER aggregate or sum it across multiple months. If a user asks for MRR over a multi-month period (e.g. "for the year 2026"), you MUST set `aggregation_level` to `"month"` so the semantic layer returns the trend, rather than summing it into a meaningless annual total.
 - **Watch time:** Always use `AVG(watch_time_minutes)` not `SUM(watch_time_minutes)` — summing sessions gives meaningless totals.
 - **Churn:** `churned_mrr` is already a signed negative value; do not negate it again or the sign will flip to positive.
+- **Churn rate is MONTHLY and event-based:** `churn_rate` = distinct subscribers with `mrr_type = 'churned'` in the month ÷ distinct subscribers with `mrr_type != 'inactive'` in the month, computed on `fct_mrr_monthly` and time-filtered by `period_month`. A time filter selects the month the churn EVENT happened — never filter churn by `signup_date` (that computes signup-cohort churn, which reads ~0% for recent months). `retention_rate` = 1 − churn_rate, same base.
 - **Country NULL:** Some rows have `country = NULL` (unknown origin); always include `WHERE country IS NOT NULL` unless the user explicitly asks to include all countries.
 - **Plan type:** Valid values are `'basic'`, `'standard'`, `'premium'` only — any other value indicates bad data and should be filtered out.
 

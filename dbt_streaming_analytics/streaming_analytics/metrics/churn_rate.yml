@@ -1,8 +1,37 @@
 metrics:
+  # Building-block metrics for the monthly churn rate (wrap sem_mrr measures —
+  # ratio metrics must reference metrics, not measures).
+  - name: monthly_churned_subscribers
+    description: >
+      Distinct subscribers whose subscription flipped active→inactive during the
+      period month (mrr_type = 'churned' in fct_mrr_monthly).
+    label: Monthly Churned Subscribers
+    type: simple
+    type_params:
+      measure: monthly_churned_subscribers
+
+  - name: monthly_subscriber_base
+    description: >
+      Distinct subscribers with any non-inactive subscription row in the period
+      month. Denominator for the monthly churn rate.
+    label: Monthly Subscriber Base
+    type: simple
+    type_params:
+      measure: monthly_subscriber_base
+
   - name: churn_rate
-    description: Subscriber Churn Rate
-    label: Subscriber Churn Rate
+    description: >
+      Monthly subscriber churn rate: distinct subscribers who churned during the
+      period month ÷ distinct subscribers active in that month (any non-inactive
+      row in fct_mrr_monthly). Time-filtering this metric selects the month(s) the
+      churn EVENT happened in — not the signup cohort. Formula matches the
+      dashboard churn_rate_kpi widget.
+      (Previous definition — churned ÷ total on the dim_subscribers snapshot,
+      time-filtered by signup_date — answered "how many of month M's SIGNUPS have
+      churned so far", which reported ~0% for recent months and contradicted the
+      dashboard.)
+    label: Subscriber Churn Rate (Monthly)
     type: ratio
     type_params:
-      numerator: churned_subscribers
-      denominator: total_subscribers
+      numerator: monthly_churned_subscribers
+      denominator: monthly_subscriber_base

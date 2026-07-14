@@ -28,3 +28,19 @@ semantic_models:
         expr: mrr_usd
         agg: sum
         agg_time_dimension: period_month
+      - name: monthly_churned_subscribers
+        description: >
+          Distinct subscribers whose subscription flipped active→inactive in the
+          period month (mrr_type = 'churned'). Numerator for the monthly churn rate.
+        expr: case when mrr_type = 'churned' then subscriber_id end
+        agg: count_distinct
+        agg_time_dimension: period_month
+      - name: monthly_subscriber_base
+        description: >
+          Distinct subscribers with any non-inactive subscription row in the period
+          month. Denominator for the monthly churn rate — intentionally matches the
+          dashboard churn_rate_kpi formula (gateway/api/routes/dashboard.py) so the
+          chat and dashboard always report the same number.
+        expr: case when mrr_type != 'inactive' then subscriber_id end
+        agg: count_distinct
+        agg_time_dimension: period_month
