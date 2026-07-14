@@ -53,7 +53,9 @@ class MetricEmbedder:
                         "content": {"parts": [{"text": text}]}
                     })
                     
-                resp = requests.post(url, json={"requests": reqs})
+                # Timeout is mandatory: without it a stalled embedding endpoint
+                # hangs the entire request pipeline indefinitely.
+                resp = requests.post(url, json={"requests": reqs}, timeout=(3, 10))
                 if not resp.ok:
                     raise RuntimeError(f"Gemini API error: {resp.text}")
                     

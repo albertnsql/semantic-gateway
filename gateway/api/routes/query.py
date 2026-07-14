@@ -33,8 +33,9 @@ def make_json_safe(obj):
         return float(obj)
     return obj
 
-# All classifier imports at module level — avoids re-importing on every request
-from classifier import QueryType, build_out_of_scope_suggestion
+# Routing (metric_query / schema_question / out_of_scope) is decided inside the
+# IntentExtractor call itself — no separate classifier LLM round trip.
+from classifier import build_out_of_scope_suggestion
 
 from config import settings as _settings
 from core.exceptions import (
@@ -135,12 +136,16 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "Please provide the 2-sentence conversational summary of these results."
         )
 
-        # Prefer Gemini, fallback to Groq
+        # Prefer Gemini, fallback to Groq.
+        # Time-boxed: the narrative runs AFTER results are ready and only decorates
+        # them — it must never hold the response hostage (SDK default is 600 s).
         if getattr(settings, "google_api_key", ""):
-            client = _OpenAI(api_key=settings.google_api_key, base_url=settings.google_base_url)
+            client = _OpenAI(api_key=settings.google_api_key, base_url=settings.google_base_url,
+                             timeout=8.0, max_retries=0)
             model  = settings.google_model
         else:
-            client = _OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url)
+            client = _OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url,
+                             timeout=8.0, max_retries=0)
             model  = settings.openai_model
 
         response = client.chat.completions.create(
@@ -177,10 +182,12 @@ def _generate_schema_response(query: str, registry, settings) -> str:
     try:
         from openai import OpenAI as _OpenAI
         if getattr(settings, "google_api_key", ""):
-            client = _OpenAI(api_key=settings.google_api_key, base_url=settings.google_base_url)
+            client = _OpenAI(api_key=settings.google_api_key, base_url=settings.google_base_url,
+                             timeout=8.0, max_retries=0)
             model  = settings.google_model
         else:
-            client = _OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url)
+            client = _OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url,
+                             timeout=8.0, max_retries=0)
             model  = settings.openai_model
 
         response = client.chat.completions.create(
@@ -265,70 +272,8 @@ async def submit_query(
     registry         = request.app.state.metric_registry
     metric_embedder  = getattr(request.app.state, "metric_embedder", None)
     query_cache      = getattr(request.app.state, "query_cache", None)
-    classifier       = getattr(request.app.state, "intent_classifier", None)
 
-    # ── Stage 0: Two-stage intent classification ─────────────────────────────
-    classification = None
-    if classifier is not None:
-        try:
-            classification = await classifier.classify(body.query)
-            logger.info(
-                "[%s] Classification: %s (confidence=%.2f reason=%s)",
-                request_id,
-                classification["query_type"].value,
-                classification["confidence"],
-                classification["reason"],
-            )
-        except Exception as exc:
-            logger.warning("[%s] Classifier failed (%s) — defaulting to METRIC_QUERY.", request_id, exc)
-
-    if classification is not None:
-        qtype = classification["query_type"]   # QueryType imported at module level
-
-        # ── SCHEMA_QUESTION branch ──────────────────────────────────────────
-        if qtype == QueryType.SCHEMA_QUESTION:
-            message = _generate_schema_response(body.query, registry, _settings)
-            elapsed = (time.perf_counter() - start_time) * 1000
-            logger.info("[%s] Schema response returned in %.1f ms.", request_id, elapsed)
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "schema_response",
-                    "message": message,
-                    "sql": None,
-                    "results": None,
-                    "cache_hit": False,
-                    "request_id": request_id,
-                },
-            )
-
-        # ── OUT_OF_SCOPE branch ─────────────────────────────────────────────
-        if qtype == QueryType.OUT_OF_SCOPE:
-            all_metric_names = [m.name for m in registry.list_metrics()]
-            suggested_query = build_out_of_scope_suggestion(body.query, all_metric_names)
-            message = (
-                "That's a great question, but it requires reasoning about causes and context "
-                "that goes beyond what I can answer by querying data directly.\n\n"
-                "What I can tell you is the data behind it — for example:\n"
-                f'"{suggested_query}"\n\n'
-                "Would you like me to run that instead?"
-            )
-            elapsed = (time.perf_counter() - start_time) * 1000
-            logger.info("[%s] Out-of-scope response returned in %.1f ms.", request_id, elapsed)
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "out_of_scope",
-                    "message": message,
-                    "suggested_query": suggested_query,
-                    "sql": None,
-                    "results": None,
-                    "cache_hit": False,
-                    "request_id": request_id,
-                },
-            )
-
-    # ── Stage 1: Intent extraction ────────────────────────────────────────────
+    # ── Stage 1: Intent extraction (includes query_type routing) ─────────────
     try:
         available_metrics    = [m.name for m in registry.list_metrics()]
         available_dims       = registry.get_all_dimension_map()
@@ -350,6 +295,50 @@ async def submit_query(
                 "error": "intent_extraction_failed",
                 "message": str(exc.message),
                 "detail": exc.raw_response[:300] if exc.raw_response else None,
+            },
+        )
+
+    logger.info("[%s] Query type: %s", request_id, intent.query_type)
+
+    # ── Stage 1.25: Route on query_type (extracted in the same LLM call) ──────
+    if intent.query_type == "schema_question":
+        message = _generate_schema_response(body.query, registry, _settings)
+        elapsed = (time.perf_counter() - start_time) * 1000
+        logger.info("[%s] Schema response returned in %.1f ms.", request_id, elapsed)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "schema_response",
+                "message": message,
+                "sql": None,
+                "results": None,
+                "cache_hit": False,
+                "request_id": request_id,
+            },
+        )
+
+    if intent.query_type == "out_of_scope":
+        all_metric_names = [m.name for m in registry.list_metrics()]
+        suggested_query = build_out_of_scope_suggestion(body.query, all_metric_names)
+        message = (
+            "That's a great question, but it requires reasoning about causes and context "
+            "that goes beyond what I can answer by querying data directly.\n\n"
+            "What I can tell you is the data behind it — for example:\n"
+            f'"{suggested_query}"\n\n'
+            "Would you like me to run that instead?"
+        )
+        elapsed = (time.perf_counter() - start_time) * 1000
+        logger.info("[%s] Out-of-scope response returned in %.1f ms.", request_id, elapsed)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "out_of_scope",
+                "message": message,
+                "suggested_query": suggested_query,
+                "sql": None,
+                "results": None,
+                "cache_hit": False,
+                "request_id": request_id,
             },
         )
 

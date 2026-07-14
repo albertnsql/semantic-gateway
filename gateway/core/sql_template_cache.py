@@ -225,7 +225,13 @@ class SQLTemplateCache:
     semantic model changes only happen on dbt deploys, which restart the gateway.
     """
 
-    def __init__(self, ttl_seconds: int = 86400, maxsize: int = 200, disk_path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        ttl_seconds: int = 86400,
+        maxsize: int = 200,
+        disk_path: Optional[str] = None,
+        refresh_on_load: bool = False,
+    ) -> None:
         """
         Args:
             ttl_seconds: How long a compiled template stays valid.  Default 24 h.
@@ -233,11 +239,18 @@ class SQLTemplateCache:
             disk_path:   Optional filepath to persist compiled SQL templates across restarts.
                          When set, templates are loaded on startup and saved after every write,
                          so the 32s MetricFlow subprocess is not re-paid after a gateway restart.
+            refresh_on_load: When True, expired entries found on disk are re-stamped with a
+                         fresh TTL at load time.  Use this when the disk file is a build
+                         artifact shipped with each deploy (e.g. pre-compiled templates
+                         committed to the repo): templates only go stale when the dbt
+                         semantic model changes, and that always arrives via a new deploy
+                         that replaces the file — wall-clock age is irrelevant.
         """
         self._store: OrderedDict = OrderedDict()
         self._ttl = ttl_seconds
         self._maxsize = maxsize
         self._disk_path = disk_path
+        self._refresh_on_load = refresh_on_load
         self._load()
 
     # ──────────────────────────────────────────────── disk persistence
@@ -249,12 +262,17 @@ class SQLTemplateCache:
         try:
             with open(self._disk_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            now = time.time()
+            refreshed = 0
             for k, v in data.items():
+                if self._refresh_on_load and v.get("expires_at", 0) <= now:
+                    v["expires_at"] = now + self._ttl
+                    refreshed += 1
                 self._store[k] = v
-            active = sum(1 for e in self._store.values() if e["expires_at"] > time.time())
+            active = sum(1 for e in self._store.values() if e["expires_at"] > now)
             logger.info(
-                "SQLTemplateCache: loaded %d entries from disk (%d still valid) at '%s'.",
-                len(self._store), active, self._disk_path,
+                "SQLTemplateCache: loaded %d entries from disk (%d valid, %d TTL-refreshed) at '%s'.",
+                len(self._store), active, refreshed, self._disk_path,
             )
         except Exception as exc:
             logger.warning("SQLTemplateCache: failed to load disk cache from '%s': %s", self._disk_path, exc)

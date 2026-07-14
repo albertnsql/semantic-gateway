@@ -31,7 +31,6 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from config import settings
 from cache import QueryCache
-from classifier import IntentClassifier
 from core.intent_extractor import IntentExtractor
 from core.lineage_resolver import LineageResolver
 from core.manifest_parser import ManifestParser
@@ -118,10 +117,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     sql_generator = SQLGenerator(settings=settings, pool=snowflake_pool if snowflake_ok else None)
 
     # ── 4.5. SQL Template Cache (skips MetricFlow subprocess on repeat metric/dim combos) ──
+    # refresh_on_load=True: the disk file is a build artifact (pre-compiled via
+    # precompile_templates.py and committed to the repo). Templates only go stale
+    # when the dbt semantic model changes, which always ships as a new deploy that
+    # replaces the file — so entries are re-stamped with a fresh TTL at startup.
     sql_template_cache = SQLTemplateCache(
         ttl_seconds=settings.sql_template_cache_ttl_seconds,
         maxsize=settings.sql_template_cache_maxsize,
         disk_path="./.sql_template_cache.json",
+        refresh_on_load=True,
     )
     sql_generator._template_cache = sql_template_cache  # inject after construction
     logger.info(
@@ -188,23 +192,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         settings.query_cache_maxsize,
     )
 
-    # ── 7. Intent classifier (two-stage routing) ───────────────────────────
-    try:
-        # Reuse the primary client already created by IntentExtractor
-        _classifier_client = intent_extractor._primary_client or intent_extractor._fallback_client
-        _classifier_model  = (
-            settings.google_model if intent_extractor._primary_client
-            else settings.openai_model
-        )
-        intent_classifier = IntentClassifier(
-            llm_client=_classifier_client,
-            model=_classifier_model,
-        )
-        app.state.intent_classifier = intent_classifier
-        logger.info("✓ IntentClassifier ready (model: %s).", _classifier_model)
-    except Exception as exc:
-        logger.warning("✗ IntentClassifier init failed (%s) — all queries will be treated as METRIC_QUERY.", exc)
-        app.state.intent_classifier = None
+    # ── 7. (removed) Intent classifier ──────────────────────────────────────
+    # Routing (metric_query / schema_question / out_of_scope) is now decided
+    # inside the IntentExtractor's single LLM call — one round trip instead of
+    # two on every query. classifier.py remains only for shared helpers.
 
     # ── 8. Cache Warmer ────────────────────────────────────────────────
     if os.getenv("DISABLE_CACHE_WARMER", "false").lower() != "true":

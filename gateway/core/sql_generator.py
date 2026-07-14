@@ -615,7 +615,10 @@ class SQLGenerator:
                                 raw_list = [raw_list]  # treat whole string as one value
                     vals = raw_list if isinstance(raw_list, list) else [raw_list]
                     val_str = ", ".join(f"'{v}'" for v in vals)
-                    where_parts.append(f"Dimension('{col}') IN ({val_str})")
+                    # MetricFlow --where requires Jinja templating: without {{ }} the
+                    # expression is passed verbatim into the compiled SQL, and Snowflake
+                    # fails with "Unknown function DIMENSION".
+                    where_parts.append(f"{{{{ Dimension('{col}') }}}} IN ({val_str})")
                 else:
                     op = _OP_MAP.get(f.operator, "=")
                     raw_val = str(f.value)
@@ -624,7 +627,7 @@ class SQLGenerator:
                         val_str = raw_val
                     except ValueError:
                         val_str = f"'{raw_val}'"
-                    where_parts.append(f"Dimension('{col}') {op} {val_str}")
+                    where_parts.append(f"{{{{ Dimension('{col}') }}}} {op} {val_str}")
             if where_parts:
                 where_clause = " AND ".join(where_parts)
                 parts.append(f'--where "{where_clause}"')
@@ -759,23 +762,31 @@ class SQLGenerator:
         # We reuse the same OpenAI-compatible pattern used by IntentExtractor.
         try:
             s = self._settings
-            # Match the IntentExtractor fallback order: Gemini -> Groq -> OpenRouter
+            # Match the IntentExtractor fallback order: Gemini -> Groq -> OpenRouter.
+            # Fail-fast: the reviewer fails open, so a degraded provider must not
+            # stall the request on the SDK's default 600 s timeout.
             if getattr(s, "google_api_key", ""):
                 review_client = OpenAI(
                     api_key=s.google_api_key,
                     base_url=s.google_base_url,
+                    timeout=15.0,
+                    max_retries=0,
                 )
                 review_model = s.google_model
             elif getattr(s, "openai_api_key", ""):
                 review_client = OpenAI(
                     api_key=s.openai_api_key,
                     base_url=s.llm_base_url,
+                    timeout=15.0,
+                    max_retries=0,
                 )
                 review_model = s.openai_model
             elif getattr(s, "openrouter_api_key", ""):
                 review_client = OpenAI(
                     api_key=s.openrouter_api_key,
                     base_url=s.openrouter_base_url,
+                    timeout=15.0,
+                    max_retries=0,
                 )
                 review_model = s.openrouter_model
             else:

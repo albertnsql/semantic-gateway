@@ -84,6 +84,9 @@ class QueryIntent(BaseModel):
     raw_llm_response: str = ""
     needs_clarification: bool = False
     clarification_reason: str | None = None
+    # Routing decision made in the same LLM call as extraction (replaces the
+    # separate IntentClassifier round trip): metric_query | schema_question | out_of_scope
+    query_type: str = "metric_query"
 
 
 # ──────────────────────────────────────────────── Intent extractor
@@ -108,12 +111,21 @@ class IntentExtractor:
         Args:
             settings: Gateway settings object.
         """
+        # Fail-fast client config: without these, the openai SDK defaults to a
+        # 600 s timeout and 2 internal retries with backoff — a rate-limited
+        # primary blocks for minutes before the fallback chain ever runs.
+        # The chain itself IS the retry policy, so each attempt gets one shot.
+        _LLM_TIMEOUT_S = 15.0
+        _LLM_MAX_RETRIES = 0
+
         # Primary Client (Google Gemini)
         self._primary_model = settings.google_model
         if settings.google_api_key:
             self._primary_client = OpenAI(
                 api_key=settings.google_api_key,
                 base_url=settings.google_base_url,
+                timeout=_LLM_TIMEOUT_S,
+                max_retries=_LLM_MAX_RETRIES,
             )
         else:
             self._primary_client = None
@@ -123,6 +135,8 @@ class IntentExtractor:
         self._fallback_client = OpenAI(
             api_key=settings.openai_api_key,
             base_url=settings.llm_base_url,
+            timeout=_LLM_TIMEOUT_S,
+            max_retries=_LLM_MAX_RETRIES,
         )
 
         # Tertiary Client (OpenRouter)
@@ -131,6 +145,8 @@ class IntentExtractor:
             self._tertiary_client = OpenAI(
                 api_key=settings.openrouter_api_key,
                 base_url=settings.openrouter_base_url,
+                timeout=_LLM_TIMEOUT_S,
+                max_retries=_LLM_MAX_RETRIES,
             )
         else:
             self._tertiary_client = None
@@ -248,6 +264,14 @@ class IntentExtractor:
                 f"LLM returned non-JSON response: {exc}",
                 raw_response=raw_content,
             ) from exc
+
+        # Normalise query_type — routing decision extracted in the same call.
+        # Anything unrecognised falls back to metric_query (fail-open: the
+        # semantic validator still guards the pipeline downstream).
+        _qt = str(parsed.get("query_type") or "metric_query").strip().lower()
+        if _qt not in ("metric_query", "schema_question", "out_of_scope"):
+            _qt = "metric_query"
+        parsed["query_type"] = _qt
 
         # Resolve relative time ranges to absolute dates
         parsed = self._resolve_time_range(parsed, today_str)
@@ -368,6 +392,7 @@ class IntentExtractor:
 
         schema = """
 {
+  "query_type": "<metric_query|schema_question|out_of_scope>",
   "metrics": ["<metric_name>"],
   "dimensions": ["<dimension_name>"],
   "filters": [
@@ -439,16 +464,31 @@ class IntentExtractor:
 5. If the user changes a filter, the dashboard context will be re-injected — always use the most recent context provided.
 """
 
-        return f"""You are an analytics query intent extractor for a streaming analytics platform.
+        return f"""You are an analytics query router and intent extractor for a streaming analytics platform.
 
-Your job is to extract structured query intent from natural language analytics questions.
+Your job is to FIRST classify the question, THEN (for metric queries) extract structured query intent.
 
-## CRITICAL RULES — NEVER VIOLATE:
+## STEP 1 — CLASSIFY (set "query_type"):
+- "metric_query": The question asks for specific data, numbers, or metrics that can be
+  answered by querying a data warehouse. Examples: "Show me MRR by segment",
+  "What was churn last month?", "Compare revenue across regions".
+- "schema_question": The question asks about what data or metrics exist, what dimensions
+  are available, or how the system works. Examples: "What metrics do you have?",
+  "What dimensions can I filter by?", "What does MRR mean in this system?"
+- "out_of_scope": The question asks for reasoning, causation, predictions, or anything
+  that cannot be answered by a SQL query. Examples: "Why did MRR drop?",
+  "What should I focus on?", "Predict next quarter's revenue".
+
+For "schema_question" and "out_of_scope", set metrics to [] and stop — do not extract
+dimensions, filters, or time ranges. Dashboard-context answers (see rules below, if
+present) are always "metric_query".
+
+## STEP 2 — EXTRACT (only for "metric_query"). CRITICAL RULES — NEVER VIOLATE:
 1. You MUST respond ONLY with valid JSON. No markdown, no explanation, no code blocks.
 2. You MUST ONLY use metrics from the CERTIFIED METRICS LIST below. Never invent new metric names.
 3. You MUST ONLY use dimensions from the CERTIFIED DIMENSIONS MAP below. Never invent new dimension names.
 4. SYNONYM MAPPING: If the user asks for a metric (e.g., "video completion rate", "revenue") or dimension (e.g., "continent", "region") that is not in the certified lists, you MUST map it to the closest semantic equivalent from the certified lists (e.g., "engagement_rate", "mrr", "country"). Do NOT ask for clarification if a reasonable mapping exists.
-5. If no certified metric matches the question AT ALL (e.g., "customer satisfaction score", "performance"), use an empty list for metrics and set needs_clarification to true.
+5. If the question IS a data question but no certified metric matches it AT ALL (e.g., "customer satisfaction score"), keep query_type "metric_query", use an empty list for metrics, and set needs_clarification to true.
 6. Only use metrics from the provided list. Do not invent metric names not in this list.
 
 ## TIME GRANULARITIES CONSTRAINTS
@@ -487,15 +527,23 @@ Never put a duration (e.g. "6 months") in aggregation_level.
 
 User: "What is the MRR by plan type for the last 3 months?"
 Output:
-{{"metrics": ["mrr"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2024-02-27", "end_date": "2024-05-27", "relative": "last_3_months"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["mrr"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2024-02-27", "end_date": "2024-05-27", "relative": "last_3_months"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Show me churn rate by country this year"
 Output:
-{{"metrics": ["churn_rate"], "dimensions": ["country"], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-05-27", "relative": "this_year"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["country"], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-05-27", "relative": "this_year"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "What is the LTV by acquisition channel?"
 Output:
-{{"metrics": ["ltv"], "dimensions": ["acquisition_channel"], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["ltv"], "dimensions": ["acquisition_channel"], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "What metrics can I ask about?"
+Output:
+{{"query_type": "schema_question", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "Why did churn increase last quarter?"
+Output:
+{{"query_type": "out_of_scope", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 """
 
     def _resolve_time_range(self, parsed: dict, today_str: str) -> dict:

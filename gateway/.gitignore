@@ -1,3 +1,6 @@
 # Runtime cache files — generated at startup, not source code
-.sql_template_cache.json
+# NOTE: .sql_template_cache.json is intentionally NOT ignored. It is a build
+# artifact: pre-compiled MetricFlow SQL templates (see precompile_templates.py)
+# committed to the repo so production never runs the 30-45s MetricFlow
+# subprocess. Regenerate and re-commit it after any dbt semantic model change.
 .query_cache.json
