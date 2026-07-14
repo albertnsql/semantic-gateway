@@ -182,166 +182,258 @@ def algo_for_date(d: date) -> str:
     return "v3"
 
 
-# ── Stateful table re-generators (identical seeds = identical IDs) ─────────────
-def _rebuild_stateful(sim_start: date, sim_end: date):
+# ── Existing-data loaders (READ real IDs from Snowflake — no regeneration) ─────
+#
+# WHY THIS REPLACED _rebuild_stateful / _rebuild_content:
+#   The previous version regenerated all subscribers and content with fixed seeds
+#   (Faker.seed / random.seed / np.random.seed), assuming that reproduced the
+#   original UUIDs. It does not: uuid.uuid4() draws from os.urandom and ignores
+#   random.seed(), so every run minted BRAND-NEW ids. The appended month's events
+#   then referenced subscriber/content ids that exist nowhere in the dimensions
+#   (0% content-join, ~2% subscriber-join), which is what broke every dimensional
+#   breakdown for that month.
+#
+#   The correct incremental pattern: READ the existing ids from RAW and reference
+#   them, only minting new ids for genuinely net-new signups (which we also INSERT,
+#   so their foreign keys resolve).
+
+NEW_SUBS_PER_MONTH = 500       # net-new signups to create for the month
+MONTHLY_CHURN_RATE = 0.03      # fraction of the active base that churns during the month
+
+
+def _get_sf_connection():
+    """Open a Snowflake connection scoped to the RAW schema."""
+    import snowflake.connector
+    conn = snowflake.connector.connect(
+        user=SF_USER, password=SF_PASSWORD, account=SF_ACCOUNT, role=SF_ROLE,
+    )
+    cur = conn.cursor()
+    cur.execute(f"USE DATABASE {SF_DATABASE};")
+    cur.execute(f"USE SCHEMA {SF_SCHEMA};")
+    cur.execute(f"USE WAREHOUSE {SF_WAREHOUSE};")
+    cur.close()
+    return conn
+
+
+def _iso(v):
+    """Normalise a Snowflake date/datetime/None to an ISO string (or None)."""
+    if v is None or v == "":
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def _load_existing_subscribers(conn) -> dict:
+    """Return {subscriber_id: attributes} for every existing subscriber in RAW."""
+    cols = ["subscriber_id", "email", "country", "signup_date", "acquisition_channel",
+            "plan_type", "plan_price_usd", "subscription_status", "trial_start_date",
+            "trial_end_date", "churn_date", "churn_reason", "age_group", "device_preference"]
+    cur = conn.cursor()
+    cur.execute(f"SELECT {', '.join(cols)} FROM SUBSCRIBERS")
+    sub_info = {}
+    for row in cur.fetchall():
+        r = dict(zip(cols, row))
+        for dc in ("signup_date", "trial_start_date", "trial_end_date", "churn_date"):
+            r[dc] = _iso(r[dc])
+        r["plan_price_usd"] = float(r["plan_price_usd"]) if r["plan_price_usd"] is not None else 0.0
+        sub_info[r["subscriber_id"]] = r
+    cur.close()
+    print(f"    loaded {len(sub_info):,} existing subscribers")
+    return sub_info
+
+
+def _load_existing_subscriptions(conn):
+    """Return (subscription_rows, subscription_map) for existing subscriptions in RAW."""
+    cols = ["subscription_id", "subscriber_id", "plan_type", "plan_price_usd", "billing_cycle",
+            "status", "start_date", "end_date", "mrr_usd", "is_trial", "payment_method",
+            "cancellation_reason"]
+    cur = conn.cursor()
+    cur.execute(f"SELECT {', '.join(cols)} FROM SUBSCRIPTIONS")
+    subscription_rows = []
+    subscription_map  = defaultdict(list)
+    for row in cur.fetchall():
+        r = dict(zip(cols, row))
+        r["start_date"]     = _iso(r["start_date"])
+        r["end_date"]       = _iso(r["end_date"])
+        r["plan_price_usd"] = float(r["plan_price_usd"]) if r["plan_price_usd"] is not None else 0.0
+        r["mrr_usd"]        = float(r["mrr_usd"]) if r["mrr_usd"] is not None else 0.0
+        r["is_trial"]       = bool(r["is_trial"])
+        subscription_rows.append(r)
+        subscription_map[r["subscriber_id"]].append(r)
+    cur.close()
+    print(f"    loaded {len(subscription_rows):,} existing subscriptions")
+    return subscription_rows, subscription_map
+
+
+def _load_existing_content(conn):
+    """Return (content_ids, content_weights, content_runtime) from RAW.CONTENT_CATALOG."""
+    cur = conn.cursor()
+    cur.execute("SELECT content_id, avg_runtime_minutes FROM CONTENT_CATALOG")
+    content_ids     = []
+    content_runtime = {}
+    for cid, runtime in cur.fetchall():
+        content_ids.append(cid)
+        content_runtime[cid] = int(runtime) if runtime is not None else 60
+    cur.close()
+    # Per-item popularity isn't stored in the catalog; approximate the original
+    # power-law skew so session/rec content selection stays realistically long-tailed.
+    content_weights = [float(np.random.power(0.3)) for _ in content_ids]
+    print(f"    loaded {len(content_ids):,} existing content items")
+    return content_ids, content_weights, content_runtime
+
+
+def _load_monthly_session_counts(conn, month_start: date) -> list[tuple[str, int]]:
+    """Trailing monthly session counts from RAW (months strictly before month_start)."""
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT TO_CHAR(DATE_TRUNC('month', session_start::timestamp), 'YYYY-MM') AS mo,
+               COUNT(*)
+        FROM STREAM_SESSIONS
+        WHERE session_start::timestamp < '{month_start.isoformat()}'
+        GROUP BY 1 ORDER BY 1
+    """)
+    rows = [(m, int(c)) for m, c in cur.fetchall() if m is not None]
+    cur.close()
+    return rows[-6:]   # last 6 months is enough to estimate the trend
+
+
+def _session_volume_target(history: list[tuple[str, int]]) -> int | None:
     """
-    Re-generate subscribers, subscriptions, and subscription_plan_history
-    with fixed seeds. Returns (sub_info, subscription_rows, subscription_map).
-    These must exactly reproduce the original run so FK references stay valid.
+    Realistic session count for the new month: previous month grown by the
+    trailing average month-over-month rate (clamped to 0–10% so one noisy
+    month can't produce an absurd target). Returns None when there is no
+    history to calibrate against (caller falls back to uncalibrated rates).
+
+    WHY: the raw per-subscriber engagement rates in this script imply ~16
+    sessions/sub/month, which is ~2x what the base generator's tenure-spread
+    logic actually produced historically. Uncalibrated, an appended month
+    lands at ~2x the previous month — an obvious synthetic-data artifact on
+    the sessions trend chart.
+    """
+    if not history:
+        return None
+    counts = [c for _, c in history]
+    prev = counts[-1]
+    if len(counts) >= 2:
+        growths = [counts[i] / counts[i - 1] - 1 for i in range(1, len(counts)) if counts[i - 1] > 0]
+        g = sum(growths) / len(growths) if growths else 0.05
+    else:
+        g = 0.05
+    g = min(max(g, 0.0), 0.10)
+    return int(prev * (1 + g))
+
+
+def _generate_new_subscribers(month_start: date, month_end: date):
+    """
+    Create NET-NEW signups for the month (fresh uuids). These are genuinely new
+    rows, INSERTed downstream, so their foreign keys are valid. Returns
+    (new_subscriber_rows, new_subscription_rows).
     """
     age_groups  = ["18-24", "25-34", "35-44", "45-54", "55+"]
     age_weights = [0.18, 0.32, 0.25, 0.15, 0.10]
 
-    subscriber_rows = []
-    subscriber_ids  = []
+    new_subs          = []
+    new_subscriptions = []
 
-    for _ in range(15_000):
+    for _ in range(NEW_SUBS_PER_MONTH):
         sid         = uid()
-        signup      = cohort_signup_date(sim_start, sim_end)
-        country     = weighted_choice(COUNTRIES)
+        signup      = rand_date(month_start, month_end)
         plan        = random.choices(PLAN_NAMES, weights=PLAN_WEIGHTS, k=1)[0]
         is_trial    = random.random() < 0.22
         trial_start = signup if is_trial else None
         trial_end   = (signup + timedelta(days=30)) if is_trial else None
 
-        base_churn_prob = {"basic": 0.28, "standard": 0.20, "premium": 0.14}[plan]
-        days_active     = (sim_end - signup).days
-        churn_prob      = base_churn_prob * (1.2 if days_active < 90 else 1.0)
-        churned         = random.random() < (churn_prob * days_active / 365)
-        churn_date      = None
-        churn_reason    = None
-        status          = "active"
-
-        if churned:
-            min_tenure = 30
-            max_churn  = (sim_end - signup).days
-            if max_churn > min_tenure:
-                churn_offset = int(np.random.exponential(scale=max_churn * 0.4))
-                churn_offset = max(min_tenure, min(churn_offset, max_churn))
-                churn_date   = (signup + timedelta(days=churn_offset)).isoformat()
-                churn_reason = random.choices(
-                    CHURN_REASONS,
-                    weights=[0.28, 0.22, 0.18, 0.15, 0.10, 0.07], k=1)[0]
-                status = "churned"
-
-        if not churned and random.random() < 0.04:
-            status = "paused"
-
-        subscriber_rows.append({
+        new_subs.append({
             "subscriber_id":       sid,
             "email":               fake.unique.email(),
-            "country":             country,
+            "country":             weighted_choice(COUNTRIES),
             "signup_date":         signup.isoformat(),
             "acquisition_channel": weighted_choice(ACQ_CHANNELS),
             "plan_type":           plan,
             "plan_price_usd":      PLAN_PRICES[plan],
-            "subscription_status": status,
+            "subscription_status": "active",
             "trial_start_date":    trial_start.isoformat() if trial_start else None,
             "trial_end_date":      trial_end.isoformat()   if trial_end   else None,
-            "churn_date":          churn_date,
-            "churn_reason":        churn_reason,
+            "churn_date":          None,
+            "churn_reason":        None,
             "age_group":           random.choices(age_groups, weights=age_weights, k=1)[0],
-            "device_preference":   random.choices(
-                                       DEVICES,
-                                       weights=[0.40, 0.35, 0.15, 0.10], k=1)[0],
+            "device_preference":   random.choices(DEVICES, weights=[0.40, 0.35, 0.15, 0.10], k=1)[0],
         })
-        subscriber_ids.append(sid)
-
-    sub_info = {row["subscriber_id"]: row for row in subscriber_rows}
-
-    # Subscriptions
-    subscription_rows = []
-    subscription_map  = {}
-
-    for sid, info in sub_info.items():
-        signup     = date.fromisoformat(info["signup_date"])
-        plan       = info["plan_type"]
-        status     = info["subscription_status"]
-        churn_date = date.fromisoformat(info["churn_date"]) if info["churn_date"] else None
-        is_trial   = info["trial_start_date"] is not None
 
         if is_trial:
-            trial_end_ = date.fromisoformat(info["trial_end_date"])
-            sub_id     = uid()
-            subscription_rows.append({
-                "subscription_id":     sub_id,
+            new_subscriptions.append({
+                "subscription_id":     uid(),
                 "subscriber_id":       sid,
                 "plan_type":           plan,
                 "plan_price_usd":      0.00,
                 "billing_cycle":       "monthly",
                 "status":              "cancelled",
                 "start_date":          signup.isoformat(),
-                "end_date":            trial_end_.isoformat(),
+                "end_date":            trial_end.isoformat(),
                 "mrr_usd":             0.00,
                 "is_trial":            True,
                 "payment_method":      random.choice(PAYMENT_METHODS),
                 "cancellation_reason": None,
             })
-            start = trial_end_
+            start = trial_end
         else:
             start = signup
 
         billing_cycle = random.choices(["monthly", "annual"], weights=[0.72, 0.28], k=1)[0]
         price = PLAN_PRICES[plan]
         mrr   = price if billing_cycle == "monthly" else round(price * 12 * 0.85 / 12, 2)
-        end_date = churn_date if churn_date else None
-        sub_id   = uid()
-
-        sub_record = {
-            "subscription_id":     sub_id,
+        new_subscriptions.append({
+            "subscription_id":     uid(),
             "subscriber_id":       sid,
             "plan_type":           plan,
             "plan_price_usd":      price if billing_cycle == "monthly" else round(price * 12 * 0.85, 2),
             "billing_cycle":       billing_cycle,
-            "status":              "cancelled" if churn_date else status,
+            "status":              "active",
             "start_date":          start.isoformat(),
-            "end_date":            end_date.isoformat() if end_date else None,
+            "end_date":            None,
             "mrr_usd":             mrr,
             "is_trial":            False,
             "payment_method":      random.choice(PAYMENT_METHODS),
-            "cancellation_reason": info["churn_reason"] if churn_date else None,
-        }
-        subscription_rows.append(sub_record)
-        subscription_map.setdefault(sid, []).append(sub_record)
-
-    return sub_info, subscription_rows, subscription_map
-
-
-def _rebuild_content(sim_start: date, sim_end: date):
-    """Re-generate content catalog with the same seed so content_ids are stable."""
-    content_rows = []
-    content_ids  = []
-    for _ in range(2500):
-        cid   = uid()
-        ctype = weighted_choice(CONTENT_TYPES)
-        genre = random.choice(PRIMARY_GENRES)
-        release_year = random.choices(
-            range(1990, 2025),
-            weights=[max(0.1, 1 + 0.15 * (y - 1990)) for y in range(1990, 2025)],
-            k=1
-        )[0]
-        is_original = random.random() < 0.28
-        if ctype == "movie":
-            runtime = random.randint(75, 180)
-        elif ctype == "series":
-            seasons = random.randint(1, 8)
-            runtime = random.randint(22, 65)
-        elif ctype == "documentary":
-            runtime = random.randint(45, 120)
-        else:
-            runtime = random.randint(8, 30)
-        popularity = np.random.power(0.3)
-        content_rows.append({
-            "content_id": cid,
-            "_popularity": popularity,
-            "_runtime":    runtime,
+            "cancellation_reason": None,
         })
-        content_ids.append(cid)
 
-    content_popularity = {r["content_id"]: r["_popularity"] for r in content_rows}
-    content_runtime    = {r["content_id"]: r["_runtime"]    for r in content_rows}
-    content_weights    = [content_popularity[cid] for cid in content_ids]
-    return content_ids, content_weights, content_runtime
+    print(f"    generated {len(new_subs):,} new subscribers for the month")
+    return new_subs, new_subscriptions
+
+
+def _apply_month_churn(sub_info: dict, subscription_map: dict,
+                       month_start: date, month_end: date):
+    """
+    Flip a realistic share of currently-active subscribers to 'churned' within the
+    month. Mutates sub_info in place (so the churn-updates MERGE picks them up) AND
+    updates their subscription rows (end_date/status) so the churn flows into
+    fct_mrr_monthly. Returns the list of updated subscription rows to MERGE.
+    """
+    active = [
+        sid for sid, i in sub_info.items()
+        if i["subscription_status"] == "active" and not i["churn_date"]
+        and i["signup_date"] and date.fromisoformat(i["signup_date"]) < month_start
+    ]
+    n = min(int(len(active) * MONTHLY_CHURN_RATE), len(active))
+    churned_subscription_updates = []
+
+    for sid in random.sample(active, n):
+        cdate  = rand_date(month_start, month_end)
+        reason = random.choices(CHURN_REASONS, weights=[0.28, 0.22, 0.18, 0.15, 0.10, 0.07], k=1)[0]
+        sub_info[sid]["churn_date"]          = cdate.isoformat()
+        sub_info[sid]["subscription_status"] = "churned"
+        sub_info[sid]["churn_reason"]        = reason
+        # End the subscriber's live (non-trial, not-yet-ended) subscription(s).
+        for sub in subscription_map.get(sid, []):
+            if not sub["is_trial"] and sub["end_date"] is None:
+                sub["status"]              = "cancelled"
+                sub["end_date"]            = cdate.isoformat()
+                sub["cancellation_reason"] = reason
+                churned_subscription_updates.append(sub)
+
+    print(f"    churned {n:,} existing subscribers this month")
+    return churned_subscription_updates
 
 
 # ── Core incremental generators ───────────────────────────────────────────────
@@ -351,13 +443,37 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
     Generate all incremental rows for [month_start, month_end].
     Returns a dict of {table_name: DataFrame}.
     """
-    print(f"\nRebuilding stateful IDs (seeds fixed)...")
-    # We need the FULL sim_start -> month_end range so cohort/churn logic is
-    # consistent, but we'll filter events to [month_start, month_end] only.
-    SIM_START = date(2023, 1, 1)
+    print(f"\nLoading existing subscribers / subscriptions / content from Snowflake...")
+    _conn = _get_sf_connection()
+    try:
+        sub_info = _load_existing_subscribers(_conn)
+        subscription_rows, subscription_map = _load_existing_subscriptions(_conn)
+        content_ids, content_weights, content_runtime = _load_existing_content(_conn)
+        session_history = _load_monthly_session_counts(_conn, month_start)
+    finally:
+        _conn.close()
 
-    sub_info, subscription_rows, subscription_map = _rebuild_stateful(SIM_START, month_end)
-    content_ids, content_weights, content_runtime = _rebuild_content(SIM_START, month_end)
+    if not sub_info or not content_ids:
+        raise RuntimeError(
+            "No existing subscribers/content found in RAW. Load the base dataset "
+            "(generate_streaming_data.py) before appending an incremental month."
+        )
+
+    # Net-new signups for the month (fresh ids — INSERTed downstream so FKs resolve).
+    new_subs, new_subscriptions = _generate_new_subscribers(month_start, month_end)
+    for s in new_subs:
+        sub_info[s["subscriber_id"]] = s
+    for s in new_subscriptions:
+        subscription_rows.append(s)
+        subscription_map[s["subscriber_id"]].append(s)
+    new_sub_ids = {s["subscriber_id"] for s in new_subs}
+
+    # New churn events for the month (existing actives → churned within the window).
+    # Mutates sub_info + subscription rows in place; returns the subscription
+    # updates that must be MERGEd so the churn flows into fct_mrr_monthly.
+    churned_subscription_updates = _apply_month_churn(
+        sub_info, subscription_map, month_start, month_end
+    )
 
     results: dict[str, pd.DataFrame] = {}
 
@@ -450,6 +566,9 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
         if info["subscription_status"] in ("active", "paused", "churned")
     ]
 
+    # First pass: eligibility + engagement rates, so total volume can be
+    # calibrated to the warehouse trend BEFORE any sessions are drawn.
+    eligible: list[tuple[str, date, date, str, int]] = []
     for sid in active_subs:
         info       = sub_info[sid]
         signup     = date.fromisoformat(info["signup_date"])
@@ -461,12 +580,27 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
         if sess_start > active_end:
             continue
 
-        tenure_days = max((active_end - signup).days, 1)
         engagement_level = random.choices(
             ["heavy", "medium", "light", "very_light"],
             weights=[0.15, 0.40, 0.30, 0.15], k=1)[0]
         monthly_rate = {"heavy": 45, "medium": 18, "light": 6, "very_light": 2}[engagement_level]
-        n_sessions   = max(1, int(np.random.poisson(monthly_rate * 1)))  # 1 month worth
+        eligible.append((sid, sess_start, active_end, engagement_level, monthly_rate))
+
+    expected_total = sum(rate for *_, rate in eligible)
+    target_total   = _session_volume_target(session_history)
+    volume_scale   = 1.0
+    if target_total and expected_total > 0:
+        volume_scale = target_total / expected_total
+        print(f"    calibrating session volume to warehouse trend: "
+              f"target {target_total:,} (prev months: "
+              f"{', '.join(f'{m}={c:,}' for m, c in session_history[-3:])}), "
+              f"uncalibrated expectation {expected_total:,}, scale {volume_scale:.2f}")
+    else:
+        print("    [!] no session history found — generating with uncalibrated rates")
+
+    for sid, sess_start, active_end, engagement_level, monthly_rate in eligible:
+        info = sub_info[sid]
+        n_sessions = max(1, int(np.random.poisson(monthly_rate * volume_scale)))
 
         country = info["country"]
         device  = info["device_preference"]
@@ -645,23 +779,20 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
 
     results["user_watchlists"] = pd.DataFrame(watchlist_rows)
 
-    # ── New Subscribers & Subscriptions for this month ────────────────────────
-    # Only upload subscribers who signed up within this month window.
-    # These are brand-new rows — safe to INSERT via COPY INTO.
-    print("  Filtering new subscribers/subscriptions for this month...")
-    new_subscriber_rows = [
-        row for row in list(sub_info.values())
-        if month_start <= date.fromisoformat(row["signup_date"]) <= month_end
-    ]
+    # ── New Subscribers & Subscription changes for this month ─────────────────
+    # New subscriber rows (net-new signups) → INSERT via COPY INTO.
+    # Churned-subscriber subscription updates → MERGE (so churn flows into MRR).
+    print("  Assembling new subscribers / subscription changes for this month...")
+    new_subscriber_rows = [sub_info[sid] for sid in new_sub_ids]
     results["subscribers"] = pd.DataFrame(new_subscriber_rows)
 
-    new_sub_ids = {row["subscriber_id"] for row in new_subscriber_rows}
     new_subscription_rows = [
-        row for row in subscription_rows
-        if row["subscriber_id"] in new_sub_ids
+        row for row in subscription_rows if row["subscriber_id"] in new_sub_ids
     ]
-    results["subscriptions"] = pd.DataFrame(new_subscription_rows)
-    print(f"    → {len(new_subscriber_rows):,} new subscribers, {len(new_subscription_rows):,} new subscriptions")
+    # MERGE payload = new subscriptions (INSERT) + churned existing ones (UPDATE end_date/status).
+    results["subscriptions"] = pd.DataFrame(new_subscription_rows + churned_subscription_updates)
+    print(f"    -> {len(new_subscriber_rows):,} new subscribers, "
+          f"{len(new_subscription_rows):,} new + {len(churned_subscription_updates):,} churned-updated subscriptions")
 
     # ── Churned Subscriber Updates for this month ──────────────────────────────
     # Existing subscribers whose churn_date falls within this month.
@@ -675,7 +806,7 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
         and row["subscriber_id"] not in new_sub_ids  # already covered above
     ]
     results["subscribers_churn_updates"] = pd.DataFrame(churned_update_rows)
-    print(f"    → {len(churned_update_rows):,} subscribers churned this month (will MERGE)")
+    print(f"    -> {len(churned_update_rows):,} subscribers churned this month (will MERGE)")
 
     # ── Subscription Plan History (plan changes this month) ────────────────────
     # ~5% of existing active subscribers change their plan each month.
@@ -713,7 +844,7 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
         })
 
     results["subscription_plan_history"] = pd.DataFrame(plan_change_rows)
-    print(f"    → {len(plan_change_rows):,} plan changes generated")
+    print(f"    -> {len(plan_change_rows):,} plan changes generated")
 
     return results
 
