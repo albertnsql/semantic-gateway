@@ -461,9 +461,15 @@ class SQLGenerator:
                 review_result = self._review_sql(compiled_sql)
                 if not review_result.get("approved", True):
                     revised = review_result.get("revised_sql")
-                    if revised:
+                    if revised and self._validate_revised_sql(revised):
                         logger.warning("SQL reviewer found issues on fallback_sql; using revised SQL. Issues: %s", review_result.get("issues"))
                         compiled_sql = revised
+                    elif revised:
+                        logger.warning(
+                            "SQL reviewer revised SQL REJECTED by safety check — "
+                            "using original fallback SQL. Issues: %s",
+                            review_result.get("issues"),
+                        )
                     else:
                         logger.warning("SQL reviewer found issues on fallback_sql but could not auto-revise. Issues: %s", review_result.get("issues"))
 
@@ -793,6 +799,54 @@ class SQLGenerator:
                 pass
 
     # ────────────────────────────────────────────────────── private
+
+    # Allowed tables that the fallback SQL reviewer may reference.
+    _ALLOWED_TABLES = re.compile(
+        r"\b(STREAMING_ANALYTICS\.(marts|staging|intermediate)\.\w+|fct_\w+|dim_\w+|int_\w+|stg_\w+)\b",
+        re.IGNORECASE,
+    )
+
+    # DDL/DML keywords that must never appear in revised SQL.
+    _FORBIDDEN_SQL = re.compile(
+        r"\b(DROP|DELETE|INSERT|UPDATE|CREATE|ALTER|TRUNCATE|GRANT|REVOKE|MERGE|EXEC|EXECUTE|CALL)\b",
+        re.IGNORECASE,
+    )
+
+    def _validate_revised_sql(self, sql: str) -> bool:
+        """Reject LLM-revised SQL that is not a single read-only SELECT.
+
+        This is a defence-in-depth check on the fallback path (Audit issue #5).
+        If the LLM reviewer's revised SQL looks unsafe we fall back to the
+        original (governed) fallback SQL rather than executing the revision.
+
+        Checks:
+          1. Single statement (no ``;`` separating multiple commands).
+          2. Starts with ``SELECT`` (after stripping comments).
+          3. No DDL/DML keywords (DROP, DELETE, INSERT, etc.).
+
+        Returns:
+            ``True`` if the SQL passes all safety checks.
+        """
+        # Strip SQL comments
+        stripped = re.sub(r'--[^\n]*', '', sql).strip()
+        stripped = re.sub(r'/\*.*?\*/', '', stripped, flags=re.DOTALL).strip()
+
+        # 1. Single statement
+        if ';' in stripped.rstrip(';'):
+            logger.warning("Revised SQL rejected: contains multiple statements.")
+            return False
+
+        # 2. Must start with SELECT
+        if not stripped.upper().startswith('SELECT'):
+            logger.warning("Revised SQL rejected: does not start with SELECT.")
+            return False
+
+        # 3. No forbidden DDL/DML keywords
+        if self._FORBIDDEN_SQL.search(stripped):
+            logger.warning("Revised SQL rejected: contains forbidden DDL/DML keyword.")
+            return False
+
+        return True
 
     def _review_sql(self, sql: str) -> dict:
         """

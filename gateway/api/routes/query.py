@@ -18,6 +18,9 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from functools import partial
+
+import anyio
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -281,10 +284,13 @@ async def submit_query(
             m.name: registry.get_valid_time_grains_for_metric(m.name)
             for m in registry.list_metrics()
         }
-        intent = extractor.extract(
-            body.query, available_metrics, available_dims, available_time_grains,
-            history=body.history, retriever=metric_embedder,
-            dashboard_context=body.dashboard_context,
+        intent = await anyio.to_thread.run_sync(
+            partial(
+                extractor.extract,
+                body.query, available_metrics, available_dims, available_time_grains,
+                history=body.history, retriever=metric_embedder,
+                dashboard_context=body.dashboard_context,
+            )
         )
     except IntentExtractionError as exc:
         logger.error("[%s] Intent extraction failed: %s", request_id, exc)
@@ -302,7 +308,9 @@ async def submit_query(
 
     # ── Stage 1.25: Route on query_type (extracted in the same LLM call) ──────
     if intent.query_type == "schema_question":
-        message = _generate_schema_response(body.query, registry, _settings)
+        message = await anyio.to_thread.run_sync(
+            partial(_generate_schema_response, body.query, registry, _settings)
+        )
         elapsed = (time.perf_counter() - start_time) * 1000
         logger.info("[%s] Schema response returned in %.1f ms.", request_id, elapsed)
         return JSONResponse(
@@ -447,7 +455,7 @@ async def submit_query(
     # ── Stage 4: Dry run — skip execution ─────────────────────────────────────
     if body.options.dry_run:
         try:
-            gen_query = sql_gen.generate(intent, validation)
+            gen_query = await anyio.to_thread.run_sync(partial(sql_gen.generate, intent, validation))
         except SQLGenerationError as exc:
             logger.error("[%s] SQL generation failed: %s", request_id, exc)
             return JSONResponse(
@@ -474,7 +482,7 @@ async def submit_query(
 
     # ── Stage 5: SQL generation ────────────────────────────────────────────────
     try:
-        gen_query = sql_gen.generate(intent, validation)
+        gen_query = await anyio.to_thread.run_sync(partial(sql_gen.generate, intent, validation))
     except SQLGenerationError as exc:
         logger.error("[%s] SQL generation failed: %s", request_id, exc)
         return JSONResponse(
@@ -490,7 +498,7 @@ async def submit_query(
     # ── Stage 6: Snowflake execution ───────────────────────────────────────────
     results: list[dict] = []
     try:
-        all_rows = sql_gen.execute_query(gen_query.compiled_sql)
+        all_rows = await anyio.to_thread.run_sync(partial(sql_gen.execute_query, gen_query.compiled_sql))
         results  = all_rows[: body.options.max_rows]
         logger.info(
             "[%s] Snowflake returned %d rows (capped at %d).",
@@ -533,12 +541,14 @@ async def submit_query(
     payload["cache_hit"] = False
 
     # ── Stage 8b: Conversational narrative summary ─────────────────────────────
-    payload["narrative_summary"] = _generate_narrative(body.query, results, intent, _settings)
+    payload["narrative_summary"] = await anyio.to_thread.run_sync(
+        partial(_generate_narrative, body.query, results, intent, _settings)
+    )
 
     # ── Store in intent-keyed cache ────────────────────────────────────────────
     payload = make_json_safe(payload)
     if query_cache is not None:
-        query_cache.set(intent_dict, payload)
+        await anyio.to_thread.run_sync(partial(query_cache.set, intent_dict, payload))
 
     resp = JSONResponse(status_code=200, content=payload)
     resp.headers["X-Cache"] = "MISS"

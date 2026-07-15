@@ -172,7 +172,6 @@ class MetricRegistry:
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:
                     m_def.certified_dimensions.extend(sub_sem.dimensions + sub_sem.time_dimensions)
-                m_def.certified_dimensions.extend(["content_type", "primary_genre", "is_original"])
                 
             # Deduplicate while preserving order
             seen = set()
