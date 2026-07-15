@@ -252,16 +252,49 @@ app = FastAPI(
 
 # ──────────────────────────────────────────────── Middleware
 
-# CORS — wildcard in development (no credentials needed), restrict in production.
+# CORS — configurable origins (restrict to frontend URL in production).
+# Set CORS_ALLOWED_ORIGINS=https://your-frontend.onrender.com in production.
 # NOTE: allow_credentials must be False when allow_origins=["*"]; that combination
 # is explicitly rejected by browsers per the CORS spec.
+_cors_origins = [o.strip() for o in settings.cors_allowed_origins.split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── API Key authentication for cost-bearing routes ──────────────────────────
+# When GATEWAY_API_KEY is set, requests to /api/v1/query and /api/v1/dashboard
+# must include a matching X-API-Key header (or ?api_key= query param).
+# When the key is empty (development), all requests pass through.
+import secrets as _secrets
+
+# Route prefixes that require API key authentication.
+_AUTH_REQUIRED_PREFIXES = ("/api/v1/query", "/api/v1/dashboard")
+
+
+@app.middleware("http")
+async def api_key_auth_middleware(request: Request, call_next):
+    """Enforce API key on cost-bearing routes when GATEWAY_API_KEY is configured."""
+    api_key = settings.gateway_api_key
+    if api_key and request.url.path.startswith(_AUTH_REQUIRED_PREFIXES):
+        provided = (
+            request.headers.get("X-API-Key")
+            or request.query_params.get("api_key")
+            or ""
+        )
+        if not provided or not _secrets.compare_digest(provided, api_key):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "message": "Missing or invalid API key. Provide X-API-Key header.",
+                },
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")

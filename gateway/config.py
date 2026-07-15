@@ -144,6 +144,17 @@ class Settings(BaseSettings):
     # Leave empty ("") to allow unauthenticated access in development only.
     admin_secret_key: str = ""
 
+    # API key for cost-bearing routes (/query, /dashboard). When non-empty,
+    # every request to those routes must include an ``X-API-Key`` header (or
+    # ``api_key`` query param) that matches this value.  Leave empty for
+    # unauthenticated development access.
+    gateway_api_key: str = ""
+
+    # Comma-separated list of allowed CORS origins. Defaults to ``*`` for
+    # development; restrict to your frontend URL in production, e.g.
+    # ``https://streaming-analytics.onrender.com``.
+    cors_allowed_origins: str = "*"
+
 
 # Module-level singleton — importable everywhere without re-parsing .env
 settings = Settings()

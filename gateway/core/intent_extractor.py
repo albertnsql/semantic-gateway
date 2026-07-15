@@ -17,7 +17,7 @@ import re
 from datetime import date, timedelta
 
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from core.exceptions import IntentExtractionError
 
@@ -57,6 +57,15 @@ class TimeRange(BaseModel):
     start_date: str  # YYYY-MM-DD
     end_date: str    # YYYY-MM-DD
     relative: str | None = None  # e.g. "last_30_days", "last_3_months"
+
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def _must_be_iso_date(cls, v: str) -> str:
+        """Reject dates that don't match YYYY-MM-DD to prevent injection."""
+        import re as _re
+        if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            raise ValueError(f"Date must be YYYY-MM-DD, got {v!r}")
+        return v
 
 
 class FilterClause(BaseModel):

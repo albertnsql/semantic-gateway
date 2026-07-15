@@ -28,6 +28,40 @@ from typing import TYPE_CHECKING, Any
 
 import snowflake.connector
 from openai import OpenAI
+
+
+# ──────────────────────────────────────────────── Input validation helpers
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Shell metacharacters that could allow command injection.
+_SHELL_META_RE = re.compile(r"[;|&$`(){}\\<>!\"]")  # double-quote included
+
+
+def _validate_date(value: str, label: str = "date") -> str:
+    """Validate that *value* looks like ``YYYY-MM-DD``.
+
+    Raises ``ValueError`` with a descriptive message when the check fails.
+    Returns the original value unchanged when valid.
+    """
+    if not _DATE_RE.fullmatch(value):
+        raise ValueError(
+            f"Invalid {label}: {value!r} — expected YYYY-MM-DD format."
+        )
+    return value
+
+
+def _sanitize_filter_value(value: str) -> str:
+    """Reject filter values that contain shell metacharacters.
+
+    This is a defence-in-depth check — with ``shell=False`` these characters
+    are harmless, but we reject them anyway to surface bad LLM output early.
+    """
+    if _SHELL_META_RE.search(value):
+        raise ValueError(
+            f"Filter value contains disallowed characters: {value!r}"
+        )
+    return value
 from pydantic import BaseModel
 
 from core.exceptions import SnowflakeConnectionError, SQLGenerationError
@@ -389,12 +423,12 @@ class SQLGenerator:
                         used_template_cache = True
 
         # ── MetricFlow subprocess & Speculative LLM Review ───────────
-        mf_command = ""
+        mf_command: list[str] = []
         fallback_sql = self._build_fallback_sql(intent)
         
         if compiled_sql is None:
             mf_command = self.format_mf_query(intent)
-            logger.info("Executing MetricFlow: %s", mf_command)
+            logger.info("Executing MetricFlow: %s", " ".join(mf_command))
 
             try:
                 compiled_sql = self._run_mf_subprocess(mf_command)
@@ -481,7 +515,7 @@ class SQLGenerator:
                     )
 
         # mf_command is only defined when MetricFlow ran; provide an audit label otherwise.
-        _mf_cmd = mf_command if not used_template_cache else (
+        _mf_cmd = " ".join(mf_command) if (mf_command and not used_template_cache) else (
             f"[template_cache] mf query --metrics {','.join(intent.metrics)} "
             f"--group-by {','.join(intent.dimensions)} --explain"
         )
@@ -497,8 +531,12 @@ class SQLGenerator:
             sql_review=review_result,
         )
 
-    def _run_mf_subprocess(self, mf_command: str) -> str:
-        """Run MetricFlow subprocess and return the extracted SQL string."""
+    def _run_mf_subprocess(self, mf_command: list[str]) -> str:
+        """Run MetricFlow subprocess and return the extracted SQL string.
+
+        Uses ``shell=False`` (argv list) to prevent shell injection via
+        LLM-derived dates and filter values.
+        """
         env = os.environ.copy()
         env["DBT_PROJECT_DIR"] = "../dbt_streaming_analytics/streaming_analytics"
         env["DBT_PROFILES_DIR"] = "../dbt_streaming_analytics/streaming_analytics"
@@ -515,15 +553,13 @@ class SQLGenerator:
         env["PYTHONIOENCODING"] = "utf-8"
         env["NO_COLOR"] = "1"
 
-        if sys.platform == "win32":
-            safe_command = f"chcp 65001 >nul && {mf_command}"
-        else:
-            safe_command = mf_command
-        
+        # Human-readable command string for logging / error messages only.
+        mf_command_str = " ".join(mf_command)
+
         try:
             result = subprocess.run(
-                safe_command,
-                shell=True,
+                mf_command,
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -532,18 +568,22 @@ class SQLGenerator:
         except subprocess.TimeoutExpired as exc:
             raise SQLGenerationError(
                 "MetricFlow CLI timed out after 120 seconds.",
-                mf_command=mf_command,
+                mf_command=mf_command_str,
                 stderr="timeout",
             ) from exc
 
         if result.returncode != 0:
             raise Exception(f"MetricFlow CLI returned non-zero exit code {result.returncode}.\nSTDERR: {result.stderr}\nSTDOUT: {result.stdout}")
 
-        return self._extract_sql_from_mf_output(result.stdout, mf_command)
+        return self._extract_sql_from_mf_output(result.stdout, mf_command_str)
 
-    def format_mf_query(self, intent: "QueryIntent") -> str:
+    def format_mf_query(self, intent: "QueryIntent") -> list[str]:
         """
-        Build the complete ``mf query`` CLI string from a QueryIntent.
+        Build the ``mf query`` CLI argv list from a QueryIntent.
+
+        Returns a list of strings suitable for ``subprocess.run(..., shell=False)``.
+        All LLM-derived values (dates, filter values) are validated before
+        inclusion to prevent shell/command injection.
 
         Handles:
         - Multiple metrics (comma-separated)
@@ -556,12 +596,12 @@ class SQLGenerator:
             intent: Query intent with metrics, dimensions, time_range.
 
         Returns:
-            Full shell command string.
+            Argv list — e.g. ``["mf", "query", "--metrics", "mrr", "--explain"]``.
         """
-        parts: list[str] = ["mf query"]
+        parts: list[str] = ["mf", "query"]
 
         if intent.metrics:
-            parts.append(f"--metrics {','.join(intent.metrics)}")
+            parts.extend(["--metrics", ",".join(intent.metrics)])
 
         if intent.dimensions:
             global_dim_map = build_dimension_prefix_map()
@@ -585,11 +625,13 @@ class SQLGenerator:
                 else:
                     logger.warning("Dimension '%s' not found for metric '%s', passing raw to MetricFlow.", dim, primary_metric)
                     mapped_dims.append(dim)
-            parts.append(f"--group-by {','.join(mapped_dims)}")
+            parts.extend(["--group-by", ",".join(mapped_dims)])
 
         if intent.time_range:
-            parts.append(f"--start-time {intent.time_range.start_date}")
-            parts.append(f"--end-time {intent.time_range.end_date}")
+            _validate_date(intent.time_range.start_date, "start_date")
+            _validate_date(intent.time_range.end_date, "end_date")
+            parts.extend(["--start-time", intent.time_range.start_date])
+            parts.extend(["--end-time", intent.time_range.end_date])
 
         if intent.filters:
             import json as _json
@@ -643,6 +685,8 @@ class SQLGenerator:
                             except Exception:
                                 raw_list = [raw_list]  # treat whole string as one value
                     vals = raw_list if isinstance(raw_list, list) else [raw_list]
+                    # Sanitize each filter value (defence-in-depth)
+                    vals = [_sanitize_filter_value(str(v)) for v in vals]
                     val_str = ", ".join(f"'{v}'" for v in vals)
                     # MetricFlow --where requires Jinja templating: without {{ }} the
                     # expression is passed verbatim into the compiled SQL, and Snowflake
@@ -651,6 +695,7 @@ class SQLGenerator:
                 else:
                     op = _OP_MAP.get(f.operator, "=")
                     raw_val = str(f.value)
+                    _sanitize_filter_value(raw_val)  # defence-in-depth
                     try:
                         float(raw_val)
                         val_str = raw_val
@@ -659,16 +704,16 @@ class SQLGenerator:
                     where_parts.append(f"{{{{ Dimension('{col}') }}}} {op} {val_str}")
             if where_parts:
                 where_clause = " AND ".join(where_parts)
-                parts.append(f'--where "{where_clause}"')
+                parts.extend(["--where", where_clause])
                 logger.info("MetricFlow --where clause: %s", where_clause)
 
         if intent.limit:
-            parts.append(f"--limit {intent.limit}")
+            parts.extend(["--limit", str(intent.limit)])
 
         # Always use --explain so we get SQL without running it in the warehouse
         parts.append("--explain")
 
-        return " ".join(parts)
+        return parts
 
     def execute_query(self, compiled_sql: str) -> list[dict[str, Any]]:
         """
@@ -1039,6 +1084,9 @@ class SQLGenerator:
             else:
                 time_col = "payment_date"
 
+            # Validate dates to prevent SQL injection (audit issue #1 / fallback path)
+            _validate_date(intent.time_range.start_date, "start_date")
+            _validate_date(intent.time_range.end_date, "end_date")
             where_clauses.append(
                 f"{time_col} BETWEEN '{intent.time_range.start_date}' "
                 f"AND '{intent.time_range.end_date}'"

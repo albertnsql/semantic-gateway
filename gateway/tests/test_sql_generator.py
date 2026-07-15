@@ -49,7 +49,7 @@ def test_format_mf_query_maps_prefixed_dimension_to_metricflow_name(monkeypatch)
 
     assert (
         generator.format_mf_query(_intent(["subscriber__plan_type"]))
-        == "mf query --metrics total_subscribers --group-by subscriber__plan_type --explain"
+        == ["mf", "query", "--metrics", "total_subscribers", "--group-by", "subscriber__plan_type", "--explain"]
     )
 
 
