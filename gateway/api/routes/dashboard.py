@@ -506,7 +506,7 @@ def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]
 SELECT
     'current' AS period_bucket,
     COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
-    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) * 100.0 AS value
+    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE 1=1
   {year_filter}
@@ -524,7 +524,7 @@ SELECT
         WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
     END AS period_bucket,
     COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
-    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) * 100.0 AS value
+    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE (
     period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
