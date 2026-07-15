@@ -1,7 +1,0 @@
-metrics:
-  - name: total_revenue_usd
-    description: Total revenue from succeeded payments.
-    label: Total Revenue (Payments)
-    type: simple
-    type_params:
-      measure: total_revenue_usd

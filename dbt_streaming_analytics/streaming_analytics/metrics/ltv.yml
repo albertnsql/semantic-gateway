@@ -4,5 +4,5 @@ metrics:
     label: Lifetime Value
     type: ratio
     type_params:
-      numerator: total_revenue_usd
+      numerator: total_revenue
       denominator: total_subscribers

@@ -1,7 +1,7 @@
 metrics:
   - name: total_revenue
-    description: Total revenue (calculated as the sum of MRR) across subscriptions.
+    description: Total revenue (calculated as the sum of successful payment transactions).
     label: Total Revenue
     type: simple
     type_params:
-      measure: mrr_usd
+      measure: total_revenue_usd
