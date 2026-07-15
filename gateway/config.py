@@ -122,7 +122,7 @@ class Settings(BaseSettings):
         "total_subscribers":     ["subscriber__plan_type", "subscriber__country", "subscriber__acquisition_channel"],
         "churned_subscribers":   ["subscriber__plan_type", "subscriber__country"],
         # ── LTV (fct_payments — subscriber join ~86%) ──
-        "ltv":                   ["payment__payment_method", "subscriber__plan_type", "subscriber__country"],
+        "ltv":                   ["subscriber__plan_type", "subscriber__country"],
         # ── Session metrics (fct_stream_sessions — NATIVE session dims only) ──
         "avg_watch_time":        ["session__device_type", "session__quality_streamed", "session__referral_source"],
         "total_sessions":        ["session__device_type", "session__quality_streamed", "session__referral_source"],

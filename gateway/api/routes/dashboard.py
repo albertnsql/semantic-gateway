@@ -190,14 +190,14 @@ def _sql_revenue_kpi(plans: list[str], years: list[int], countries: list[str], m
     Returns 2 rows: period_bucket IN ('current', 'prior_year') with summed value.
     """
     if len(years) > 1:
-        year_filter = _year_clause(years, "period_month")
+        year_filter = _year_clause(years, "payment_date")
         return f"""
 -- Dashboard: revenue_kpi — Total Revenue (flow metric, multi-year sum)
 SELECT
     'current' AS period_bucket,
-    COALESCE(SUM(mrr_usd), 0) AS value
-FROM {_DB}.marts.fct_mrr_monthly
-WHERE is_active = TRUE
+    COALESCE(SUM(amount_usd), 0) AS value
+FROM {_DB}.marts.fct_payments
+WHERE status = 'succeeded'
   {year_filter}
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
@@ -210,15 +210,15 @@ ORDER BY 1
 -- Dashboard: revenue_kpi — Total Revenue (flow metric, period-sum YoY)
 SELECT
     CASE
-        WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
-        WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+        WHEN payment_date BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
+        WHEN payment_date BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
     END AS period_bucket,
-    COALESCE(SUM(mrr_usd), 0) AS value
-FROM {_DB}.marts.fct_mrr_monthly
-WHERE is_active = TRUE
+    COALESCE(SUM(amount_usd), 0) AS value
+FROM {_DB}.marts.fct_payments
+WHERE status = 'succeeded'
   AND (
-    period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
-    OR period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+    payment_date BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
+    OR payment_date BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
   )
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
