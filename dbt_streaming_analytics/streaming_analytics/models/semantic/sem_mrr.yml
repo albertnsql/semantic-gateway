@@ -25,7 +25,7 @@ semantic_models:
     measures:
       - name: mrr_usd
         description: MRR in USD
-        expr: mrr_usd
+        expr: case when is_active then mrr_usd else 0 end
         agg: sum
         agg_time_dimension: period_month
       - name: monthly_churned_subscribers

@@ -1,0 +1,7 @@
+metrics:
+  - name: active_subscribers
+    description: Count of distinct active subscribers in a period.
+    label: Active Subscribers
+    type: simple
+    type_params:
+      measure: monthly_subscriber_base
