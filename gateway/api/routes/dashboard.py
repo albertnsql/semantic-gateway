@@ -236,86 +236,103 @@ def _sql_mrr_kpi(plans: list[str], years: list[int], countries: list[str], max_d
 
 def _sql_subs_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
-    Active Subscribers — STOCK metric (point-in-time snapshot).
-    Comparison: latest available month vs same calendar month, prior year.
+    Active Subscribers — FLOW metric (full-year aggregated).
+    Comparison: period-sum for Jan-through-datathrough vs same partial-year range in prior year.
     Returns 2 rows ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
     
     if len(years) > 1:
+        year_filter = _year_clause(years, "period_month")
         return f"""
--- Dashboard: subs_kpi — Active subscriber count (stock snapshot latest)
+-- Dashboard: subs_kpi — Active subscriber count (full-year aggregated)
 SELECT
-    period_month,
+    'current' AS period_bucket,
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month = '{d['data_through_date']}'::date
-  AND is_active = TRUE
+WHERE is_active = TRUE
+  {year_filter}
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY 1
 """.strip()
 
     return f"""
--- Dashboard: subs_kpi — Active subscriber count (stock snapshot YoY)
+-- Dashboard: subs_kpi — Active subscriber count (period-sum YoY)
 SELECT
-    period_month,
+    CASE
+        WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
+        WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+    END AS period_bucket,
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month IN ('{d['data_through_date']}'::date, '{d['prior_year_same_month']}'::date)
-  AND is_active = TRUE
+WHERE is_active = TRUE
+  AND (
+    period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
+    OR period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+  )
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY
+    CASE period_bucket WHEN 'current' THEN 0 ELSE 1 END
 """.strip()
 
 
 def _sql_watch_time_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
-    Avg Watch Time — STOCK metric (point-in-time snapshot).
-    Comparison: latest available month vs same calendar month, prior year.
+    Avg Watch Time — FLOW metric (full-year aggregated).
+    Comparison: period-avg for Jan-through-datathrough vs same partial-year range in prior year.
     Source: fct_stream_sessions (session_start)
     Returns 2 rows ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
-    # next-month boundary for each snapshot window
-    curr_month_num  = int(d['data_through_date'][5:7])
-    curr_year_num   = int(d['data_through_date'][:4])
-    prior_year_num  = curr_year_num - 1
-    curr_next_month  = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
-    prior_next_month = f"{prior_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{prior_year_num + 1}-01-01"
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
     
+    curr_end_month_num = int(d['data_through_date'][5:7])
+    curr_end_year_num = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
+
+    prior_end_month_num = int(d['prior_year_equiv_end'][5:7])
+    prior_end_year_num = int(d['prior_year_equiv_end'][:4])
+    prior_next_month = f"{prior_end_year_num}-{prior_end_month_num + 1:02d}-01" if prior_end_month_num < 12 else f"{prior_end_year_num + 1}-01-01"
+    
     if len(years) > 1:
+        year_filter = _year_clause(years, "session_start")
         return f"""
--- Dashboard: watch_time_kpi — Avg watch time (stock snapshot latest)
+-- Dashboard: watch_time_kpi — Avg watch time (full-year aggregated)
 SELECT
-    DATE_TRUNC('month', session_start) AS period_month,
+    'current' AS period_bucket,
     AVG(duration_minutes) AS value
 FROM {_DB}.marts.fct_stream_sessions
-WHERE session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date
+WHERE 1=1
+  {year_filter}
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY 1
 """.strip()
 
     return f"""
--- Dashboard: watch_time_kpi — Avg watch time (stock snapshot YoY)
+-- Dashboard: watch_time_kpi — Avg watch time (period-sum YoY)
 SELECT
-    DATE_TRUNC('month', session_start) AS period_month,
+    CASE
+        WHEN session_start >= '{d['current_year_start']}'::date AND session_start < '{curr_next_month}'::date THEN 'current'
+        WHEN session_start >= '{d['prior_year_start']}'::date AND session_start < '{prior_next_month}'::date THEN 'prior_year'
+    END AS period_bucket,
     AVG(duration_minutes) AS value
 FROM {_DB}.marts.fct_stream_sessions
 WHERE (
-    (session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date)
-    OR (session_start >= '{d['prior_year_same_month']}'::date AND session_start < '{prior_next_month}'::date)
+    (session_start >= '{d['current_year_start']}'::date AND session_start < '{curr_next_month}'::date)
+    OR
+    (session_start >= '{d['prior_year_start']}'::date AND session_start < '{prior_next_month}'::date)
   )
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY
+    CASE period_bucket WHEN 'current' THEN 0 ELSE 1 END
 """.strip()
 
 
@@ -417,55 +434,65 @@ ORDER BY
 
 def _sql_engagement_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
-    Avg Engagement — STOCK metric (point-in-time snapshot).
-    Comparison: latest available month vs same calendar month, prior year.
-    Source: fct_stream_sessions (session_start, completion_pct)
+    Avg Engagement — FLOW metric (full-year aggregated).
+    Comparison: period-avg for Jan-through-datathrough vs same partial-year range in prior year.
+    Source: fct_stream_sessions (session_start)
     Returns 2 rows ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
-    curr_month_num  = int(d['data_through_date'][5:7])
-    curr_year_num   = int(d['data_through_date'][:4])
-    prior_year_num  = curr_year_num - 1
-    curr_next_month  = f"{curr_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{curr_year_num + 1}-01-01"
-    prior_next_month = f"{prior_year_num}-{curr_month_num + 1:02d}-01" if curr_month_num < 12 else f"{prior_year_num + 1}-01-01"
     plan_filter = f"AND subscriber_id IN (SELECT subscriber_id FROM {_DB}.marts.dim_subscribers WHERE 1=1 {_plan_clause(plans)})" if plans else ""
     
+    curr_end_month_num = int(d['data_through_date'][5:7])
+    curr_end_year_num = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
+
+    prior_end_month_num = int(d['prior_year_equiv_end'][5:7])
+    prior_end_year_num = int(d['prior_year_equiv_end'][:4])
+    prior_next_month = f"{prior_end_year_num}-{prior_end_month_num + 1:02d}-01" if prior_end_month_num < 12 else f"{prior_end_year_num + 1}-01-01"
+    
     if len(years) > 1:
+        year_filter = _year_clause(years, "session_start")
         return f"""
--- Dashboard: engagement_kpi — Avg content completion rate (stock snapshot latest)
+-- Dashboard: engagement_kpi — Avg content completion rate (full-year aggregated)
 SELECT
-    DATE_TRUNC('month', session_start) AS period_month,
+    'current' AS period_bucket,
     AVG(completion_pct) * 100.0 AS value
 FROM {_DB}.marts.fct_stream_sessions
-WHERE session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date
+WHERE 1=1
+  {year_filter}
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY 1
 """.strip()
 
     return f"""
--- Dashboard: engagement_kpi — Avg content completion rate (stock snapshot YoY)
+-- Dashboard: engagement_kpi — Avg content completion rate (period-sum YoY)
 SELECT
-    DATE_TRUNC('month', session_start) AS period_month,
+    CASE
+        WHEN session_start >= '{d['current_year_start']}'::date AND session_start < '{curr_next_month}'::date THEN 'current'
+        WHEN session_start >= '{d['prior_year_start']}'::date AND session_start < '{prior_next_month}'::date THEN 'prior_year'
+    END AS period_bucket,
     AVG(completion_pct) * 100.0 AS value
 FROM {_DB}.marts.fct_stream_sessions
 WHERE (
-    (session_start >= '{d['data_through_date']}'::date AND session_start < '{curr_next_month}'::date)
-    OR (session_start >= '{d['prior_year_same_month']}'::date AND session_start < '{prior_next_month}'::date)
+    (session_start >= '{d['current_year_start']}'::date AND session_start < '{curr_next_month}'::date)
+    OR
+    (session_start >= '{d['prior_year_start']}'::date AND session_start < '{prior_next_month}'::date)
   )
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY
+    CASE period_bucket WHEN 'current' THEN 0 ELSE 1 END
 """.strip()
 
 
 def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     """
-    Churn Rate — STOCK metric (point-in-time snapshot).
-    Comparison: latest available month vs same calendar month, prior year.
-    Formula unchanged: churned / total active-or-churned subscribers per month.
+    Churn Rate — FLOW metric (period-aggregated).
+    Comparison: period-sum for Jan-through-datathrough vs same partial-year range in prior year.
+    Formula unchanged: churned / total active-or-churned subscribers.
     Returns 2 rows ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
@@ -473,32 +500,41 @@ def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]
     country_filter = _country_clause_sub(countries)
     
     if len(years) > 1:
+        year_filter = _year_clause(years, "period_month")
         return f"""
--- Dashboard: churn_rate_kpi — Monthly churn rate (stock snapshot latest)
+-- Dashboard: churn_rate_kpi — Churn rate (full-year aggregated)
 SELECT
-    period_month,
+    'current' AS period_bucket,
     COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
-    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
+    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) * 100.0 AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month = '{d['data_through_date']}'::date
+WHERE 1=1
+  {year_filter}
   {plan_filter}
   {country_filter}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY 1
 """.strip()
 
     return f"""
--- Dashboard: churn_rate_kpi — Monthly churn rate (stock snapshot YoY)
+-- Dashboard: churn_rate_kpi — Churn rate (period-sum YoY)
 SELECT
-    period_month,
+    CASE
+        WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
+        WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+    END AS period_bucket,
     COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
-    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
+    NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) * 100.0 AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month IN ('{d['data_through_date']}'::date, '{d['prior_year_same_month']}'::date)
+WHERE (
+    period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
+    OR period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+  )
   {plan_filter}
   {country_filter}
 GROUP BY 1
-ORDER BY 1 DESC
+ORDER BY
+    CASE period_bucket WHEN 'current' THEN 0 ELSE 1 END
 """.strip()
 
 

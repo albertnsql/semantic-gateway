@@ -102,7 +102,7 @@ subscription_periods as (
         on m.period_month >= date_trunc('month', t.valid_from)
         and m.period_month < date_trunc('month', t.valid_to)
         and m.period_month <= case 
-            when t.status = 'active' then dateadd(month, -1, date_trunc('month', current_date()))
+            when t.status = 'active' then date_trunc('month', current_date())
             else dateadd(month, 1, date_trunc('month', coalesce(t.end_date, current_date())))
         end
 )

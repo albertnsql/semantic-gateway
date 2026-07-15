@@ -40,14 +40,14 @@ Only fall back to raw SQL if the requested metric is not in this list or if Metr
 - **Grain:** One session per row
 - **Key dimensions:** `content_type`, `country`
 - **Important:** Use `AVG(watch_time_minutes)` — never SUM
-- Standard hygiene filter: `WHERE is_deleted = FALSE`
+
 
 ### dim_content
 - **Grain:** One row per `content_id`
 - **Join key:** `content_id` — used to resolve `content_type` from `fct_stream_sessions`
-- Standard hygiene filter: `WHERE is_deleted = FALSE`
 
-**Standard hygiene filter:** Exclude `is_deleted = TRUE` on ALL tables in every query, without exception.
+
+
 
 ## Section 3 — Gotchas
 
@@ -99,9 +99,7 @@ SELECT
 FROM fct_stream_sessions fs
 JOIN dim_content dc
     ON fs.content_id = dc.content_id
-WHERE fs.is_deleted = FALSE
-  AND dc.is_deleted = FALSE
-  AND fs.country IS NOT NULL
+WHERE fs.country IS NOT NULL
 GROUP BY 1
 ORDER BY 2 DESC
 ```
