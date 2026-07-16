@@ -110,7 +110,7 @@ class Settings(BaseSettings):
         # ── MRR family (fct_mrr_monthly — subscriber join 100%) ──
         "mrr":                   ["subscription__plan_type", "subscriber__country", "subscriber__cohort_month"],
         "expansion_mrr":         ["subscription__plan_type", "subscriber__country"],
-        "total_revenue":         ["subscription__plan_type", "subscriber__country"],
+        "total_revenue":         ["subscriber__plan_type", "subscriber__country"],
         # net_mrr_growth is intentionally NOT warmed: it's a derived offset_window
         # (month-over-month) metric, so MetricFlow can't compile it without a
         # metric_time grouping and it always falls back. The dashboard net_mrr_growth_kpi
