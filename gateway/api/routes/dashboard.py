@@ -505,7 +505,7 @@ def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]
 -- Dashboard: churn_rate_kpi — Churn rate (full-year aggregated)
 SELECT
     'current' AS period_bucket,
-    COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
+    COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT /
     NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE 1=1
@@ -523,7 +523,7 @@ SELECT
         WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
         WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
     END AS period_bucket,
-    COUNT(CASE WHEN mrr_type = 'churned' THEN 1 END)::FLOAT /
+    COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT /
     NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE (

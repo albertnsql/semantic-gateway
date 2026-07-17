@@ -32,6 +32,9 @@ final as (
         period_month,
         plan_type,
         mrr_usd,
+        -- Month-over-month MRR movement for this subscription:
+        -- new = full amount, expansion = upgrade delta, contraction = negative delta.
+        mrr_usd - coalesce(prev_mrr_usd, 0) as mrr_change_usd,
         billing_cycle,
         is_active,
         case

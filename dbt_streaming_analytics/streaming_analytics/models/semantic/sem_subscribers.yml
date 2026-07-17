@@ -31,10 +31,13 @@ semantic_models:
           time_granularity: day
     measures:
       - name: churned_subscribers
-        description: Count of churned subscribers
+        description: >
+          Count of subscribers who churned, bucketed by the month the churn
+          EVENT occurred (churn_date) — not the signup cohort. Filtering by month
+          M returns subscribers who churned in M.
         expr: case when is_churned = true then subscriber_id else null end
         agg: count
-        agg_time_dimension: signup_date
+        agg_time_dimension: churn_date
       - name: new_subscribers
         description: Count of new subscribers
         expr: subscriber_id

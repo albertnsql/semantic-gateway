@@ -1,9 +1,9 @@
 metrics:
   - name: expansion_mrr
-    description: MRR gained from plan upgrades.
+    description: MRR gained from plan upgrades (incremental delta, not full plan price).
     label: Expansion MRR
     type: simple
     type_params:
-      measure: mrr_usd
+      measure: mrr_change_usd
     filter: |
       {{ Dimension('subscription__mrr_type') }} = 'expansion'

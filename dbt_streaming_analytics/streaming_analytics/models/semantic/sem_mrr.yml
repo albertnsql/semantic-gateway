@@ -28,6 +28,15 @@ semantic_models:
         expr: case when is_active then mrr_usd else 0 end
         agg: sum
         agg_time_dimension: period_month
+      - name: mrr_change_usd
+        description: >
+          Month-over-month MRR movement per subscription (new = full amount,
+          expansion = upgrade delta, contraction = negative delta). Sum this
+          filtered to a single mrr_type for MRR-movement metrics such as
+          expansion_mrr, rather than summing full plan MRR.
+        expr: mrr_change_usd
+        agg: sum
+        agg_time_dimension: period_month
       - name: monthly_churned_subscribers
         description: >
           Distinct subscribers whose subscription flipped active→inactive in the

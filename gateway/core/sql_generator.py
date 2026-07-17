@@ -243,7 +243,7 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
 
                 if not chosen:
                     # Foreign entities on the metric's models are valid MetricFlow
-                    # join paths (e.g. total_revenue on sem_mrr → subscriber__country
+                    # join paths (e.g. total_revenue on sem_payments → subscriber__country
                     # via the foreign 'subscriber' entity). Prefer these over an
                     # arbitrary prefixes[0], which picks unreachable dims like
                     # session__country and fails query resolution.
@@ -1037,7 +1037,7 @@ class SQLGenerator:
         _METRIC_TABLE: dict[str, str] = {
             "mrr": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "expansion_mrr": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
-            "total_revenue": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
+            "total_revenue": "STREAMING_ANALYTICS.marts.fct_payments",
             "ltv": "STREAMING_ANALYTICS.marts.fct_payments",
             "engagement_rate": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
             "churn_rate": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
@@ -1051,8 +1051,8 @@ class SQLGenerator:
 
         _METRIC_EXPR: dict[str, str] = {
             "mrr": "SUM(mrr_usd) AS mrr",
-            "expansion_mrr": "SUM(CASE WHEN mrr_type = 'expansion' THEN mrr_usd ELSE 0 END) AS expansion_mrr",
-            "total_revenue": "SUM(mrr_usd) AS total_revenue",
+            "expansion_mrr": "SUM(CASE WHEN mrr_type = 'expansion' THEN mrr_change_usd ELSE 0 END) AS expansion_mrr",
+            "total_revenue": "SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END) AS total_revenue",
             "ltv": "SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END) AS ltv",
             "engagement_rate": "AVG(completion_pct) AS engagement_rate",
             # Monthly event-based churn on fct_mrr_monthly — mirrors the governed
@@ -1125,9 +1125,9 @@ class SQLGenerator:
 
         if intent.time_range:
             # Use the appropriate physical time column based on the metric
-            if primary_metric in ("mrr", "expansion_mrr", "total_revenue", "churn_rate", "retention_rate"):
+            if primary_metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate"):
                 time_col = "period_month"
-            elif primary_metric == "ltv":
+            elif primary_metric in ("ltv", "total_revenue"):
                 time_col = "payment_date"
             elif primary_metric == "engagement_rate":
                 time_col = "session_start"  # fct_stream_sessions physical column
