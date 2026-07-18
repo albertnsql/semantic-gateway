@@ -581,18 +581,13 @@ def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str], max_
     curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
 
     return f"""
--- Dashboard: sub_dist — Subscriber count by plan type (stock snapshot, latest month in selected year)
+-- Dashboard: sub_dist — Subscriber count by plan type (full-year aggregated)
 SELECT
     INITCAP(plan_type) AS name,
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month = (
-    SELECT MAX(period_month)
-    FROM {_DB}.marts.fct_mrr_monthly
-    WHERE period_month >= '{selected_year_start}'::date AND period_month < '{curr_next_month}'::date
-      AND is_active = TRUE
-  )
-  AND is_active = TRUE
+WHERE is_active = TRUE
+  AND period_month >= '{selected_year_start}'::date AND period_month < '{curr_next_month}'::date
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY 1
@@ -647,8 +642,8 @@ SELECT
     TO_CHAR(DATE_TRUNC('month', period_month), 'Mon YYYY') AS name,
     DATE_TRUNC('month', period_month) AS sort_key,
     ROUND(
-      COUNT(CASE WHEN mrr_type = 'retained' THEN 1 END) * 100.0 /
-      NULLIF(COUNT(DISTINCT subscription_id), 0), 1
+      100.0 - (COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT * 100.0 /
+      NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0)), 1
     ) AS retention_rate
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE period_month >= DATEADD('month', -12, '{max_data_date}'::date)

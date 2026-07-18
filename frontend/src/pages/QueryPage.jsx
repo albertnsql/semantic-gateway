@@ -5,6 +5,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Send, RotateCcw, KeyRound, ExternalLink } from 'lucide-react';
 import TopBar from '../components/TopBar';
 import LoadingSpinner from '../components/LoadingSpinner';
+import QueryProgress from '../components/QueryProgress';
 import QueryResultPanel from '../components/QueryResultPanel';
 import { postQuery } from '../api/query';
 
@@ -219,10 +220,7 @@ export default function QueryPage() {
                       {/* AI Response */}
                       <div className="self-start w-full">
                         {item.loading ? (
-                          <div className="flex items-center gap-3 text-neu-muted text-sm font-dm px-4 py-2">
-                            <span className="w-5 h-5 rounded-full border-[2.5px] border-[#0D9488]/30 border-t-[#0D9488] animate-spin" />
-                            Processing query through semantic gateway…
-                          </div>
+                          <QueryProgress />
                         ) : (
                           <>
                             {item.showApiKeyHelp && <ApiKeyBanner />}

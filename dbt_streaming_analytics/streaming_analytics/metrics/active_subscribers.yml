@@ -4,4 +4,4 @@ metrics:
     label: Active Subscribers
     type: simple
     type_params:
-      measure: monthly_subscriber_base
+      measure: active_subscribers_count

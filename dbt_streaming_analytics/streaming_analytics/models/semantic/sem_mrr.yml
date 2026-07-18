@@ -53,3 +53,10 @@ semantic_models:
         expr: case when mrr_type != 'inactive' then subscriber_id end
         agg: count_distinct
         agg_time_dimension: period_month
+      - name: active_subscribers_count
+        description: >
+          Distinct subscribers who are currently active (is_active = TRUE). 
+          This perfectly matches the dashboard subs_kpi.
+        expr: case when is_active = true then subscriber_id end
+        agg: count_distinct
+        agg_time_dimension: period_month

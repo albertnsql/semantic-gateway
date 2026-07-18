@@ -64,7 +64,7 @@ semantic_models:
         agg_time_dimension: session_start
       - name: avg_completion_pct
         description: Average completion percentage
-        expr: completion_pct
+        expr: completion_pct * 100.0
         agg: average
         agg_time_dimension: session_start
       - name: avg_watch_time

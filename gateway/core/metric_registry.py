@@ -437,7 +437,6 @@ class MetricRegistry:
         Find the semantic model whose measures contain a measure matching the
         metric's type_params (by name or by model reference convention).
         """
-        # Heuristic mapping based on this project's naming conventions
         _METRIC_TO_SEM: dict[str, str] = {
             "mrr": "sem_mrr",
             "expansion_mrr": "sem_mrr",
@@ -454,6 +453,7 @@ class MetricRegistry:
             "retention_rate": "sem_mrr",
             "total_subscribers": "sem_subscribers",
             "churned_subscribers": "sem_subscribers",
+            "active_subscribers": "sem_mrr",
             "recommendation_ctr": "sem_recommendation_events",
             "clicked_recommendations": "sem_recommendation_events",
             "total_recommendations": "sem_recommendation_events",
