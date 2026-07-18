@@ -424,8 +424,24 @@ class SQLGenerator:
 
         # ── MetricFlow subprocess & Speculative LLM Review ───────────
         mf_command: list[str] = []
+        mf_success = False
+        used_fallback_builder = False
         fallback_sql = self._build_fallback_sql(intent)
-        
+
+        # ── Option B: filtered queries skip the ~30 s MetricFlow subprocess ──────
+        # A filter (e.g. country = 'US') makes a query ineligible for the L1 template
+        # cache, which used to mean every filtered query paid MetricFlow's full cold
+        # start (~30 s → the 34 s requests in the logs). Serve it from the in-process
+        # governed fallback builder instead: deterministic, sub-millisecond SQL that
+        # applies the filter itself (joining dim_subscribers when the metric needs it).
+        if compiled_sql is None and effective_filters:
+            compiled_sql = fallback_sql
+            used_fallback_builder = True
+            logger.info(
+                "Filtered query — serving from in-process governed fallback builder "
+                "(skipping MetricFlow)."
+            )
+
         if compiled_sql is None:
             mf_command = self.format_mf_query(intent)
             logger.info("Executing MetricFlow: %s", " ".join(mf_command))
@@ -452,6 +468,12 @@ class SQLGenerator:
         review_result: dict
         if used_template_cache:
             review_result = {"approved": True, "sql": compiled_sql, "source": "template_cache"}
+        elif used_fallback_builder:
+            # Option B path: deterministic, column-validated, value-escaped SQL from the
+            # governed builder — the adversarial LLM reviewer (≈1-2 s + rewrite risk) is
+            # unnecessary here. It still runs on the MetricFlow-failure path below, where
+            # SQL provenance is less certain.
+            review_result = {"approved": True, "sql": compiled_sql, "source": "fallback_builder"}
         else:
             if mf_success:
                 logger.info("MetricFlow generated valid SQL. Bypassing LLM review.")
@@ -520,11 +542,20 @@ class SQLGenerator:
                         "Failed to store SQL template (non-fatal): %s", tpl_exc
                     )
 
-        # mf_command is only defined when MetricFlow ran; provide an audit label otherwise.
-        _mf_cmd = " ".join(mf_command) if (mf_command and not used_template_cache) else (
-            f"[template_cache] mf query --metrics {','.join(intent.metrics)} "
-            f"--group-by {','.join(intent.dimensions)} --explain"
-        )
+        # Audit label — reflect which path actually produced the SQL.
+        if mf_command and not used_template_cache:
+            _mf_cmd = " ".join(mf_command)
+        elif used_fallback_builder:
+            _filter_cols = ",".join(f.column for f in (intent.filters or []))
+            _mf_cmd = (
+                f"[fallback_builder] metrics={','.join(intent.metrics)} "
+                f"dims={','.join(intent.dimensions)} filters={_filter_cols}"
+            )
+        else:
+            _mf_cmd = (
+                f"[template_cache] mf query --metrics {','.join(intent.metrics)} "
+                f"--group-by {','.join(intent.dimensions)} --explain"
+            )
 
         return GeneratedQuery(
             metricflow_query=_mf_cmd,
@@ -1146,6 +1177,34 @@ class SQLGenerator:
                 f"AND '{intent.time_range.end_date}'"
             )
 
+        # ── Subscriber-attribute join (Option B) ──────────────────────────────
+        # fct_mrr_monthly carries no subscriber attributes (country, cohort_month,
+        # acquisition_channel, churn_reason) — those live on dim_subscribers. When a
+        # dimension or filter references one, wrap the fact in a derived table that
+        # LEFT JOINs dim_subscribers so the outer SELECT/WHERE can use the bare
+        # column name unambiguously. (The other marts carry country/plan_type
+        # denormalized, so they never need this join.)
+        _SUBSCRIBER_ONLY_DIMS = {
+            "country", "cohort_month", "acquisition_channel",
+            "churn_reason", "age_group", "subscription_status",
+        }
+        referenced_cols = set(physical_dims) | {
+            _bare_dimension_name(f.column) for f in (intent.filters or [])
+        }
+        from_clause = table
+        if table.endswith("fct_mrr_monthly"):
+            join_cols = sorted(referenced_cols & _SUBSCRIBER_ONLY_DIMS)
+            if join_cols:
+                _sub_cols = ", ".join(f"sub.{c}" for c in join_cols)
+                from_clause = (
+                    "(\n"
+                    f"        SELECT f.*, {_sub_cols}\n"
+                    f"        FROM {table} f\n"
+                    "        LEFT JOIN STREAMING_ANALYTICS.marts.dim_subscribers sub\n"
+                    "          ON f.subscriber_id = sub.subscriber_id\n"
+                    "    ) base"
+                )
+
         group_by = ", ".join(
             str(i + 1) for i in range(len(physical_dims))
         ) if physical_dims else ""
@@ -1155,7 +1214,7 @@ class SQLGenerator:
             f"-- Generated for metrics: {', '.join(intent.metrics)}",
             "SELECT",
             "    " + ",\n    ".join(select_parts),
-            f"FROM {table}",
+            f"FROM {from_clause}",
         ]
 
         if where_clauses:
