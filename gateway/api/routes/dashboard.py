@@ -206,19 +206,28 @@ ORDER BY 1
 """.strip()
 
     d = _resolve_yoy_dates(years, max_data_date)
+    
+    curr_end_month_num = int(d['data_through_date'][5:7])
+    curr_end_year_num = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
+
+    prior_end_month_num = int(d['prior_year_equiv_end'][5:7])
+    prior_end_year_num = int(d['prior_year_equiv_end'][:4])
+    prior_next_month = f"{prior_end_year_num}-{prior_end_month_num + 1:02d}-01" if prior_end_month_num < 12 else f"{prior_end_year_num + 1}-01-01"
+
     return f"""
 -- Dashboard: revenue_kpi — Total Revenue (flow metric, period-sum YoY)
 SELECT
     CASE
-        WHEN payment_date BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
-        WHEN payment_date BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+        WHEN payment_date >= '{d['current_year_start']}'::date AND payment_date < '{curr_next_month}'::date THEN 'current'
+        WHEN payment_date >= '{d['prior_year_start']}'::date AND payment_date < '{prior_next_month}'::date THEN 'prior_year'
     END AS period_bucket,
     COALESCE(SUM(amount_usd), 0) AS value
 FROM {_DB}.marts.fct_payments
 WHERE status = 'succeeded'
   AND (
-    payment_date BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
-    OR payment_date BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+    (payment_date >= '{d['current_year_start']}'::date AND payment_date < '{curr_next_month}'::date)
+    OR (payment_date >= '{d['prior_year_start']}'::date AND payment_date < '{prior_next_month}'::date)
   )
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
@@ -242,6 +251,14 @@ def _sql_subs_kpi(plans: list[str], years: list[int], countries: list[str], max_
     """
     d = _resolve_yoy_dates(years, max_data_date)
     
+    curr_end_month_num = int(d['data_through_date'][5:7])
+    curr_end_year_num = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
+
+    prior_end_month_num = int(d['prior_year_equiv_end'][5:7])
+    prior_end_year_num = int(d['prior_year_equiv_end'][:4])
+    prior_next_month = f"{prior_end_year_num}-{prior_end_month_num + 1:02d}-01" if prior_end_month_num < 12 else f"{prior_end_year_num + 1}-01-01"
+    
     if len(years) > 1:
         year_filter = _year_clause(years, "period_month")
         return f"""
@@ -262,15 +279,15 @@ ORDER BY 1
 -- Dashboard: subs_kpi — Active subscriber count (period-sum YoY)
 SELECT
     CASE
-        WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
-        WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+        WHEN period_month >= '{d['current_year_start']}'::date AND period_month < '{curr_next_month}'::date THEN 'current'
+        WHEN period_month >= '{d['prior_year_start']}'::date AND period_month < '{prior_next_month}'::date THEN 'prior_year'
     END AS period_bucket,
     COUNT(DISTINCT subscriber_id) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE is_active = TRUE
   AND (
-    period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
-    OR period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+    (period_month >= '{d['current_year_start']}'::date AND period_month < '{curr_next_month}'::date)
+    OR (period_month >= '{d['prior_year_start']}'::date AND period_month < '{prior_next_month}'::date)
   )
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
@@ -496,6 +513,15 @@ def _sql_churn_rate_kpi(plans: list[str], years: list[int], countries: list[str]
     Returns 2 rows ordered current first.
     """
     d = _resolve_yoy_dates(years, max_data_date)
+
+    curr_end_month_num = int(d['data_through_date'][5:7])
+    curr_end_year_num = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
+
+    prior_end_month_num = int(d['prior_year_equiv_end'][5:7])
+    prior_end_year_num = int(d['prior_year_equiv_end'][:4])
+    prior_next_month = f"{prior_end_year_num}-{prior_end_month_num + 1:02d}-01" if prior_end_month_num < 12 else f"{prior_end_year_num + 1}-01-01"
+
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
     
@@ -520,15 +546,15 @@ ORDER BY 1
 -- Dashboard: churn_rate_kpi — Churn rate (period-sum YoY)
 SELECT
     CASE
-        WHEN period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date THEN 'current'
-        WHEN period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date THEN 'prior_year'
+        WHEN period_month >= '{d['current_year_start']}'::date AND period_month < '{curr_next_month}'::date THEN 'current'
+        WHEN period_month >= '{d['prior_year_start']}'::date AND period_month < '{prior_next_month}'::date THEN 'prior_year'
     END AS period_bucket,
     COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT /
     NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE (
-    period_month BETWEEN '{d['current_year_start']}'::date AND '{d['data_through_date']}'::date
-    OR period_month BETWEEN '{d['prior_year_start']}'::date AND '{d['prior_year_equiv_end']}'::date
+    (period_month >= '{d['current_year_start']}'::date AND period_month < '{curr_next_month}'::date)
+    OR (period_month >= '{d['prior_year_start']}'::date AND period_month < '{prior_next_month}'::date)
   )
   {plan_filter}
   {country_filter}
@@ -547,9 +573,13 @@ def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str], max_
     Never averages across months — always a single-month snapshot.
     """
     d = _resolve_yoy_dates(years, max_data_date)
-    # Inner subquery resolves to the latest available month within the selected year window
     selected_year_start = d['current_year_start']
     selected_year_cap   = d['data_through_date']     # capped at last available data month
+
+    curr_end_month_num = int(d['data_through_date'][5:7])
+    curr_end_year_num = int(d['data_through_date'][:4])
+    curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
+
     return f"""
 -- Dashboard: sub_dist — Subscriber count by plan type (stock snapshot, latest month in selected year)
 SELECT
@@ -559,7 +589,7 @@ FROM {_DB}.marts.fct_mrr_monthly
 WHERE period_month = (
     SELECT MAX(period_month)
     FROM {_DB}.marts.fct_mrr_monthly
-    WHERE period_month BETWEEN '{selected_year_start}'::date AND '{selected_year_cap}'::date
+    WHERE period_month >= '{selected_year_start}'::date AND period_month < '{curr_next_month}'::date
       AND is_active = TRUE
   )
   AND is_active = TRUE
@@ -585,7 +615,7 @@ SELECT
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE mrr_type IN ('new', 'expansion', 'contraction', 'churned')
   AND period_month >= DATEADD(month, -12, '{max_data_date}'::date)
-  AND period_month <= '{max_data_date}'::date
+  AND period_month < DATEADD(month, 1, '{max_data_date}'::date)
   {plan_filter}
   {country_filter}
 GROUP BY 1, 2
@@ -602,7 +632,7 @@ SELECT
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE is_active = TRUE
   AND period_month >= DATEADD('month', -12, '{max_data_date}'::date)
-  AND period_month <= '{max_data_date}'::date
+  AND period_month < DATEADD('month', 1, '{max_data_date}'::date)
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY period_month
@@ -622,7 +652,7 @@ SELECT
     ) AS retention_rate
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE period_month >= DATEADD('month', -12, '{max_data_date}'::date)
-  AND period_month <= '{max_data_date}'::date
+  AND period_month < DATEADD('month', 1, '{max_data_date}'::date)
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY DATE_TRUNC('month', period_month), name
