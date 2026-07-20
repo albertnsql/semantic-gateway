@@ -581,15 +581,23 @@ def _sql_sub_dist(plans: list[str], years: list[int], countries: list[str], max_
     curr_next_month = f"{curr_end_year_num}-{curr_end_month_num + 1:02d}-01" if curr_end_month_num < 12 else f"{curr_end_year_num + 1}-01-01"
 
     return f"""
--- Dashboard: sub_dist — Subscriber count by plan type (full-year aggregated)
+-- Dashboard: sub_dist — Subscriber count by plan type (deduplicated by latest plan)
+WITH deduped AS (
+    SELECT
+        subscriber_id,
+        plan_type
+    FROM {_DB}.marts.fct_mrr_monthly
+    WHERE is_active = TRUE
+      AND period_month >= '{selected_year_start}'::date AND period_month < '{curr_next_month}'::date
+      {_country_clause_sub(countries)}
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY subscriber_id ORDER BY period_month DESC) = 1
+)
 SELECT
     INITCAP(plan_type) AS name,
     COUNT(DISTINCT subscriber_id) AS value
-FROM {_DB}.marts.fct_mrr_monthly
-WHERE is_active = TRUE
-  AND period_month >= '{selected_year_start}'::date AND period_month < '{curr_next_month}'::date
+FROM deduped
+WHERE 1=1
   {_plan_clause(plans)}
-  {_country_clause_sub(countries)}
 GROUP BY 1
 ORDER BY 2 DESC
 """.strip()

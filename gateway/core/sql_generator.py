@@ -306,13 +306,19 @@ class SQLGenerator:
     _METRIC_TIME_COL: dict[str, str] = {
         "mrr":                    "period_month",
         "expansion_mrr":          "period_month",
+        "total_revenue":          "payment_date",
         "ltv":                    "payment_date",
         "engagement_rate":        "session_start",
+        "avg_watch_time":         "session_start",
+        "total_watch_time":       "session_start",
+        "total_sessions":         "session_start",
+        "avg_buffering_events":   "session_start",
+        "total_buffering_events": "session_start",
         # churn_rate/retention_rate live on fct_mrr_monthly (monthly event-based
         # definition) — time filters select the month churn HAPPENED, not signup.
         "churn_rate":             "period_month",
         "retention_rate":         "period_month",
-        "total_subscribers":      "signup_date",
+        "total_subscribers":      "period_month",
         "churned_subscribers":    "signup_date",
         "recommendation_ctr":     "event_timestamp",
         "total_recommendations":  "event_timestamp",
@@ -426,7 +432,6 @@ class SQLGenerator:
         mf_command: list[str] = []
         mf_success = False
         used_fallback_builder = False
-        fallback_sql = self._build_fallback_sql(intent)
 
         # ── Option B: filtered queries skip the ~30 s MetricFlow subprocess ──────
         # A filter (e.g. country = 'US') makes a query ineligible for the L1 template
@@ -434,13 +439,21 @@ class SQLGenerator:
         # start (~30 s → the 34 s requests in the logs). Serve it from the in-process
         # governed fallback builder instead: deterministic, sub-millisecond SQL that
         # applies the filter itself (joining dim_subscribers when the metric needs it).
+        # If the builder can't serve this metric (raises SQLGenerationError), fall
+        # through to MetricFlow — slow but correct for MetricFlow-only metrics.
         if compiled_sql is None and effective_filters:
-            compiled_sql = fallback_sql
-            used_fallback_builder = True
-            logger.info(
-                "Filtered query — serving from in-process governed fallback builder "
-                "(skipping MetricFlow)."
-            )
+            try:
+                compiled_sql = self._build_fallback_sql(intent)
+                used_fallback_builder = True
+                logger.info(
+                    "Filtered query — serving from in-process governed fallback builder "
+                    "(skipping MetricFlow)."
+                )
+            except SQLGenerationError as exc:
+                logger.info(
+                    "Fallback builder cannot serve %s (%s); routing to MetricFlow instead.",
+                    intent.metrics, exc.message,
+                )
 
         if compiled_sql is None:
             mf_command = self.format_mf_query(intent)
@@ -453,7 +466,9 @@ class SQLGenerator:
                 if isinstance(exc, SQLGenerationError):
                     raise
                 logger.warning("MetricFlow execution failed: %s. Falling back to governed SQL template.", exc)
-                compiled_sql = fallback_sql
+                # May raise SQLGenerationError for an unmapped metric (e.g. net_mrr_growth);
+                # that surfaces a clear error rather than a cryptic Snowflake crash.
+                compiled_sql = self._build_fallback_sql(intent)
                 mf_success = False
 
         grain = ""
@@ -1071,9 +1086,14 @@ class SQLGenerator:
             "total_revenue": "STREAMING_ANALYTICS.marts.fct_payments",
             "ltv": "STREAMING_ANALYTICS.marts.fct_payments",
             "engagement_rate": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
+            "avg_watch_time": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
+            "total_watch_time": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
+            "total_sessions": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
+            "avg_buffering_events": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
+            "total_buffering_events": "STREAMING_ANALYTICS.marts.fct_stream_sessions",
             "churn_rate": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "retention_rate": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
-            "total_subscribers": "STREAMING_ANALYTICS.marts.dim_subscribers",
+            "total_subscribers": "STREAMING_ANALYTICS.marts.fct_mrr_monthly",
             "churned_subscribers": "STREAMING_ANALYTICS.marts.dim_subscribers",
             "recommendation_ctr": "STREAMING_ANALYTICS.staging.stg_recommendation_events",
             "total_recommendations": "STREAMING_ANALYTICS.staging.stg_recommendation_events",
@@ -1086,6 +1106,13 @@ class SQLGenerator:
             "total_revenue": "SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END) AS total_revenue",
             "ltv": "SUM(CASE WHEN status = 'succeeded' THEN amount_usd ELSE 0 END) AS ltv",
             "engagement_rate": "AVG(completion_pct) AS engagement_rate",
+            # Streaming-session metrics on fct_stream_sessions — mirror the
+            # sem_stream_sessions measures (duration_minutes, session_id, buffering_events).
+            "avg_watch_time": "AVG(duration_minutes) AS avg_watch_time",
+            "total_watch_time": "SUM(duration_minutes) AS total_watch_time",
+            "total_sessions": "COUNT(session_id) AS total_sessions",
+            "avg_buffering_events": "AVG(buffering_events) AS avg_buffering_events",
+            "total_buffering_events": "SUM(buffering_events) AS total_buffering_events",
             # Monthly event-based churn on fct_mrr_monthly — mirrors the governed
             # MetricFlow definition and the dashboard churn_rate_kpi formula.
             "churn_rate": (
@@ -1096,7 +1123,7 @@ class SQLGenerator:
                 "1 - COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT / "
                 "NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0) AS retention_rate"
             ),
-            "total_subscribers": "COUNT(DISTINCT subscriber_id) AS total_subscribers",
+            "total_subscribers": "COUNT(DISTINCT CASE WHEN is_active = TRUE THEN subscriber_id END) AS total_subscribers",
             "churned_subscribers": "COUNT(DISTINCT CASE WHEN is_churned = TRUE THEN subscriber_id END) AS churned_subscribers",
             "recommendation_ctr": (
                 "COUNT(CASE WHEN was_clicked = TRUE THEN event_id END)::FLOAT / "
@@ -1118,8 +1145,24 @@ class SQLGenerator:
         }
 
         primary_metric = intent.metrics[0] if intent.metrics else "mrr"
-        table = _METRIC_TABLE.get(primary_metric, "STREAMING_ANALYTICS.marts.fct_mrr_monthly")
-        metric_expr = _METRIC_EXPR.get(primary_metric, f"COUNT(*) AS {primary_metric}")
+
+        # Fail loudly for unmapped metrics instead of silently defaulting to
+        # fct_mrr_monthly / COUNT(*), which produced plausible-looking SQL that
+        # crashed on Snowflake with a cryptic "invalid identifier" error.
+        if primary_metric not in _METRIC_TABLE or primary_metric not in _METRIC_EXPR:
+            hint = ""
+            if primary_metric == "net_mrr_growth":
+                hint = (
+                    " It is a month-over-month derived (offset-window) metric that a flat "
+                    "SELECT cannot express — use the dashboard net_mrr_growth widget."
+                )
+            raise SQLGenerationError(
+                f"Metric '{primary_metric}' is not supported on the governed fallback path "
+                f"(no table/expression mapping in the fallback builder)." + hint
+            )
+
+        table = _METRIC_TABLE[primary_metric]
+        metric_expr = _METRIC_EXPR[primary_metric]
 
         # Translate semantic dimension names → physical column names for SELECT/GROUP BY
         physical_dims = [
@@ -1156,13 +1199,16 @@ class SQLGenerator:
 
         if intent.time_range:
             # Use the appropriate physical time column based on the metric
-            if primary_metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate"):
+            if primary_metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate", "total_subscribers"):
                 time_col = "period_month"
             elif primary_metric in ("ltv", "total_revenue"):
                 time_col = "payment_date"
-            elif primary_metric == "engagement_rate":
+            elif primary_metric in (
+                "engagement_rate", "avg_watch_time", "total_watch_time",
+                "total_sessions", "avg_buffering_events", "total_buffering_events",
+            ):
                 time_col = "session_start"  # fct_stream_sessions physical column
-            elif primary_metric in ("total_subscribers", "churned_subscribers"):
+            elif primary_metric == "churned_subscribers":
                 time_col = "signup_date"
             elif primary_metric in ("recommendation_ctr", "total_recommendations", "clicked_recommendations"):
                 time_col = "event_timestamp"  # stg_recommendation_events physical column

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import core.sql_generator as sql_generator
+from core.exceptions import SQLGenerationError
 from core.intent_extractor import FilterClause, QueryIntent, TimeRange
 from core.semantic_validator import ValidationResult
 from core.sql_generator import SQLGenerator
@@ -162,3 +165,70 @@ def test_fallback_sql_escapes_single_quotes_in_filter_value() -> None:
     )
 
     assert "a'' OR ''1''=''1" in sql
+
+
+# ── Metric mapping coverage & fail-loud guard ─────────────────────────────────
+
+
+def _metric_intent(metric: str, dimensions: list[str] | None = None) -> QueryIntent:
+    return QueryIntent(
+        original_query=f"{metric} query",
+        metrics=[metric],
+        dimensions=dimensions or [],
+        filters=[],
+        time_range=TimeRange(
+            start_date="2026-04-01", end_date="2026-07-01", relative="last_3_months"
+        ),
+    )
+
+
+# metric name → the aggregation expected in the fallback SQL (mirrors sem_stream_sessions).
+_STREAMING_METRICS = {
+    "avg_watch_time": "AVG(duration_minutes)",
+    "total_watch_time": "SUM(duration_minutes)",
+    "total_sessions": "COUNT(session_id)",
+    "avg_buffering_events": "AVG(buffering_events)",
+    "total_buffering_events": "SUM(buffering_events)",
+}
+
+
+@pytest.mark.parametrize("metric,expr", list(_STREAMING_METRICS.items()))
+def test_fallback_maps_streaming_metrics_to_sessions_table(metric, expr) -> None:
+    """Streaming metrics must hit fct_stream_sessions with session_start — never the MRR table."""
+    generator = SQLGenerator(_settings())
+    sql = generator._build_fallback_sql(_metric_intent(metric, ["session__device_type"]))
+
+    assert "STREAMING_ANALYTICS.marts.fct_stream_sessions" in sql
+    assert "fct_mrr_monthly" not in sql
+    assert expr in sql
+    assert "session_start BETWEEN" in sql
+
+
+def test_fallback_rejects_net_mrr_growth() -> None:
+    """net_mrr_growth (offset-window) must fail loudly, pointing to the dashboard widget."""
+    generator = SQLGenerator(_settings())
+    with pytest.raises(SQLGenerationError) as exc:
+        generator._build_fallback_sql(_metric_intent("net_mrr_growth"))
+
+    assert "net_mrr_growth" in str(exc.value)
+    assert "dashboard" in str(exc.value).lower()
+
+
+def test_fallback_rejects_unmapped_metric() -> None:
+    """An unmapped metric must raise a clear error, not silently default to fct_mrr_monthly."""
+    generator = SQLGenerator(_settings())
+    with pytest.raises(SQLGenerationError):
+        generator._build_fallback_sql(_metric_intent("some_unmapped_metric"))
+
+
+def test_fallback_total_subscribers_counts_active_on_mrr() -> None:
+    """total_subscribers must count distinct ACTIVE subscribers on fct_mrr_monthly by period_month,
+    matching the dashboard Active Subscribers KPI — not signups on dim_subscribers."""
+    generator = SQLGenerator(_settings())
+    sql = generator._build_fallback_sql(_metric_intent("total_subscribers"))
+
+    assert "STREAMING_ANALYTICS.marts.fct_mrr_monthly" in sql
+    assert "COUNT(DISTINCT CASE WHEN is_active = TRUE THEN subscriber_id END)" in sql
+    assert "period_month BETWEEN" in sql
+    assert "signup_date" not in sql
+    assert "dim_subscribers" not in sql  # unfiltered → no subscriber join

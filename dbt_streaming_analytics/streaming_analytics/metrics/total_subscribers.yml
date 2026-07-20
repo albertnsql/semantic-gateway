@@ -1,7 +1,14 @@
 metrics:
   - name: total_subscribers
-    description: Total subscribers
+    description: >
+      Distinct active subscribers in the period (is_active = TRUE), counted on
+      fct_mrr_monthly by period_month. This is the CANONICAL subscriber-count
+      metric — it matches the dashboard Active Subscribers KPI and reuses the
+      active_subscribers_count measure so chat and dashboard always agree. Answers
+      both "total subscribers" and "active subscribers" questions.
+      (Previously counted signups by signup_date, which returned a cohort — e.g.
+      2,775 for 2026 — instead of the ~12,249 active subscriber base.)
     label: Total Subscribers
     type: simple
     type_params:
-      measure: total_subscribers
+      measure: active_subscribers_count

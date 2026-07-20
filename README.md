@@ -110,7 +110,7 @@ React Frontend
 | Metric | Description |
 |---|---|
 | `mrr` | Monthly recurring revenue |
-| `new_mrr` | New MRR from first-time subscribers |
+| `total_revenue` | Total revenue (sum of succeeded payments) |
 | `expansion_mrr` | MRR from plan upgrades |
 | `churn_rate` | % of subscribers who churned |
 | `churned_subscribers` | Count of churned subscribers |

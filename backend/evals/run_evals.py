@@ -71,9 +71,12 @@ logger = logging.getLogger("run_evals")
 _GOLDEN_SET_PATH = _HERE / "golden_set.json"
 _SNAPSHOTS_DIR = _HERE / "snapshots"
 
-# The certified metric + dimension universe used by this project.
-# Kept here rather than loading from live registry so evals are deterministic
-# even when the registry YAML files change.
+# A fixed, deterministic SUBSET (10 of the 18 certified metrics) used for evals.
+# Kept here rather than loading from the live registry so eval results stay stable
+# even as the registry YAML files change. NOTE: this is intentionally a curated
+# subset, NOT the full metric set — if you want full production-universe coverage,
+# expand this list (plus _CERTIFIED_DIMENSIONS / _CERTIFIED_TIME_GRAINS) and re-run
+# the eval, since the pass rate may shift as more candidate metrics are exposed.
 _CERTIFIED_METRICS = [
     "mrr",
     "expansion_mrr",

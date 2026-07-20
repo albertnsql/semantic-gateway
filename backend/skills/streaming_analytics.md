@@ -14,12 +14,23 @@ ALWAYS attempt the semantic layer first before falling back to raw SQL.
 ### Available MetricFlow Metrics
 
 - mrr
-- new_mrr
-- churned_mrr
-- active_subscribers
-- avg_watch_time
-- engagement_rate
+- expansion_mrr
+- total_revenue
 - ltv
+- churn_rate
+- retention_rate
+- total_subscribers
+- churned_subscribers
+- avg_watch_time
+- total_watch_time
+- total_sessions
+- avg_buffering_events
+- total_buffering_events
+- engagement_rate
+- recommendation_ctr
+- total_recommendations
+- clicked_recommendations
+- net_mrr_growth
 
 ### Available Dimensions
 
