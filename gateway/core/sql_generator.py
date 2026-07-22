@@ -1030,15 +1030,19 @@ class SQLGenerator:
         Raises:
             SQLGenerationError: If no SQL could be found in the output.
         """
+        # MetricFlow renders complex queries (multi-model ratios like ltv, joined
+        # group-bys) as a top-level CTE — `WITH cte AS ( SELECT … )`. Capturing from
+        # the first SELECT would drop the `WITH cte AS (` prefix and leave the CTE's
+        # closing `)` dangling → Snowflake "syntax error … unexpected ')'". So begin
+        # at the first line starting with WITH *or* SELECT, whichever comes first.
+        _sql_start = re.compile(r"^(?:WITH|SELECT)\b", re.IGNORECASE)
+
         lines = stdout.splitlines()
         sql_lines: list[str] = []
         capturing = False
 
         for line in lines:
-            upper = line.strip().upper()
-            if upper.startswith("SELECT") or (
-                capturing and sql_lines
-            ):
+            if not capturing and _sql_start.match(line.strip()):
                 capturing = True
 
             if capturing:
@@ -1050,10 +1054,10 @@ class SQLGenerator:
         sql = "\n".join(sql_lines).strip()
 
         if not sql:
-            # Try alternate: find SELECT anywhere in the output
-            idx = stdout.upper().find("SELECT")
-            if idx != -1:
-                sql = stdout[idx:].strip()
+            # Fallback: slice from the first WITH/SELECT keyword, whichever is earlier.
+            m = re.search(r"(?im)^\s*(?:WITH|SELECT)\b", stdout)
+            if m:
+                sql = stdout[m.start():].strip()
 
         if not sql:
             raise SQLGenerationError(

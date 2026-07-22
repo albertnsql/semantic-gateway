@@ -221,6 +221,43 @@ def test_fallback_rejects_unmapped_metric() -> None:
         generator._build_fallback_sql(_metric_intent("some_unmapped_metric"))
 
 
+def test_extract_sql_captures_leading_with_cte() -> None:
+    """MetricFlow CTE output must be captured starting at WITH, not the inner SELECT —
+    dropping the `WITH cte AS (` prefix leaves a dangling ')' (Snowflake syntax error)."""
+    generator = SQLGenerator(_settings())
+    stdout = (
+        "Success - query completed\n"
+        "SQL:\n"
+        "WITH cte_0 AS (\n"
+        "  SELECT subscriber_id, amount_usd\n"
+        "  FROM STREAMING_ANALYTICS.marts.fct_payments\n"
+        ")\n"
+        "SELECT plan_type, SUM(amount_usd) AS ltv\n"
+        "FROM cte_0\n"
+        "GROUP BY plan_type\n"
+    )
+    sql = generator._extract_sql_from_mf_output(stdout, "mf query ...")
+
+    assert sql.upper().startswith("WITH")
+    assert "cte_0" in sql
+    assert sql.count("(") == sql.count(")")  # balanced → prefix not dropped
+
+
+def test_extract_sql_captures_leading_select() -> None:
+    """Plain SELECT output (no CTE) still extracts cleanly."""
+    generator = SQLGenerator(_settings())
+    stdout = (
+        "SQL:\n"
+        "SELECT plan_type, SUM(mrr_usd) AS mrr\n"
+        "FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly\n"
+        "GROUP BY plan_type\n"
+    )
+    sql = generator._extract_sql_from_mf_output(stdout, "mf query ...")
+
+    assert sql.upper().startswith("SELECT")
+    assert "fct_mrr_monthly" in sql
+
+
 def test_fallback_total_subscribers_counts_active_on_mrr() -> None:
     """total_subscribers must count distinct ACTIVE subscribers on fct_mrr_monthly by period_month,
     matching the dashboard Active Subscribers KPI — not signups on dim_subscribers."""

@@ -1,60 +1,10 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { X, Send, Sparkles, MessageSquare, ChevronLeft } from 'lucide-react';
 import ChatMessage from './ChatMessage';
+import QueryProgress from '../QueryProgress';
 
 const CLAY_SHADOW = `16px 16px 32px rgba(13,148,136,0.12), -10px -10px 24px rgba(255,255,255,0.9), inset 6px 6px 12px rgba(13,148,136,0.04), inset -6px -6px 12px rgba(255,255,255,1)`;
 const CLAY_INSET  = `inset 8px 8px 16px rgba(13,148,136,0.08), inset -8px -8px 16px rgba(255,255,255,0.9)`;
-
-const PROGRESS_STEPS = [
-  "Extracting query intent...",
-  "Validating semantic model...",
-  "Compiling MetricFlow SQL...",
-  "Executing Snowflake query...",
-  "Generating narrative summary..."
-];
-
-function TypingProgressIndicator() {
-  const [stepIndex, setStepIndex] = useState(0);
-
-  useEffect(() => {
-    const timers = [
-      setTimeout(() => setStepIndex(1), 1500),
-      setTimeout(() => setStepIndex(2), 3000),
-      setTimeout(() => setStepIndex(3), 6000),
-      setTimeout(() => setStepIndex(4), 11000)
-    ];
-    return () => timers.forEach(clearTimeout);
-  }, []);
-
-  return (
-    <div
-      className="self-start px-4 py-3 rounded-[20px] rounded-tl-[6px] flex flex-col gap-2 min-w-[220px]"
-      style={{ background: 'rgba(255,255,255,0.80)', boxShadow: CLAY_SHADOW }}
-    >
-      <div className="flex items-center gap-2.5">
-        <div className="flex gap-1 items-center h-4">
-          {[0, 150, 300].map(delay => (
-            <div
-              key={delay}
-              className="w-1.5 h-1.5 rounded-full animate-bounce"
-              style={{ background: 'rgba(13,148,136,0.80)', animationDelay: `${delay}ms` }}
-            />
-          ))}
-        </div>
-        <span className="text-xs font-bold text-[#0D9488]" style={{ fontFamily: 'DM Sans, sans-serif' }}>
-          {PROGRESS_STEPS[stepIndex]}
-        </span>
-      </div>
-      
-      <div className="w-full h-1 bg-[#0D9488]/10 rounded-full overflow-hidden">
-        <div 
-          className="h-full bg-gradient-to-r from-[#2DD4BF] to-[#0D9488] transition-all duration-1000 ease-out"
-          style={{ width: `${((stepIndex + 1) / PROGRESS_STEPS.length) * 100}%` }}
-        />
-      </div>
-    </div>
-  );
-}
 
 export default function ChatPanel({
   drawerOpen,
@@ -179,7 +129,7 @@ export default function ChatPanel({
             <ChatMessage key={i} message={m} onSuggest={handleSendChat} onSuggestPopulate={(text) => { setChatInput(text); }} />
           ))}
 
-          {isTyping && <TypingProgressIndicator />}
+          {isTyping && <QueryProgress />}
 
           {showPrompts && !isTyping && (
             <div className="flex flex-col gap-2 mt-1">
