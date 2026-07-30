@@ -9,7 +9,7 @@ import ChartCard from '../components/dashboard/ChartCard';
 import ChatPanel from '../components/dashboard/ChatPanel';
 import LoadingSpinner from '../components/LoadingSpinner';
 import { fetchDashboardWidget, fetchDashboardMetadata } from '../api/dashboard';
-import { postQuery } from '../api/query';
+import { postQuery, agentTextFromResponse } from '../api/query';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 
@@ -442,7 +442,17 @@ export default function DashboardPage() {
         max_rows: 10,
         dashboard_context: chatContext
       });
-      setMessages(prev => [...prev, { role: 'agent', status: res.status, raw: res, date: new Date() }]);
+      // `content` carries the agent's answer into the next turn's history. Without
+      // it, buildHistory() drops this turn and the model cannot see what it just
+      // answered — which is how the same question resolved to two different
+      // metrics on consecutive turns. ChatMessage still renders raw.narrative_summary.
+      setMessages(prev => [...prev, {
+        role: 'agent',
+        status: res.status,
+        content: agentTextFromResponse(res),
+        raw: res,
+        date: new Date(),
+      }]);
     } catch (err) {
       const errorMsg = err.response?.data?.message || err.response?.data?.error || err.message || 'Failed';
       setMessages(prev => [...prev, { role: 'agent', status: 'error', error: errorMsg, date: new Date() }]);

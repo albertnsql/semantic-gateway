@@ -60,6 +60,30 @@
     "notes": "Churned subscriber COUNT not churn rate — distinct metric."
   },
   {
+    "id": "churn-003",
+    "category": "metric_disambiguation",
+    "question": "Show churn by plan type for 2025",
+    "expected": {
+      "metrics": ["churn_rate"],
+      "dimensions": ["plan_type"],
+      "time_range_relative": null,
+      "needs_clarification": false
+    },
+    "notes": "Bare 'churn' with no count wording MUST resolve to churn_rate. This exact phrasing resolved to churned_subscribers on one run and churn_rate on the next in production (2026-07-30), producing two contradictory answers — standard worst by count vs basic worst by rate. Rate beats count unless the user explicitly asks for a count."
+  },
+  {
+    "id": "churn-004",
+    "category": "metric_disambiguation",
+    "question": "What was the number of churned subscribers by plan type in 2025?",
+    "expected": {
+      "metrics": ["churned_subscribers"],
+      "dimensions": ["plan_type"],
+      "time_range_relative": null,
+      "needs_clarification": false
+    },
+    "notes": "Counterpart to churn-003: explicit 'number of' wording MUST still reach churned_subscribers. Guards against the disambiguation rule over-correcting everything to churn_rate."
+  },
+  {
     "id": "ltv-001",
     "category": "metric_extraction",
     "question": "What is the lifetime value of our subscribers by acquisition channel?",

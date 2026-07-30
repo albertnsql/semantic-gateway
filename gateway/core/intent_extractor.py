@@ -199,11 +199,24 @@ class IntentExtractor:
             {"role": "system", "content": system_prompt},
         ]
         if history:
+            # Drop blank turns BEFORE truncating. Message.content is a required str
+            # but '' is valid, and a client that stores its answer somewhere other
+            # than `content` will happily send empty assistant turns — which tell
+            # the model it replied with nothing, and burn slots that real turns need.
+            # Filtering here keeps the gateway correct regardless of the caller.
+            _non_empty = [m for m in history if (m.content or "").strip()]
+            _dropped = len(history) - len(_non_empty)
+            if _dropped:
+                logger.warning(
+                    "Dropped %d/%d blank history turn(s) — the caller is not populating "
+                    "'content'. The model cannot see its own prior answers.",
+                    _dropped, len(history),
+                )
             # We only keep the last 5 turns to prevent context bloat
-            for msg in history[-5:]:
+            for msg in _non_empty[-5:]:
                 # Force roles to be either 'user' or 'assistant'
                 role = "assistant" if msg.role in ("agent", "assistant", "system") else "user"
-                messages.append({"role": role, "content": msg.content or ""})
+                messages.append({"role": role, "content": msg.content.strip()})
 
         messages.append(
             {
@@ -499,6 +512,33 @@ present) are always "metric_query".
 4. SYNONYM MAPPING: If the user asks for a metric (e.g., "video completion rate", "revenue") or dimension (e.g., "continent", "region") that is not in the certified lists, you MUST map it to the closest semantic equivalent from the certified lists (e.g., "engagement_rate", "mrr", "country"). Do NOT ask for clarification if a reasonable mapping exists.
 5. If the question IS a data question but no certified metric matches it AT ALL (e.g., "customer satisfaction score"), keep query_type "metric_query", use an empty list for metrics, and set needs_clarification to true.
 6. Only use metrics from the provided list. Do not invent metric names not in this list.
+7. When more than one certified metric matches the user's wording, resolve it with the
+   METRIC DISAMBIGUATION rules below. Never pick arbitrarily between near-synonyms —
+   the same question must always resolve to the same metric.
+
+## METRIC DISAMBIGUATION — apply before choosing a metric
+
+RATE BEATS COUNT. When the certified list contains both a rate/percentage metric and a
+raw count metric for the same concept, and the user did NOT explicitly ask for a count,
+you MUST choose the RATE. Counts are confounded by segment size — the largest segment
+almost always has the biggest count, which makes a count-based breakdown misleading when
+the user is comparing segments. Only choose the count when the user's wording explicitly
+asks for one: "how many", "number of", "count of", "total ...s".
+
+Applying that rule to this registry:
+- "churn", "churn rate", "churned", "attrition", "cancellations", "% churning"
+  → `churn_rate`   (the default for ANY bare mention of churn)
+- "how many churned", "number of churned subscribers", "churn count", "churned users count"
+  → `churned_subscribers`
+- "retention", "retention rate", "% retained", "how sticky"
+  → `retention_rate`
+- "revenue", "sales", "income" → `total_revenue`;  "MRR", "recurring revenue" → `mrr`
+
+CHURN IS MONTHLY AND EVENT-BASED. `churn_rate` is computed on fct_mrr_monthly and
+time-filtered by the month the churn EVENT happened. This is the governed definition and
+it matches the dashboard. `churned_subscribers` is a dim_subscribers snapshot count on a
+different grain, so the two are NOT interchangeable and their numbers will not reconcile —
+which is exactly why the rule above is mandatory rather than advisory.
 
 ## TIME GRANULARITIES CONSTRAINTS
 {grains_section}
@@ -541,6 +581,16 @@ Output:
 User: "Show me churn rate by country this year"
 Output:
 {{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["country"], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-05-27", "relative": "this_year"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "Show churn by plan type for 2025"
+(A bare "churn" with no count wording → churn_rate, never churned_subscribers.)
+Output:
+{{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2025-01-01", "end_date": "2025-12-31", "relative": null}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "How many subscribers churned in 2025, by plan type?"
+(Explicit count wording → churned_subscribers.)
+Output:
+{{"query_type": "metric_query", "metrics": ["churned_subscribers"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2025-01-01", "end_date": "2025-12-31", "relative": null}}, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "What is the LTV by acquisition channel?"
 Output:

@@ -38,6 +38,18 @@ _FANOUT_PAIRS: set[frozenset[str]] = {
     frozenset({"fct_mrr_monthly", "stg_recommendation_events"}),
 }
 
+# Ratio building blocks: metrics that exist only because MetricFlow requires a
+# ratio's numerator/denominator to be metrics rather than raw measures. They are
+# never a valid answer to a user's question on their own — exposing them to the
+# LLM just adds near-duplicate candidates to an already ambiguous term (a bare
+# "churn" matched churn_rate, churned_subscribers AND monthly_churned_subscribers,
+# and the extractor picked differently run to run). Still resolvable by name via
+# get_metric() so churn_rate/retention_rate keep compiling.
+_INTERNAL_METRICS: frozenset[str] = frozenset({
+    "monthly_churned_subscribers",
+    "monthly_subscriber_base",
+})
+
 # Allowed cross-metric joins (same grain or safe via bridge)
 _ALLOWED_JOINS: dict[str, list[str]] = {
     "mrr": ["expansion_mrr", "churn_rate", "total_subscribers"],
@@ -199,8 +211,20 @@ class MetricRegistry:
         return self._metrics.get(name.lower())
 
     def list_metrics(self) -> list[MetricDefinition]:
-        """Return all certified metrics."""
+        """Return all certified metrics, including ratio building blocks."""
         return list(self._metrics.values())
+
+    def list_user_facing_metrics(self) -> list[MetricDefinition]:
+        """
+        Return certified metrics minus ratio building blocks (:data:`_INTERNAL_METRICS`).
+
+        Use this for anything the user or the LLM sees — prompt construction,
+        the schema-question answer, out-of-scope suggestions. Use
+        :meth:`list_metrics` only when you genuinely need the full set.
+        """
+        return [
+            m for name, m in self._metrics.items() if name not in _INTERNAL_METRICS
+        ]
 
     def get_all_metrics(self) -> list[dict]:
         """Return raw YAML dicts for all certified metrics (used by the RAG indexer)."""

@@ -66,6 +66,35 @@ class TestMetricRegistryLoad:
             assert m.description, f"Metric '{m.name}' missing description."
 
 
+class TestUserFacingMetrics:
+    """Ratio building blocks must never reach the LLM prompt as selectable metrics."""
+
+    def test_building_blocks_hidden_from_user_facing_list(
+        self, registry: MetricRegistry
+    ) -> None:
+        names = {m.name for m in registry.list_user_facing_metrics()}
+        assert "monthly_churned_subscribers" not in names
+        assert "monthly_subscriber_base" not in names
+
+    def test_real_metrics_still_present(self, registry: MetricRegistry) -> None:
+        names = {m.name for m in registry.list_user_facing_metrics()}
+        assert {"churn_rate", "churned_subscribers", "mrr"} <= names
+
+    def test_list_metrics_still_returns_building_blocks(
+        self, registry: MetricRegistry
+    ) -> None:
+        """The unfiltered list is unchanged — only the user-facing view is narrowed."""
+        names = {m.name for m in registry.list_metrics()}
+        assert "monthly_churned_subscribers" in names
+
+    def test_building_blocks_still_resolvable_by_name(
+        self, registry: MetricRegistry
+    ) -> None:
+        """Hiding them from the prompt must not break churn_rate's ratio compilation."""
+        assert registry.get_metric("monthly_churned_subscribers") is not None
+        assert registry.is_certified_metric("monthly_subscriber_base")
+
+
 class TestMetricRegistryGetMetric:
     def test_get_metric_mrr(self, registry: MetricRegistry) -> None:
         """mrr should return a MetricDefinition with correct label."""

@@ -7,7 +7,7 @@ import TopBar from '../components/TopBar';
 import LoadingSpinner from '../components/LoadingSpinner';
 import QueryProgress from '../components/QueryProgress';
 import QueryResultPanel from '../components/QueryResultPanel';
-import { postQuery } from '../api/query';
+import { postQuery, agentTextFromResponse } from '../api/query';
 
 const CLAY_SHADOW = `16px 16px 32px rgba(13,148,136,0.12), -10px -10px 24px rgba(255,255,255,0.9), inset 6px 6px 12px rgba(13,148,136,0.04), inset -6px -6px 12px rgba(255,255,255,1)`;
 const CLAY_INSET  = `inset 8px 8px 16px rgba(13,148,136,0.08), inset -8px -8px 16px rgba(255,255,255,0.9)`;
@@ -138,8 +138,20 @@ export default function QueryPage() {
     setQueryText('');
     setLoading(true);
 
+    // This page stores turn PAIRS ({ query, response }) rather than role-tagged
+    // messages, so flatten to the same shape the dashboard chat sends. `history`
+    // here is the pre-append value, so it excludes the question being asked now —
+    // that travels as `query`. buildHistory() drops blanks and truncates.
+    const priorTurns = history.flatMap(item => {
+      const turns = [{ role: 'user', content: item.query || '' }];
+      if (item.response) {
+        turns.push({ role: 'agent', content: agentTextFromResponse(item.response) });
+      }
+      return turns;
+    });
+
     try {
-      const data = await postQuery(currentQuery, [], {
+      const data = await postQuery(currentQuery, priorTurns, {
         include_sql:     includeSql,
         include_lineage: includeLineage,
         dry_run:         dryRun,

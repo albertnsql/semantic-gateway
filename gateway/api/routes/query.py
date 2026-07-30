@@ -205,7 +205,7 @@ def _generate_schema_response(query: str, registry, settings) -> str:
         return (response.choices[0].message.content or "").strip()
     except Exception as exc:
         logger.warning("Schema response generation failed: %s", exc)
-        all_metric_names = [m.name for m in registry.list_metrics()]
+        all_metric_names = [m.name for m in registry.list_user_facing_metrics()]
         example_metric = all_metric_names[0] if all_metric_names else "mrr"
         return (
             "I can help you understand what's available in this system.\n"
@@ -278,11 +278,14 @@ async def submit_query(
 
     # ── Stage 1: Intent extraction (includes query_type routing) ─────────────
     try:
-        available_metrics    = [m.name for m in registry.list_metrics()]
+        # User-facing list only: ratio building blocks (monthly_churned_subscribers,
+        # monthly_subscriber_base) must not reach the prompt as selectable metrics.
+        _user_facing         = registry.list_user_facing_metrics()
+        available_metrics    = [m.name for m in _user_facing]
         available_dims       = registry.get_all_dimension_map()
         available_time_grains = {
             m.name: registry.get_valid_time_grains_for_metric(m.name)
-            for m in registry.list_metrics()
+            for m in _user_facing
         }
         intent = await anyio.to_thread.run_sync(
             partial(
@@ -326,7 +329,7 @@ async def submit_query(
         )
 
     if intent.query_type == "out_of_scope":
-        all_metric_names = [m.name for m in registry.list_metrics()]
+        all_metric_names = [m.name for m in registry.list_user_facing_metrics()]
         suggested_query = build_out_of_scope_suggestion(body.query, all_metric_names)
         message = (
             "That's a great question, but it requires reasoning about causes and context "

@@ -299,6 +299,79 @@ class TestInvalidJsonRaises:
             extractor.extract("some query", AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
 
 
+class TestConversationHistory:
+    """
+    Blank turns must never reach the LLM.
+
+    The dashboard chat stored its answers on `raw` and sent `content: ''`, so every
+    assistant turn arrived empty — the model saw the user's prior questions but none
+    of its own answers, and could not anchor on a metric it had already chosen.
+    The frontend now populates `content`; this is the gateway-side guarantee that no
+    other caller can reintroduce it.
+    """
+
+    @staticmethod
+    def _sent_messages(extractor) -> list[dict]:
+        return extractor._primary_client.chat.completions.create.call_args.kwargs["messages"]
+
+    @staticmethod
+    def _run(extractor, history):
+        extractor._primary_client.chat.completions.create.return_value = _mock_llm_response(
+            _valid_intent_json()
+        )
+        extractor.extract(
+            "Show churn by plan type for 2025",
+            AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS,
+            history=history,
+        )
+
+    def test_blank_agent_turns_are_dropped(self) -> None:
+        extractor = _make_extractor()
+        self._run(extractor, [
+            SimpleNamespace(role="user", content="Show churn by plan type for 2026"),
+            SimpleNamespace(role="agent", content=""),
+        ])
+        sent = self._sent_messages(extractor)
+        assert all(m["content"].strip() for m in sent), "a blank turn reached the LLM"
+        assert any("2026" in m["content"] for m in sent), "real user turn was lost"
+
+    def test_whitespace_only_turns_are_dropped(self) -> None:
+        extractor = _make_extractor()
+        self._run(extractor, [SimpleNamespace(role="agent", content="   \n  ")])
+        assert all(m["content"].strip() for m in self._sent_messages(extractor))
+
+    def test_populated_agent_turns_survive_as_assistant(self) -> None:
+        extractor = _make_extractor()
+        self._run(extractor, [
+            SimpleNamespace(role="user", content="Show churn by plan type for 2026"),
+            SimpleNamespace(role="agent", content="Churn rate was highest on basic."),
+        ])
+        sent = self._sent_messages(extractor)
+        assistant = [m for m in sent if m["role"] == "assistant"]
+        assert len(assistant) == 1
+        assert "highest on basic" in assistant[0]["content"]
+
+    def test_truncation_counts_only_non_empty_turns(self) -> None:
+        """Blanks must not consume the 5-turn budget that real turns need."""
+        extractor = _make_extractor()
+        history = []
+        for i in range(6):
+            history.append(SimpleNamespace(role="user", content=f"question {i}"))
+            history.append(SimpleNamespace(role="agent", content=""))
+        self._run(extractor, history)
+        sent = self._sent_messages(extractor)
+        # system + 5 surviving user turns + the current question
+        assert len([m for m in sent if m["content"].startswith("question ")]) == 5
+        assert any("question 5" in m["content"] for m in sent), "newest turn dropped"
+
+    def test_no_history_sends_only_system_and_query(self) -> None:
+        extractor = _make_extractor()
+        self._run(extractor, [])
+        sent = self._sent_messages(extractor)
+        assert len(sent) == 2
+        assert sent[0]["role"] == "system"
+
+
 class TestBuildSystemPrompt:
     def test_system_prompt_contains_metrics(self) -> None:
         """System prompt must list all available metrics."""
@@ -327,3 +400,25 @@ class TestBuildSystemPrompt:
         prompt = extractor.build_system_prompt(AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
         assert isinstance(prompt, str)
         assert len(prompt) > 100  # sanity: should be substantial
+
+    def test_system_prompt_disambiguates_bare_churn(self) -> None:
+        """
+        A bare "churn" must be pinned to churn_rate in the prompt.
+
+        Without this, "Show churn by plan type" resolved to churned_subscribers on
+        one run and churn_rate on the next, returning two contradictory answers
+        from the same question (production incident, 2026-07-30).
+        """
+        extractor = _make_extractor()
+        prompt = extractor.build_system_prompt(AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
+        assert "METRIC DISAMBIGUATION" in prompt
+        assert "RATE BEATS COUNT" in prompt
+        # The bare-churn worked example must be present, not just the rule.
+        assert "Show churn by plan type" in prompt
+
+    def test_system_prompt_keeps_count_path_for_explicit_count(self) -> None:
+        """The disambiguation rule must not collapse every churn query to a rate."""
+        extractor = _make_extractor()
+        prompt = extractor.build_system_prompt(AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
+        assert "churned_subscribers" in prompt
+        assert "how many" in prompt.lower()
