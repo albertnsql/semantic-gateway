@@ -24,6 +24,7 @@ import re
 import subprocess
 import concurrent.futures
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -427,7 +428,12 @@ class SQLGenerator:
         self._settings = settings
         self._pool = pool                        # SnowflakePool — injected at startup; None = legacy mode
         self._template_cache = template_cache    # SQLTemplateCache — injected at startup; None = disabled
-        self._warm_engine = warm_engine          # WarmMetricFlowEngine — None = subprocess only
+        # WarmMetricFlowEngine. Built lazily on the first compile rather than at
+        # startup: it costs ~15s and ~100 MB, and a process that never misses the
+        # template cache should never pay either. Tests inject a stub directly.
+        self._warm_engine = warm_engine
+        self._warm_engine_attempted = warm_engine is not None
+        self._warm_engine_lock = threading.Lock()
 
     # ──────────────────────────────────────────────── public
 
@@ -711,6 +717,45 @@ class SQLGenerator:
             sql_review=review_result,
         )
 
+    def _get_warm_engine(self):
+        """
+        Return the warm MetricFlow engine, building it on first need.
+
+        Both success and failure are memoised: a deployment where the engine
+        cannot build must not re-pay the ~15s attempt on every cache miss. The
+        lock makes the build happen once even if several ``anyio`` worker threads
+        miss the template cache simultaneously.
+
+        Returns:
+            A ``WarmMetricFlowEngine``, or ``None`` if disabled or unavailable.
+        """
+        if self._warm_engine_attempted:
+            return self._warm_engine
+
+        with self._warm_engine_lock:
+            if self._warm_engine_attempted:  # another thread built it while we waited
+                return self._warm_engine
+            self._warm_engine_attempted = True
+
+            if not getattr(self._settings, "metricflow_in_process", False):
+                logger.info(
+                    "In-process MetricFlow disabled by config — using the `mf` subprocess."
+                )
+                return None
+
+            from core.metricflow_engine import WarmMetricFlowEngine
+
+            project_dir = getattr(self._settings, "dbt_project_dir", "")
+            if not project_dir:
+                logger.warning("dbt_project_dir is unset — cannot build the warm engine.")
+                return None
+
+            self._warm_engine = WarmMetricFlowEngine.try_build(
+                dbt_project_dir=project_dir,
+                dbt_profiles_dir=project_dir,
+            )
+            return self._warm_engine
+
     def _compile_metricflow(self, mf_command: list[str]) -> str:
         """
         Compile *mf_command* to SQL, preferring the warm in-process engine.
@@ -725,10 +770,11 @@ class SQLGenerator:
         Returns:
             Compiled SQL.
         """
-        if self._warm_engine is not None:
+        engine = self._get_warm_engine()
+        if engine is not None:
             started = time.perf_counter()
             try:
-                sql = self._warm_engine.explain_argv(mf_command)
+                sql = engine.explain_argv(mf_command)
                 logger.info(
                     "MetricFlow compiled in-process in %.0f ms (no subprocess).",
                     (time.perf_counter() - started) * 1000,

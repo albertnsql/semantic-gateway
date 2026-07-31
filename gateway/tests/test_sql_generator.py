@@ -595,3 +595,98 @@ def test_has_top_level_select_distinguishes_truncation() -> None:
     assert sql_generator._has_top_level_select("SELECT * FROM (SELECT 1) x")
     assert not sql_generator._has_top_level_select("WITH c AS (SELECT 1)")
     assert not sql_generator._has_top_level_select("WITH c AS (\n SELECT 1\n)\n")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Lazy construction of the warm engine.
+#
+# Building it costs ~15s and ~100 MB, so it must happen on the first compile
+# rather than at startup — otherwise every TestClient lifespan boot pays it, and
+# so does a deployment that never misses the template cache.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _settings_with_engine(**over):
+    s = _settings()
+    s.metricflow_in_process = True
+    s.dbt_project_dir = "../dbt_streaming_analytics/streaming_analytics"
+    for k, v in over.items():
+        setattr(s, k, v)
+    return s
+
+
+def test_engine_is_not_built_when_config_disables_it(monkeypatch) -> None:
+    built = []
+    generator = SQLGenerator(_settings_with_engine(metricflow_in_process=False))
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 1"
+    )
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build",
+        classmethod(lambda cls, **kw: built.append(kw) or None),
+    )
+
+    generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"])
+    assert built == [], "try_build ran despite metricflow_in_process=False"
+
+
+def test_engine_build_is_attempted_only_once(monkeypatch) -> None:
+    """A deployment where the engine cannot build must not re-pay ~15s per miss."""
+    calls = []
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build",
+        classmethod(lambda cls, **kw: calls.append(kw) or None),
+    )
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 1"
+    )
+    generator = SQLGenerator(_settings_with_engine())
+
+    for _ in range(4):
+        generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"])
+
+    assert len(calls) == 1, f"try_build ran {len(calls)} times, expected 1"
+
+
+def test_lazy_engine_is_used_once_built(monkeypatch) -> None:
+    fake = _FakeWarmEngine("SELECT 'lazy'")
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build", classmethod(lambda cls, **kw: fake)
+    )
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess",
+        lambda self, cmd: pytest.fail("subprocess ran despite a working lazy engine"),
+    )
+    generator = SQLGenerator(_settings_with_engine())
+
+    argv = ["mf", "query", "--metrics", "mrr", "--explain"]
+    assert generator._compile_metricflow(argv) == "SELECT 'lazy'"
+    assert generator._compile_metricflow(argv) == "SELECT 'lazy'"
+    assert len(fake.calls) == 2
+
+
+def test_injected_engine_skips_the_lazy_build(monkeypatch) -> None:
+    """An explicitly injected engine must be used as-is — no build attempt."""
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build",
+        classmethod(lambda cls, **kw: pytest.fail("try_build ran for an injected engine")),
+    )
+    generator = SQLGenerator(_settings_with_engine(), warm_engine=_FakeWarmEngine("SELECT 9"))
+
+    assert generator._compile_metricflow(
+        ["mf", "query", "--metrics", "mrr", "--explain"]
+    ) == "SELECT 9"
+
+
+def test_missing_dbt_project_dir_disables_the_engine(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 'sub'"
+    )
+    generator = SQLGenerator(_settings_with_engine(dbt_project_dir=""))
+
+    assert generator._compile_metricflow(
+        ["mf", "query", "--metrics", "mrr", "--explain"]
+    ) == "SELECT 'sub'"
