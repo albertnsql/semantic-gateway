@@ -123,6 +123,9 @@ class ManifestParser:
         self._assert_loaded()
         visited: set[str] = set()
         result: list[str] = []
+        # Raw sources are terminal (nothing upstream of them) and form the deepest
+        # layer, so they are collected separately and prepended.
+        sources: list[str] = []
         queue: deque[str] = deque([model_name])
 
         while queue:
@@ -138,11 +141,24 @@ class ManifestParser:
             for dep in deps:
                 if dep.startswith(_MODEL_PREFIX):
                     short = dep[len(_MODEL_PREFIX):]
-                    if short not in visited:
+                    # `visited` only marks nodes already EXPANDED, so two parents
+                    # sharing a child both appended it — fct_mrr_monthly listed
+                    # stg_subscription_plan_history twice. Check `result` as well.
+                    if short not in visited and short not in result:
                         result.append(short)
                         queue.append(short)
+                elif dep.startswith(_SOURCE_PREFIX):
+                    # Follow source. nodes too. Skipping them meant a STAGING-backed
+                    # metric resolved to an empty chain, because a staging model's only
+                    # parent is a source — which is why lineage for
+                    # clicked_recommendations / recommendation_ctr fell back to
+                    # hardcoded values (sem_recommendation_events maps to
+                    # stg_recommendation_events, not to a mart like every other metric).
+                    short = dep[len(_SOURCE_PREFIX):]
+                    if short not in sources:
+                        sources.append(short)
 
-        return result
+        return sources + result
 
     def get_model_description(self, model_name: str) -> str:
         """

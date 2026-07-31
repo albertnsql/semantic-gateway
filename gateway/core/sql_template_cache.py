@@ -352,6 +352,20 @@ class SQLTemplateCache:
         key = self.make_key(metrics, dimensions)
         now = time.time()
 
+        # MetricFlow now compiles on EVERY query, so set() is called on every request
+        # rather than only on a cache miss. Re-persisting identical SQL to disk each
+        # time is pure I/O (and, when the disk file is the committed build artifact,
+        # pure git churn). Refresh the TTL in memory and skip the write.
+        existing = self._store.get(key)
+        if existing is not None and existing["template"]["sql_template"] == sql_template:
+            existing["expires_at"] = now + self._ttl
+            self._store.move_to_end(key)
+            logger.debug(
+                "SQLTemplateCache unchanged for %s × %s — TTL refreshed, no disk write.",
+                metrics, dimensions,
+            )
+            return
+
         if key in self._store:
             self._store.move_to_end(key)
 

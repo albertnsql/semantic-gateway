@@ -7,7 +7,9 @@ Loaded once at startup; injected into services via dependency injection.
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -85,6 +87,16 @@ class Settings(BaseSettings):
     # lifespan per test, so ~17 concurrent engine builds would burn CPU and ~100 MB
     # each. Tests never miss the template cache, so they never need the engine.
     metricflow_prewarm: bool = "pytest" not in sys.modules
+
+    # Where the compiled-template artifact lives. Overridable so the test suite does
+    # not write to the COMMITTED build artifact: test_query_endpoint.py boots the real
+    # lifespan per test, which loads (and, via CacheWarmer, wrote to) this file and
+    # left a spurious git diff after every run. Under pytest it points at a temp file.
+    sql_template_cache_path: str = (
+        os.path.join(tempfile.gettempdir(), "sql_template_cache.test.json")
+        if "pytest" in sys.modules
+        else "./.sql_template_cache.json"
+    )
     semantic_models_path: str = (
         "../dbt_streaming_analytics/streaming_analytics/models/semantic"
     )

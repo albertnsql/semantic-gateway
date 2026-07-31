@@ -69,7 +69,24 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
     Returns an empty string on any failure so the caller can fail-open.
     """
     if not results:
-        return ""
+        # Deterministic message rather than silence. An empty result used to render as
+        # "No conversational summary available for this result", which reads like the
+        # summariser broke rather than like the query legitimately matched nothing —
+        # and gave no hint that a filter might be the reason.
+        _scope = ""
+        _filters = getattr(intent, "filters", None) or []
+        if _filters:
+            _scope = " with " + ", ".join(
+                f"{f.column} {f.operator} {f.value}" for f in _filters
+            )
+        _window = ""
+        if getattr(intent, "time_range", None):
+            _window = f" between {intent.time_range.start_date} and {intent.time_range.end_date}"
+        return (
+            f"No rows matched this query. **{', '.join(getattr(intent, 'metrics', []) or ['the metric'])}**"
+            f"{_window}{_scope} returned no data. If you expected results, check whether the "
+            "time range covers loaded data or whether a filter is narrower than intended."
+        )
     try:
         from openai import OpenAI as _OpenAI
 
@@ -129,7 +146,20 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "2. Always use the provided metric_value, max_value, and min_value — never estimate numbers from the preview rows. "
             "3. Produce exactly 2 sentences. First sentence: the breakdown with specific names and numbers. Second sentence: the business interpretation. "
             "4. Format all revenue and monetary values with a '$' sign, commas, and 2 decimal places (e.g., $1,234.56). Format percentages with a '%' sign and up to 2 decimal places (e.g., 25.4%). "
-            "5. Wrap all numbers, percentages, and monetary values in double asterisks so they can be highlighted (e.g., **$1,234.56**, **25.4%**, or **1,234**). Do NOT use any other markdown formatting (no headers, no bullet points)."
+            "5. Wrap all numbers, percentages, and monetary values in double asterisks so they can be highlighted (e.g., **$1,234.56**, **25.4%**, or **1,234**). Do NOT use any other markdown formatting (no headers, no bullet points). "
+            # You see values, not semantics. You cannot tell whether the metric chosen
+            # upstream answers the question that was asked, so stating a cause or
+            # prescribing an action lends unearned confidence to an unverified choice.
+            # A previous version wrote 'retention efforts should be prioritized in the
+            # US market' from three numbers, while the query was silently unfiltered.
+            "6. DESCRIBE, do not advise. State what the numbers show and, at most, what "
+            "they imply about the segments named. NEVER assert a cause ('because', "
+            "'driven by', 'due to') and NEVER recommend an action ('should', 'needs to', "
+            "'consider', 'prioritise', 're-evaluate'). You are given values only — you "
+            "cannot see why they are what they are. "
+            "7. Describe ONLY the scope you were given. If a filter is listed, say so "
+            "explicitly ('among premium subscribers…'); if none is listed, do not imply "
+            "one."
         )
         user_prompt = (
             f"The analyst asked: \"{query}\"\n\n"

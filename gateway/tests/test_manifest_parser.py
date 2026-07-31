@@ -201,3 +201,51 @@ class TestManifestParserLineageGraph:
         p.load(MANIFEST_PATH)
         models = p.get_all_models()
         assert len(models) > 10
+
+
+class TestManifestParserSourceLineage:
+    """
+    Raw sources must appear in the upstream chain.
+
+    get_upstream_models() followed only `model.` dependencies, so a STAGING-backed
+    metric resolved to an empty chain — a staging model's only parent is a source.
+    That is why lineage for clicked_recommendations / recommendation_ctr fell back
+    to hardcoded values while every mart-backed metric resolved fine.
+    """
+
+    def test_staging_model_reports_its_raw_source(self) -> None:
+        if not Path(MANIFEST_PATH).exists():
+            pytest.skip("Real manifest.json not available.")
+        p = ManifestParser()
+        p.load(MANIFEST_PATH)
+        upstream = p.get_upstream_models("stg_recommendation_events")
+        assert upstream, "staging model resolved to an empty chain"
+        assert any(u.startswith("raw.") for u in upstream)
+
+    def test_mart_chain_includes_sources_and_models(self) -> None:
+        if not Path(MANIFEST_PATH).exists():
+            pytest.skip("Real manifest.json not available.")
+        p = ManifestParser()
+        p.load(MANIFEST_PATH)
+        upstream = p.get_upstream_models("fct_mrr_monthly")
+        assert any(u.startswith("raw.") for u in upstream), "no raw sources in the chain"
+        assert "int_subscription_periods" in upstream
+
+    def test_upstream_chain_has_no_duplicates(self) -> None:
+        if not Path(MANIFEST_PATH).exists():
+            pytest.skip("Real manifest.json not available.")
+        p = ManifestParser()
+        p.load(MANIFEST_PATH)
+        upstream = p.get_upstream_models("fct_mrr_monthly")
+        assert len(upstream) == len(set(upstream)), f"duplicates in chain: {upstream}"
+
+    def test_sources_precede_models(self) -> None:
+        """Dependencies-first ordering: raw sources are the deepest layer."""
+        if not Path(MANIFEST_PATH).exists():
+            pytest.skip("Real manifest.json not available.")
+        p = ManifestParser()
+        p.load(MANIFEST_PATH)
+        upstream = p.get_upstream_models("fct_mrr_monthly")
+        raw_positions = [i for i, u in enumerate(upstream) if u.startswith("raw.")]
+        model_positions = [i for i, u in enumerate(upstream) if not u.startswith("raw.")]
+        assert max(raw_positions) < min(model_positions)

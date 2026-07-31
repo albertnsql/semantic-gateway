@@ -49,6 +49,20 @@ else:
 logger = logging.getLogger(__name__)
 
 
+# Physical time columns behind the semantic layer's time dimensions. A filter on any
+# of these duplicates `time_range` — see the guard in :meth:`IntentExtractor.extract`.
+_TIME_DIMENSION_COLUMNS: frozenset[str] = frozenset({
+    "churn_date",
+    "signup_date",
+    "period_month",
+    "payment_date",
+    "session_start",
+    "event_timestamp",
+    "cohort_month",
+    "metric_time",
+})
+
+
 # ──────────────────────────────────────────────── Data models
 
 class TimeRange(BaseModel):
@@ -74,6 +88,32 @@ class FilterClause(BaseModel):
     column: str
     operator: str  # eq | neq | gt | gte | lt | lte | in
     value: str | list[str]
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _coerce_stringified_list(cls, v):
+        """
+        Turn a stringified list into a real list.
+
+        The LLM sometimes emits an IN value as ``"['basic', 'standard', 'premium']"``
+        rather than a JSON array. Every consumer branches on
+        ``isinstance(value, list)``, so a stringified list was rendered as ONE
+        literal: ``IN ('[''basic'', ''standard'', ''premium'']')`` — which matches
+        nothing and silently returns zero rows. Normalising here fixes all three
+        SQL paths (outer predicates, MetricFlow ``--where``, the fallback builder)
+        at once rather than patching each.
+        """
+        if isinstance(v, str):
+            stripped = v.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                import ast
+                try:
+                    parsed = ast.literal_eval(stripped)
+                except (ValueError, SyntaxError):
+                    return v
+                if isinstance(parsed, (list, tuple)):
+                    return [str(item) for item in parsed]
+        return v
 
 
 class QueryIntent(BaseModel):
@@ -327,6 +367,28 @@ class IntentExtractor:
                     parsed["aggregation_level"] = _unit  # already singular
                 # If nothing matches, leave as-is and let grain validation handle it
 
+        # Drop filters that merely restate the time range. With conversation history
+        # enabled the LLM started emitting predicates like
+        # `subscriber__churn_date__day >= 2025-01-01` alongside an identical
+        # time_range; pushed through MetricFlow's --where that double-constrains the
+        # query. Time belongs in time_range only. A deterministic guard here means we
+        # do not depend on the prompt rule holding.
+        if parsed.get("time_range") and parsed.get("filters"):
+            _kept, _dropped = [], []
+            for _f in parsed["filters"]:
+                _col = str((_f or {}).get("column", "")).lower()
+                _bare = _col.split("__")[-1] if "__" in _col else _col
+                # strip a trailing grain suffix, e.g. churn_date__day → churn_date
+                if _col.endswith(("__day", "__week", "__month", "__quarter", "__year")):
+                    _bare = _col.rsplit("__", 1)[0].split("__")[-1]
+                (_dropped if _bare in _TIME_DIMENSION_COLUMNS else _kept).append(_f)
+            if _dropped:
+                logger.info(
+                    "Dropped %d time-dimension filter(s) that duplicate time_range: %s",
+                    len(_dropped), [d.get("column") for d in _dropped],
+                )
+                parsed["filters"] = _kept
+
         try:
             intent = QueryIntent(
                 original_query=query,
@@ -515,6 +577,26 @@ present) are always "metric_query".
 7. When more than one certified metric matches the user's wording, resolve it with the
    METRIC DISAMBIGUATION rules below. Never pick arbitrarily between near-synonyms —
    the same question must always resolve to the same metric.
+
+## CONVERSATION HISTORY — scope rules, NEVER VIOLATE
+
+Earlier turns may appear before the current question. They exist ONLY to resolve a
+question that is grammatically incomplete on its own.
+
+1. `filters` MUST come from the CURRENT question. Never carry a filter forward from
+   an earlier turn. If the user narrowed to one country last turn and this turn asks
+   a broader question, the broader question has NO filter.
+2. `metrics`, `dimensions` and `time_range` likewise come from the current question
+   whenever it states them.
+3. Use history ONLY when the current question cannot stand alone — a bare pronoun or
+   fragment such as "and for 2025?", "what about premium?", "break that down by
+   country". Then inherit the missing parts and nothing else.
+4. If the current question is self-contained, IGNORE history completely. "How many
+   subscribers churned in 2025" is self-contained: it means ALL subscribers, even if
+   the previous turn asked about the US.
+5. Never emit a filter on a metric's own time dimension (churn_date, period_month,
+   signup_date, payment_date, session_start, event_timestamp). Time belongs in
+   `time_range`; duplicating it as a filter double-constrains the query.
 
 ## METRIC DISAMBIGUATION — apply before choosing a metric
 

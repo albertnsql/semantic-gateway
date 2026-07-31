@@ -518,17 +518,122 @@ def test_try_build_returns_none_without_a_dbt_project(tmp_path) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+
+# ------------------------------------------------------------------------------
+# Lazy construction of the warm engine.
+#
+# Building it costs ~27s and ~100 MB, so it must happen off the request path.
+# Both success and failure are memoised.
+# ------------------------------------------------------------------------------
+
+def _settings_with_engine(**over):
+    s = _settings()
+    s.metricflow_in_process = True
+    s.dbt_project_dir = "../dbt_streaming_analytics/streaming_analytics"
+    for k, v in over.items():
+        setattr(s, k, v)
+    return s
+
+
+def test_engine_is_not_built_when_config_disables_it(monkeypatch) -> None:
+    built = []
+    generator = SQLGenerator(_settings_with_engine(metricflow_in_process=False))
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 1"
+    )
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build",
+        classmethod(lambda cls, **kw: built.append(kw) or None),
+    )
+
+    generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"])
+    assert built == [], "try_build ran despite metricflow_in_process=False"
+
+
+def test_engine_build_is_attempted_only_once(monkeypatch) -> None:
+    """A deployment where the engine cannot build must not re-pay ~27s per miss."""
+    calls = []
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build",
+        classmethod(lambda cls, **kw: calls.append(kw) or None),
+    )
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 1"
+    )
+    generator = SQLGenerator(_settings_with_engine())
+
+    for _ in range(4):
+        generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"])
+
+    assert len(calls) == 1, f"try_build ran {len(calls)} times, expected 1"
+
+
+def test_lazy_engine_is_used_once_built(monkeypatch) -> None:
+    fake = _FakeWarmEngine("SELECT 'lazy'")
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build", classmethod(lambda cls, **kw: fake)
+    )
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess",
+        lambda self, cmd: pytest.fail("subprocess ran despite a working lazy engine"),
+    )
+    generator = SQLGenerator(_settings_with_engine())
+
+    argv = ["mf", "query", "--metrics", "mrr", "--explain"]
+    assert generator._compile_metricflow(argv) == "SELECT 'lazy'"
+    assert generator._compile_metricflow(argv) == "SELECT 'lazy'"
+    assert len(fake.calls) == 2
+
+
+def test_injected_engine_skips_the_lazy_build(monkeypatch) -> None:
+    """An explicitly injected engine must be used as-is - no build attempt."""
+    import core.metricflow_engine as me
+    monkeypatch.setattr(
+        me.WarmMetricFlowEngine, "try_build",
+        classmethod(lambda cls, **kw: pytest.fail("try_build ran for an injected engine")),
+    )
+    generator = SQLGenerator(_settings_with_engine(), warm_engine=_FakeWarmEngine("SELECT 9"))
+
+    assert generator._compile_metricflow(
+        ["mf", "query", "--metrics", "mrr", "--explain"]
+    ) == "SELECT 9"
+
+
+def test_missing_dbt_project_dir_disables_the_engine(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 'sub'"
+    )
+    generator = SQLGenerator(_settings_with_engine(dbt_project_dir=""))
+
+    assert generator._compile_metricflow(
+        ["mf", "query", "--metrics", "mrr", "--explain"]
+    ) == "SELECT 'sub'"
+
+
+def test_prewarm_is_disabled_under_pytest() -> None:
+    """
+    The suite must never pre-warm the engine.
+
+    tests/test_query_endpoint.py boots the real lifespan per test, so leaving
+    pre-warm on would start ~17 concurrent engine builds at ~27s and ~100 MB each.
+    """
+    from config import Settings
+
+    assert Settings().metricflow_prewarm is False
+
+
 # ------------------------------------------------------------------------------
 # MetricFlow --explain output parsing.
 #
-# The parser used to stop at the first blank line. MetricFlow puts one between
-# the CTE list and the outer SELECT for multi-CTE queries, so `ltv` grouped by a
-# joined dimension was truncated to its CTE -- 155 of 1882 chars, invalid SQL,
-# silently cached, and shipped inside .sql_template_cache.json.
+# The parser used to stop at the first blank line. MetricFlow puts one between the
+# CTE list and the outer SELECT for multi-CTE queries, so `ltv` grouped by a joined
+# dimension was truncated to its CTE -- 155 of 1882 chars, invalid SQL, silently
+# cached, and shipped inside .sql_template_cache.json.
 # ------------------------------------------------------------------------------
 
-# Mirrors real `mf query --metrics ltv --group-by subscriber__country --explain`
-# output: a CTE, a BLANK LINE, then the outer SELECT.
 _LTV_STDOUT = """WITH sma_10005_cte AS (
   SELECT
     subscriber_id AS subscriber
@@ -597,122 +702,12 @@ def test_has_top_level_select_distinguishes_truncation() -> None:
     assert not sql_generator._has_top_level_select("WITH c AS (\n SELECT 1\n)\n")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Lazy construction of the warm engine.
-#
-# Building it costs ~15s and ~100 MB, so it must happen on the first compile
-# rather than at startup — otherwise every TestClient lifespan boot pays it, and
-# so does a deployment that never misses the template cache.
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _settings_with_engine(**over):
-    s = _settings()
-    s.metricflow_in_process = True
-    s.dbt_project_dir = "../dbt_streaming_analytics/streaming_analytics"
-    for k, v in over.items():
-        setattr(s, k, v)
-    return s
-
-
-def test_engine_is_not_built_when_config_disables_it(monkeypatch) -> None:
-    built = []
-    generator = SQLGenerator(_settings_with_engine(metricflow_in_process=False))
-    monkeypatch.setattr(
-        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 1"
-    )
-    import core.metricflow_engine as me
-    monkeypatch.setattr(
-        me.WarmMetricFlowEngine, "try_build",
-        classmethod(lambda cls, **kw: built.append(kw) or None),
-    )
-
-    generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"])
-    assert built == [], "try_build ran despite metricflow_in_process=False"
-
-
-def test_engine_build_is_attempted_only_once(monkeypatch) -> None:
-    """A deployment where the engine cannot build must not re-pay ~15s per miss."""
-    calls = []
-    import core.metricflow_engine as me
-    monkeypatch.setattr(
-        me.WarmMetricFlowEngine, "try_build",
-        classmethod(lambda cls, **kw: calls.append(kw) or None),
-    )
-    monkeypatch.setattr(
-        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 1"
-    )
-    generator = SQLGenerator(_settings_with_engine())
-
-    for _ in range(4):
-        generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"])
-
-    assert len(calls) == 1, f"try_build ran {len(calls)} times, expected 1"
-
-
-def test_lazy_engine_is_used_once_built(monkeypatch) -> None:
-    fake = _FakeWarmEngine("SELECT 'lazy'")
-    import core.metricflow_engine as me
-    monkeypatch.setattr(
-        me.WarmMetricFlowEngine, "try_build", classmethod(lambda cls, **kw: fake)
-    )
-    monkeypatch.setattr(
-        sql_generator.SQLGenerator, "_run_mf_subprocess",
-        lambda self, cmd: pytest.fail("subprocess ran despite a working lazy engine"),
-    )
-    generator = SQLGenerator(_settings_with_engine())
-
-    argv = ["mf", "query", "--metrics", "mrr", "--explain"]
-    assert generator._compile_metricflow(argv) == "SELECT 'lazy'"
-    assert generator._compile_metricflow(argv) == "SELECT 'lazy'"
-    assert len(fake.calls) == 2
-
-
-def test_injected_engine_skips_the_lazy_build(monkeypatch) -> None:
-    """An explicitly injected engine must be used as-is — no build attempt."""
-    import core.metricflow_engine as me
-    monkeypatch.setattr(
-        me.WarmMetricFlowEngine, "try_build",
-        classmethod(lambda cls, **kw: pytest.fail("try_build ran for an injected engine")),
-    )
-    generator = SQLGenerator(_settings_with_engine(), warm_engine=_FakeWarmEngine("SELECT 9"))
-
-    assert generator._compile_metricflow(
-        ["mf", "query", "--metrics", "mrr", "--explain"]
-    ) == "SELECT 9"
-
-
-def test_missing_dbt_project_dir_disables_the_engine(monkeypatch) -> None:
-    monkeypatch.setattr(
-        sql_generator.SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 'sub'"
-    )
-    generator = SQLGenerator(_settings_with_engine(dbt_project_dir=""))
-
-    assert generator._compile_metricflow(
-        ["mf", "query", "--metrics", "mrr", "--explain"]
-    ) == "SELECT 'sub'"
-
-
-def test_prewarm_is_disabled_under_pytest() -> None:
-    """
-    The suite must never pre-warm the engine.
-
-    tests/test_query_endpoint.py boots the real lifespan per test, so leaving
-    pre-warm on would start ~17 concurrent engine builds at ~27s and ~100 MB each.
-    Tests never miss the template cache, so they never need the engine.
-    """
-    from config import Settings
-
-    assert Settings().metricflow_prewarm is False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
 # MetricFlow-first ordering.
 #
-# The semantic layer is the source of truth and compiling from it costs ~60-96 ms
-# in production, so every query compiles. The template cache demotes to a
-# fallback for when the warm engine is unavailable — which is what stops a stale
-# or truncated committed template from ever being served on the happy path.
-# ──────────────────────────────────────────────────────────────────────────────
+# Every query compiles from the semantic layer; the template cache demotes to a
+# fallback for when the warm engine is unavailable.
+# ------------------------------------------------------------------------------
 
 _MRR_TEMPLATE = (
     "SELECT subscription__plan_type, SUM(mrr) AS mrr\n"
@@ -745,14 +740,14 @@ def test_metricflow_runs_even_when_the_template_cache_has_the_key(monkeypatch) -
 
 
 def test_template_cache_serves_when_no_warm_engine(monkeypatch) -> None:
-    """Without an engine the cache must still answer — never a 30s subprocess."""
+    """Without an engine the cache must still answer - never a 30s subprocess."""
     monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
     monkeypatch.setattr(
         SQLGenerator, "_run_mf_subprocess",
         lambda self, cmd: pytest.fail("subprocess ran while a cached template existed"),
     )
     cache = _StubTemplateCache(_MRR_TEMPLATE)
-    generator = SQLGenerator(_settings(), template_cache=cache)  # settings lack the flag
+    generator = SQLGenerator(_settings(), template_cache=cache)
 
     result = generator.generate(_mrr_plan_intent(), _validation())
 
@@ -777,13 +772,7 @@ def test_engine_error_falls_through_to_the_cache(monkeypatch) -> None:
 
 
 def test_filtered_query_reaches_metricflow_not_the_fallback_builder(monkeypatch) -> None:
-    """
-    With an engine available, filters compile via --where.
-
-    The fallback builder is a hand-written re-implementation of each metric and is
-    where the churn_date/signup_date divergence lives, so it must not be the
-    default route for filtered queries any more.
-    """
+    """With an engine available, filters compile via --where."""
     monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
     monkeypatch.setattr(
         SQLGenerator, "_build_fallback_sql",
@@ -802,3 +791,174 @@ def test_filtered_query_reaches_metricflow_not_the_fallback_builder(monkeypatch)
 
     assert "mf filtered" in result.compiled_sql
     assert "--where" in " ".join(engine.calls[0])
+
+
+# ------------------------------------------------------------------------------
+# Stringified IN lists.
+#
+# The LLM emits IN values as "['basic', 'standard', 'premium']" (a string), so the
+# string became ONE literal -- IN ('[''basic'', ...]') -- matching nothing and
+# silently returning 0 rows in production.
+# ------------------------------------------------------------------------------
+
+def test_stringified_in_list_is_coerced_to_a_real_list() -> None:
+    f = FilterClause(
+        column="subscription__plan_type",
+        operator="in",
+        value="['basic', 'standard', 'premium']",
+    )
+    assert f.value == ["basic", "standard", "premium"]
+
+
+def test_genuine_scalar_value_is_left_alone() -> None:
+    assert FilterClause(column="c", operator="eq", value="US").value == "US"
+    assert FilterClause(column="c", operator="eq", value="[not a list").value == "[not a list"
+
+
+def test_real_list_value_passes_through() -> None:
+    f = FilterClause(column="c", operator="in", value=["US", "UK"])
+    assert f.value == ["US", "UK"]
+
+
+def test_stringified_in_list_produces_matchable_sql() -> None:
+    """The regression: the outer predicate must list each value separately."""
+    sql = "SELECT subscription__plan_type, x FROM t GROUP BY subscription__plan_type"
+    wrapped = sql_generator.wrap_with_outer_predicates(
+        sql,
+        [(
+            "subscription__plan_type",
+            FilterClause(
+                column="subscription__plan_type",
+                operator="in",
+                value="['basic', 'standard', 'premium']",
+            ),
+        )],
+    )
+    assert "IN ('basic', 'standard', 'premium')" in wrapped
+    assert "''" not in wrapped, "value was double-escaped into one literal"
+
+# ------------------------------------------------------------------------------
+# MetricFlow --explain output parsing.
+#
+# The parser used to stop at the first blank line. MetricFlow puts one between
+# the CTE list and the outer SELECT for multi-CTE queries, so `ltv` grouped by a
+# joined dimension was truncated to its CTE -- 155 of 1882 chars, invalid SQL,
+# silently cached, and shipped inside .sql_template_cache.json.
+
+
+# ------------------------------------------------------------------------------
+# Parity guard: SQLGenerator._METRIC_TIME_COL vs the semantic layer.
+#
+# `churned_subscribers` was mapped to signup_date in TWO places while
+# sem_subscribers.yml declares agg_time_dimension: churn_date, so a filtered churn
+# count answered "who signed up in this range and has since churned". Nothing
+# connected the hand-written map to the YAML, so the drift was invisible.
+#
+# The chain is TWO hops: metric -> measure (metrics/*.yml type_params) -> the
+# measure's agg_time_dimension (semantic/*.yml). A one-hop name match is wrong:
+# the metric `total_subscribers` deliberately uses the `active_subscribers_count`
+# measure (period_month), NOT the same-named measure (signup_date).
+#
+# Needs no Snowflake and no MetricFlow.
+# ------------------------------------------------------------------------------
+
+def _dbt_root():
+    import pathlib
+    return (
+        pathlib.Path(__file__).resolve().parents[2]
+        / "dbt_streaming_analytics" / "streaming_analytics"
+    )
+
+
+def _measure_time_dimensions() -> dict:
+    """measure name -> agg_time_dimension, from models/semantic/*.yml."""
+    import yaml
+
+    out = {}
+    for path in sorted((_dbt_root() / "models" / "semantic").glob("*.yml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for model in doc.get("semantic_models") or []:
+            for measure in model.get("measures") or []:
+                if measure.get("name") and measure.get("agg_time_dimension"):
+                    out[measure["name"]] = measure["agg_time_dimension"]
+    return out
+
+
+def _metric_definitions() -> dict:
+    """metric name -> its raw dict, from metrics/*.yml."""
+    import yaml
+
+    out = {}
+    for path in sorted((_dbt_root() / "metrics").glob("*.yml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for metric in doc.get("metrics") or []:
+            if metric.get("name"):
+                out[metric["name"]] = metric
+    return out
+
+
+def _expected_time_column(metric_name, metrics, measures):
+    """Resolve metric -> measure -> agg_time_dimension, following ratio numerators."""
+    seen = set()
+    while metric_name and metric_name not in seen:
+        seen.add(metric_name)
+        defn = metrics.get(metric_name)
+        if defn is None:
+            return None
+        params = defn.get("type_params") or {}
+        measure = params.get("measure")
+        if measure:
+            return measures.get(measure)
+        numerator = params.get("numerator")
+        if not numerator:
+            return None
+        metric_name = (
+            numerator if isinstance(numerator, str) else numerator.get("name")
+        )
+    return None
+
+
+def test_semantic_and_metric_yaml_are_readable() -> None:
+    """Guard the guard: an empty read would make the parity test vacuous."""
+    assert len(_measure_time_dimensions()) >= 10
+    assert len(_metric_definitions()) >= 15
+
+
+def test_churned_subscribers_uses_churn_date_everywhere() -> None:
+    """The specific regression, pinned."""
+    measures = _measure_time_dimensions()
+    assert measures["churned_subscribers"] == "churn_date"
+    assert SQLGenerator._METRIC_TIME_COL["churned_subscribers"] == "churn_date"
+
+
+def test_metric_time_columns_match_the_semantic_layer() -> None:
+    """Every resolvable metric must use its measure's agg_time_dimension."""
+    measures = _measure_time_dimensions()
+    metrics = _metric_definitions()
+
+    checked, mismatches = 0, []
+    for metric, mapped in SQLGenerator._METRIC_TIME_COL.items():
+        expected = _expected_time_column(metric, metrics, measures)
+        if expected is None:
+            continue
+        checked += 1
+        if expected != mapped:
+            mismatches.append(f"{metric}: map={mapped!r} semantic={expected!r}")
+
+    assert checked >= 10, f"only resolved {checked} metrics — the guard is too weak"
+    assert not mismatches, "time column drifted from the semantic layer: " + "; ".join(mismatches)
+
+
+def test_fallback_builder_emits_the_mapped_time_column() -> None:
+    """The map must actually reach the generated SQL."""
+    generator = SQLGenerator(_settings())
+    intent = QueryIntent(
+        original_query="churned in the US",
+        metrics=["churned_subscribers"],
+        dimensions=[],
+        filters=[FilterClause(column="subscriber__country", operator="eq", value="US")],
+        time_range=TimeRange(start_date="2025-01-01", end_date="2025-12-31"),
+    )
+    sql = generator._build_fallback_sql(intent)
+    assert "churn_date BETWEEN" in sql
+    assert "signup_date" not in sql

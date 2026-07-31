@@ -412,7 +412,12 @@ class SQLGenerator:
         "churn_rate":             "period_month",
         "retention_rate":         "period_month",
         "total_subscribers":      "period_month",
-        "churned_subscribers":    "signup_date",
+        # churn_date, NOT signup_date — see sem_subscribers.yml's agg_time_dimension.
+        # This map is also the single source of truth for _build_fallback_sql's time
+        # column; it previously disagreed with an inline if/elif chain there, and both
+        # copies were wrong in the same way. test_fallback_time_columns_match_semantic_layer
+        # now pins every entry against the semantic YAML.
+        "churned_subscribers":    "churn_date",
         "recommendation_ctr":     "event_timestamp",
         "total_recommendations":  "event_timestamp",
         "clicked_recommendations":"event_timestamp",
@@ -1498,21 +1503,13 @@ class SQLGenerator:
                 where_clauses.append(f"{col} {op} {val_str}")
 
         if intent.time_range:
-            # Use the appropriate physical time column based on the metric
-            if primary_metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate", "total_subscribers"):
-                time_col = "period_month"
-            elif primary_metric in ("ltv", "total_revenue"):
-                time_col = "payment_date"
-            elif primary_metric in (
-                "engagement_rate", "avg_watch_time", "total_watch_time",
-                "total_sessions", "avg_buffering_events", "total_buffering_events",
-            ):
-                time_col = "session_start"  # fct_stream_sessions physical column
-            elif primary_metric == "churned_subscribers":
-                time_col = "signup_date"
-            elif primary_metric in ("recommendation_ctr", "total_recommendations", "clicked_recommendations"):
-                time_col = "event_timestamp"  # stg_recommendation_events physical column
-            else:
+            # Physical time column, from the ONE map. This used to be a parallel
+            # if/elif chain that had drifted from _METRIC_TIME_COL — both said
+            # signup_date for churned_subscribers where the semantic layer says
+            # churn_date, so a filtered churn count answered "who signed up in this
+            # range and has since churned". One lookup, one place to be wrong.
+            time_col = SQLGenerator._METRIC_TIME_COL.get(primary_metric, "")
+            if not time_col:
                 time_col = "payment_date"
 
             # Validate dates to prevent SQL injection (audit issue #1 / fallback path)
