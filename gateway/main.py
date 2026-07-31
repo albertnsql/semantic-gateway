@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 # Save downloaded HuggingFace models locally so Render preserves them
 # between the build phase and the runtime phase.
@@ -119,13 +120,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # ── 4.2. Warm in-process MetricFlow engine ────────────────────────────────
     # Almost all of the `mf query --explain` subprocess cost is process startup,
     # not compilation, so holding one engine turns a template-cache miss from a
-    # ~37s cliff into ~20ms. SQLGenerator builds it LAZILY on the first miss —
-    # not here — so startup stays fast and a process that never misses never pays
-    # the ~15s build or the ~100 MB. See SQLGenerator._get_warm_engine().
-    logger.info(
-        "✓ In-process MetricFlow %s (built lazily on the first template-cache miss).",
-        "ENABLED" if settings.metricflow_in_process else "disabled",
-    )
+    # ~37s cliff into ~200ms.
+    #
+    # Build it on a BACKGROUND thread here rather than on the first miss. Lazy
+    # building put the ~27s cost (measured on Render) inside whichever request
+    # missed first — production 2026-07-31 shows exactly that: a 30.3s request
+    # made of 27.1s build + 0.2s compile. Startup already waits ~21s on the
+    # Snowflake pool, so the engine can build alongside it and be ready before
+    # the first user arrives. Lifespan does not await the thread, so a slow build
+    # never delays readiness; a request arriving mid-build simply blocks on the
+    # same lock it would have held anyway. See SQLGenerator._get_warm_engine().
+    if settings.metricflow_in_process and settings.metricflow_prewarm:
+        def _prewarm_metricflow() -> None:
+            if sql_generator._get_warm_engine() is None:
+                logger.warning(
+                    "MetricFlow pre-warm did not produce an engine — cache misses will "
+                    "use the `mf` subprocess (~30s each)."
+                )
+
+        threading.Thread(
+            target=_prewarm_metricflow,
+            name="metricflow-prewarm",
+            daemon=True,
+        ).start()
+        logger.info("✓ In-process MetricFlow ENABLED — pre-warming in the background.")
+    else:
+        logger.info(
+            "✓ In-process MetricFlow %s%s.",
+            "ENABLED" if settings.metricflow_in_process else "disabled",
+            " (lazy: built on the first template-cache miss)"
+            if settings.metricflow_in_process else "",
+        )
 
     # ── 4.5. SQL Template Cache (skips MetricFlow subprocess on repeat metric/dim combos) ──
     # refresh_on_load=True: the disk file is a build artifact (pre-compiled via

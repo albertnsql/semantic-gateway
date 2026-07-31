@@ -7,6 +7,8 @@ Loaded once at startup; injected into services via dependency injection.
 
 from __future__ import annotations
 
+import sys
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +74,17 @@ class Settings(BaseSettings):
     # the common combos, so turning this off degrades latency but never correctness.
     # Worth watching resident memory on a 512 MB instance: measured 150 -> 251 MB.
     metricflow_in_process: bool = True
+
+    # Build the engine on a background thread at startup instead of on the first
+    # cache miss. Without this the ~27s build lands inside whichever request
+    # misses first — production 2026-07-31 logged a 30.3s query that was 27.1s
+    # build + 0.2s compile. Startup already waits ~21s on the Snowflake pool, so
+    # the build overlaps it and is normally ready before the first user.
+    #
+    # Defaults to False under pytest: tests/test_query_endpoint.py boots the real
+    # lifespan per test, so ~17 concurrent engine builds would burn CPU and ~100 MB
+    # each. Tests never miss the template cache, so they never need the engine.
+    metricflow_prewarm: bool = "pytest" not in sys.modules
     semantic_models_path: str = (
         "../dbt_streaming_analytics/streaming_analytics/models/semantic"
     )

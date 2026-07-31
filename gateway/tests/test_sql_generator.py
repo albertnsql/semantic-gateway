@@ -690,3 +690,115 @@ def test_missing_dbt_project_dir_disables_the_engine(monkeypatch) -> None:
     assert generator._compile_metricflow(
         ["mf", "query", "--metrics", "mrr", "--explain"]
     ) == "SELECT 'sub'"
+
+
+def test_prewarm_is_disabled_under_pytest() -> None:
+    """
+    The suite must never pre-warm the engine.
+
+    tests/test_query_endpoint.py boots the real lifespan per test, so leaving
+    pre-warm on would start ~17 concurrent engine builds at ~27s and ~100 MB each.
+    Tests never miss the template cache, so they never need the engine.
+    """
+    from config import Settings
+
+    assert Settings().metricflow_prewarm is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MetricFlow-first ordering.
+#
+# The semantic layer is the source of truth and compiling from it costs ~60-96 ms
+# in production, so every query compiles. The template cache demotes to a
+# fallback for when the warm engine is unavailable — which is what stops a stale
+# or truncated committed template from ever being served on the happy path.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_MRR_TEMPLATE = (
+    "SELECT subscription__plan_type, SUM(mrr) AS mrr\n"
+    "FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly\n"
+    "GROUP BY subscription__plan_type"
+)
+
+
+def _mrr_plan_intent(filters=None):
+    return QueryIntent(
+        original_query="mrr by plan type",
+        metrics=["mrr"],
+        dimensions=["subscription__plan_type"],
+        filters=filters or [],
+    )
+
+
+def test_metricflow_runs_even_when_the_template_cache_has_the_key(monkeypatch) -> None:
+    """The regression guard for MetricFlow-first: a warm cache must not short-circuit."""
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    cache = _StubTemplateCache(_MRR_TEMPLATE)
+    engine = _FakeWarmEngine("SELECT 'from metricflow' AS mrr")
+    generator = SQLGenerator(_settings(), template_cache=cache, warm_engine=engine)
+
+    result = generator.generate(_mrr_plan_intent(), _validation())
+
+    assert "from metricflow" in result.compiled_sql
+    assert engine.calls, "warm engine was not consulted"
+    assert "GROUP BY subscription__plan_type" not in result.compiled_sql
+
+
+def test_template_cache_serves_when_no_warm_engine(monkeypatch) -> None:
+    """Without an engine the cache must still answer — never a 30s subprocess."""
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    monkeypatch.setattr(
+        SQLGenerator, "_run_mf_subprocess",
+        lambda self, cmd: pytest.fail("subprocess ran while a cached template existed"),
+    )
+    cache = _StubTemplateCache(_MRR_TEMPLATE)
+    generator = SQLGenerator(_settings(), template_cache=cache)  # settings lack the flag
+
+    result = generator.generate(_mrr_plan_intent(), _validation())
+
+    assert "GROUP BY subscription__plan_type" in result.compiled_sql
+    assert "template_cache" in result.metricflow_query
+
+
+def test_engine_error_falls_through_to_the_cache(monkeypatch) -> None:
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    monkeypatch.setattr(
+        SQLGenerator, "_run_mf_subprocess",
+        lambda self, cmd: pytest.fail("subprocess ran while a cached template existed"),
+    )
+    cache = _StubTemplateCache(_MRR_TEMPLATE)
+    generator = SQLGenerator(
+        _settings(), template_cache=cache, warm_engine=_FakeWarmEngine(raises=True)
+    )
+
+    result = generator.generate(_mrr_plan_intent(), _validation())
+
+    assert "GROUP BY subscription__plan_type" in result.compiled_sql
+
+
+def test_filtered_query_reaches_metricflow_not_the_fallback_builder(monkeypatch) -> None:
+    """
+    With an engine available, filters compile via --where.
+
+    The fallback builder is a hand-written re-implementation of each metric and is
+    where the churn_date/signup_date divergence lives, so it must not be the
+    default route for filtered queries any more.
+    """
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    monkeypatch.setattr(
+        SQLGenerator, "_build_fallback_sql",
+        lambda self, intent: pytest.fail("fallback builder ran despite a warm engine"),
+    )
+    engine = _FakeWarmEngine("SELECT 'mf filtered' AS mrr")
+    generator = SQLGenerator(_settings(), warm_engine=engine)
+
+    intent = QueryIntent(
+        original_query="mrr for premium",
+        metrics=["mrr"],
+        dimensions=[],
+        filters=[FilterClause(column="subscription__plan_type", operator="eq", value="premium")],
+    )
+    result = generator.generate(intent, _validation())
+
+    assert "mf filtered" in result.compiled_sql
+    assert "--where" in " ".join(engine.calls[0])

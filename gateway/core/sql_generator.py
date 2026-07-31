@@ -504,10 +504,38 @@ class SQLGenerator:
         # exactly one copy of the predicate.
         intent.filters = effective_filters
 
+        mf_command: list[str] = []
+        mf_success = False
+        used_fallback_builder = False
+
+        # ── MetricFlow FIRST, via the warm in-process engine ──────────────────────
+        # The semantic layer is the source of truth, and compiling from it costs
+        # 59-96 ms in production — against a 1.5-2 s Snowflake round trip, that is
+        # noise. Serving the cache first bought ~80 ms and cost correctness: a
+        # committed template can be stale or (as shipped once) truncated, and only
+        # the manual regenerate-and-commit workflow kept it honest. Compiling every
+        # query removes that whole class of problem, and a semantic-layer change now
+        # takes effect on deploy without an artifact to remember to rebuild.
+        #
+        # Deliberately the ENGINE ONLY. If it is unavailable we fall through to the
+        # cache and then the subprocess — a ~30 s subprocess must never become the
+        # primary path just because the engine failed to build.
+        if intent.metrics:
+            mf_command = self.format_mf_query(intent)
+            try:
+                compiled_sql = self._compile_with_warm_engine(mf_command)
+                mf_success = compiled_sql is not None
+            except Exception as exc:
+                logger.warning(
+                    "Warm MetricFlow engine failed (%s) — falling back to the template "
+                    "cache, then the subprocess.", exc,
+                )
+                compiled_sql = None
+
         # Filtered queries are NOT eligible for the template cache — the compiled SQL
         # contains hard-coded WHERE predicates (e.g., country = 'US') that cannot be
         # reused for a different filter value or an unfiltered version of the same query.
-        if self._template_cache is not None and intent.metrics and not effective_filters:
+        if compiled_sql is None and self._template_cache is not None and intent.metrics and not effective_filters:
             cached_tpl = self._template_cache.get(intent.metrics, intent.dimensions)
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
@@ -549,19 +577,14 @@ class SQLGenerator:
                         logger.info("SQLTemplateCache HIT — no time range injection needed.")
                         used_template_cache = True
 
-        # ── MetricFlow subprocess & Speculative LLM Review ───────────
-        mf_command: list[str] = []
-        mf_success = False
-        used_fallback_builder = False
-
         # ── Option B: filtered queries skip the ~30 s MetricFlow subprocess ──────
-        # A filter (e.g. country = 'US') makes a query ineligible for the L1 template
-        # cache, which used to mean every filtered query paid MetricFlow's full cold
-        # start (~30 s → the 34 s requests in the logs). Serve it from the in-process
-        # governed fallback builder instead: deterministic, sub-millisecond SQL that
-        # applies the filter itself (joining dim_subscribers when the metric needs it).
-        # If the builder can't serve this metric (raises SQLGenerationError), fall
-        # through to MetricFlow — slow but correct for MetricFlow-only metrics.
+        # Only reachable when the warm engine is unavailable. A filter makes a query
+        # ineligible for the L1 template cache, so without an engine it would pay
+        # MetricFlow's full ~30 s cold start. The governed fallback builder serves it
+        # in sub-millisecond time instead — but it is a hand-written re-implementation
+        # of the metric (see the churn_date/signup_date divergence), so it is a last
+        # resort, not a design choice. With the engine running, MetricFlow compiles
+        # the filter itself via --where and this branch never executes.
         if compiled_sql is None and effective_filters:
             try:
                 compiled_sql = self._build_fallback_sql(intent)
@@ -577,8 +600,12 @@ class SQLGenerator:
                 )
 
         if compiled_sql is None:
-            mf_command = self.format_mf_query(intent)
-            logger.info("Executing MetricFlow: %s", " ".join(mf_command))
+            # Last resort: the `mf` CLI subprocess (~30 s). Reached only when the warm
+            # engine is unavailable AND the cache missed AND the fallback builder could
+            # not serve this metric.
+            if not mf_command:
+                mf_command = self.format_mf_query(intent)
+            logger.info("Compiling via MetricFlow subprocess: %s", " ".join(mf_command))
 
             try:
                 compiled_sql = self._compile_metricflow(mf_command)
@@ -691,18 +718,27 @@ class SQLGenerator:
                 len(post_filters), [c for c, _ in post_filters],
             )
 
-        # Audit label — reflect which path actually produced the SQL.
-        if mf_command and not used_template_cache:
-            _mf_cmd = " ".join(mf_command)
-        elif used_fallback_builder:
+        # Audit label — reflect which path actually produced the SQL. Order matters:
+        # mf_command is now built for EVERY query (MetricFlow runs first), so it can
+        # no longer be used to infer which path won. Check the specific flags first
+        # or a fallback-builder result gets labelled as native MetricFlow in the
+        # provenance we show the user.
+        if used_fallback_builder:
             _filter_cols = ",".join(f.column for f in (intent.filters or []))
             _mf_cmd = (
                 f"[fallback_builder] metrics={','.join(intent.metrics)} "
                 f"dims={','.join(intent.dimensions)} filters={_filter_cols}"
             )
-        else:
+        elif used_template_cache:
             _mf_cmd = (
                 f"[template_cache] mf query --metrics {','.join(intent.metrics)} "
+                f"--group-by {','.join(intent.dimensions)} --explain"
+            )
+        elif mf_command:
+            _mf_cmd = " ".join(mf_command)
+        else:
+            _mf_cmd = (
+                f"mf query --metrics {','.join(intent.metrics)} "
                 f"--group-by {','.join(intent.dimensions)} --explain"
             )
 
@@ -755,6 +791,33 @@ class SQLGenerator:
                 dbt_profiles_dir=project_dir,
             )
             return self._warm_engine
+
+    def _compile_with_warm_engine(self, mf_command: list[str]) -> str | None:
+        """
+        Compile via the warm in-process engine ONLY — never the subprocess.
+
+        This backs the primary path, where falling through to a ~30 s subprocess
+        would be worse than using a possibly-stale cached template. Returns
+        ``None`` when no engine is available so the caller can try the cache;
+        propagates engine errors so the caller can decide.
+
+        Args:
+            mf_command: argv list from :meth:`format_mf_query`.
+
+        Returns:
+            Compiled SQL, or ``None`` if there is no warm engine.
+        """
+        engine = self._get_warm_engine()
+        if engine is None:
+            return None
+
+        started = time.perf_counter()
+        sql = engine.explain_argv(mf_command)
+        logger.info(
+            "MetricFlow compiled in-process in %.0f ms (no subprocess).",
+            (time.perf_counter() - started) * 1000,
+        )
+        return sql
 
     def _compile_metricflow(self, mf_command: list[str]) -> str:
         """
