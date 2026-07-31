@@ -116,6 +116,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     sql_generator = SQLGenerator(settings=settings, pool=snowflake_pool if snowflake_ok else None)
 
+    # ── 4.2. Warm in-process MetricFlow engine ────────────────────────────────
+    # Almost all of the `mf query --explain` subprocess cost is process startup,
+    # not compilation. Holding one engine turns a template-cache miss from a
+    # ~30s cliff into ~20ms. Costs ~100 MB resident + ~15s startup, both once.
+    # try_build() returns None on any failure and the subprocess path takes over.
+    warm_engine = None
+    if settings.metricflow_in_process:
+        from core.metricflow_engine import WarmMetricFlowEngine
+        warm_engine = WarmMetricFlowEngine.try_build(
+            dbt_project_dir=settings.dbt_project_dir,
+            dbt_profiles_dir=settings.dbt_project_dir,
+        )
+    else:
+        logger.info("In-process MetricFlow disabled by config — using the `mf` subprocess.")
+    sql_generator._warm_engine = warm_engine
+
     # ── 4.5. SQL Template Cache (skips MetricFlow subprocess on repeat metric/dim combos) ──
     # refresh_on_load=True: the disk file is a build artifact (pre-compiled via
     # precompile_templates.py and committed to the repo). Templates only go stale
@@ -177,6 +193,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.snowflake_pool = snowflake_pool
     app.state.snowflake_connected = snowflake_ok
     app.state.metric_embedder = metric_embedder
+    app.state.warm_metricflow_engine = warm_engine
 
     # ── 6. Query result cache ────────────────────────────────────────────────
     _ttl = settings.cache_ttl_seconds

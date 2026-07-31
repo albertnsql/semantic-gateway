@@ -269,3 +269,329 @@ def test_fallback_total_subscribers_counts_active_on_mrr() -> None:
     assert "period_month BETWEEN" in sql
     assert "signup_date" not in sql
     assert "dim_subscribers" not in sql  # unfiltered → no subscriber join
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Filters on a column that is ALSO a group-by dimension.
+#
+# These used to be dropped as "redundant", which silently widened the answer:
+# "how many subscribers churned in 2025 for country US" returned all 15
+# countries. The predicate is now applied to the outer result instead, which
+# keeps the L1 template cache usable AND actually narrows.
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _StubTemplateCache:
+    """Minimal SQLTemplateCache stand-in that records what gets stored."""
+
+    def __init__(self, template_sql: str | None = None) -> None:
+        self._template_sql = template_sql
+        self.stored: list[tuple] = []
+
+    def get(self, metrics, dimensions):
+        if self._template_sql is None:
+            return None
+        return {
+            "sql_template": self._template_sql,
+            "has_time_filter": False,
+            "date_style": "plain",
+        }
+
+    def set(self, metrics, dimensions, sql_template, has_placeholder, date_style="plain"):
+        self.stored.append((metrics, dimensions, sql_template))
+
+
+_COUNTRY_TEMPLATE = (
+    "SELECT subscriber__country, SUM(__churned_subscribers) AS churned_subscribers\n"
+    "FROM STREAMING_ANALYTICS.marts.dim_subscribers\n"
+    "GROUP BY subscriber__country"
+)
+
+
+def _country_intent(filters: list[FilterClause]) -> QueryIntent:
+    return QueryIntent(
+        original_query="How many subscribers churned in 2025 for Country US",
+        metrics=["churned_subscribers"],
+        dimensions=["subscriber__country"],
+        filters=filters,
+    )
+
+
+def test_narrowing_filter_on_grouped_dimension_reaches_the_sql(monkeypatch) -> None:
+    """The regression: a country filter must survive, not be stripped."""
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    cache = _StubTemplateCache(_COUNTRY_TEMPLATE)
+    generator = SQLGenerator(_settings(), template_cache=cache)
+
+    intent = _country_intent([
+        FilterClause(column="subscriber__country", operator="eq", value="US")
+    ])
+    result = generator.generate(intent, _validation())
+
+    assert "subscriber__country = 'US'" in result.compiled_sql
+    # and it still came from the cached template, not a 30s MetricFlow compile
+    assert "template_cache" in result.metricflow_query
+
+
+def test_template_cache_is_still_used_for_a_filtered_group_by(monkeypatch) -> None:
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    cache = _StubTemplateCache(_COUNTRY_TEMPLATE)
+    generator = SQLGenerator(_settings(), template_cache=cache)
+
+    result = generator.generate(
+        _country_intent([FilterClause(column="subscriber__country", operator="eq", value="US")]),
+        _validation(),
+    )
+    # The unfiltered template body is preserved inside the wrapper.
+    assert "GROUP BY subscriber__country" in result.compiled_sql
+    assert result.compiled_sql.strip().startswith("SELECT * FROM (")
+
+
+def test_filtered_query_never_poisons_the_template_cache(monkeypatch) -> None:
+    """A 'country = US' request must not overwrite the shared metric x country key."""
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    cache = _StubTemplateCache(_COUNTRY_TEMPLATE)
+    generator = SQLGenerator(_settings(), template_cache=cache)
+
+    generator.generate(
+        _country_intent([FilterClause(column="subscriber__country", operator="eq", value="US")]),
+        _validation(),
+    )
+    for _metrics, _dims, stored_sql in cache.stored:
+        assert "'US'" not in stored_sql, "filtered SQL was cached as a reusable template"
+
+
+def test_all_values_in_filter_still_returns_every_group(monkeypatch) -> None:
+    """The LLM's habit of enumerating every value must remain a no-op in practice."""
+    monkeypatch.setattr(sql_generator, "build_dimension_prefix_map", lambda: {})
+    cache = _StubTemplateCache(_COUNTRY_TEMPLATE)
+    generator = SQLGenerator(_settings(), template_cache=cache)
+
+    result = generator.generate(
+        _country_intent([
+            FilterClause(column="subscriber__country", operator="in", value=["US", "UK", "IN"])
+        ]),
+        _validation(),
+    )
+    assert "IN ('US', 'UK', 'IN')" in result.compiled_sql
+
+
+def test_wrap_with_outer_predicates_escapes_quotes() -> None:
+    sql = "SELECT country, x FROM t GROUP BY country"
+    wrapped = sql_generator.wrap_with_outer_predicates(
+        sql, [("country", FilterClause(column="country", operator="eq", value="O'Brien"))]
+    )
+    assert "'O''Brien'" in wrapped
+
+
+def test_wrap_with_outer_predicates_rejects_unsafe_column() -> None:
+    sql = "SELECT country FROM t"
+    wrapped = sql_generator.wrap_with_outer_predicates(
+        sql, [("country; DROP TABLE t", FilterClause(column="c", operator="eq", value="US"))]
+    )
+    assert wrapped == sql  # no predicate rendered, original returned untouched
+
+
+def test_wrap_with_outer_predicates_is_noop_without_filters() -> None:
+    sql = "SELECT 1"
+    assert sql_generator.wrap_with_outer_predicates(sql, []) == sql
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Warm in-process MetricFlow engine.
+#
+# The engine and the subprocess receive the identical argv list from
+# format_mf_query(), so the two paths cannot produce different SQL. These cover
+# the argv->request translation and the fall-back-on-failure contract.
+# ──────────────────────────────────────────────────────────────────────────────
+
+from core.metricflow_engine import WarmMetricFlowEngine
+
+
+class _FakeWarmEngine:
+    """Stands in for WarmMetricFlowEngine without loading dbt."""
+
+    def __init__(self, sql: str | None = "SELECT 1 AS mrr", raises: bool = False) -> None:
+        self._sql = sql
+        self._raises = raises
+        self.calls: list[list[str]] = []
+
+    def explain_argv(self, mf_command: list[str]) -> str:
+        self.calls.append(mf_command)
+        if self._raises:
+            raise RuntimeError("engine exploded")
+        return self._sql
+
+
+def test_parse_argv_translates_every_flag() -> None:
+    argv = [
+        "mf", "query",
+        "--metrics", "mrr,churn_rate",
+        "--group-by", "subscription__plan_type,subscriber__country",
+        "--start-time", "2025-01-01",
+        "--end-time", "2025-12-31",
+        "--where", "{{ Dimension('subscriber__country') }} = 'US'",
+        "--limit", "25",
+        "--explain",
+    ]
+    kw = WarmMetricFlowEngine._parse_argv(argv)
+
+    assert kw["metric_names"] == ["mrr", "churn_rate"]
+    assert kw["group_by_names"] == ["subscription__plan_type", "subscriber__country"]
+    assert kw["time_constraint_start"].year == 2025
+    assert kw["time_constraint_end"].month == 12
+    assert kw["where_constraints"] == ["{{ Dimension('subscriber__country') }} = 'US'"]
+    assert kw["limit"] == 25
+
+
+def test_parse_argv_bare_metric_has_no_group_by() -> None:
+    kw = WarmMetricFlowEngine._parse_argv(["mf", "query", "--metrics", "mrr", "--explain"])
+    assert kw["metric_names"] == ["mrr"]
+    assert "group_by_names" not in kw
+    assert "time_constraint_start" not in kw
+
+
+def test_parse_argv_ignores_non_integer_limit() -> None:
+    kw = WarmMetricFlowEngine._parse_argv(
+        ["mf", "query", "--metrics", "mrr", "--limit", "lots", "--explain"]
+    )
+    assert "limit" not in kw
+
+
+def test_warm_engine_is_used_instead_of_subprocess(monkeypatch) -> None:
+    generator = SQLGenerator(_settings(), warm_engine=_FakeWarmEngine("SELECT 42 AS mrr"))
+
+    def _boom(*_a, **_k):
+        raise AssertionError("subprocess must not run when the warm engine works")
+
+    monkeypatch.setattr(SQLGenerator, "_run_mf_subprocess", _boom)
+
+    assert generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"]) == (
+        "SELECT 42 AS mrr"
+    )
+
+
+def test_warm_engine_failure_falls_back_to_subprocess(monkeypatch) -> None:
+    """A broken engine must degrade to the slow path, never surface an error."""
+    generator = SQLGenerator(_settings(), warm_engine=_FakeWarmEngine(raises=True))
+    monkeypatch.setattr(
+        SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 'from subprocess'"
+    )
+
+    assert generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"]) == (
+        "SELECT 'from subprocess'"
+    )
+
+
+def test_no_warm_engine_uses_subprocess(monkeypatch) -> None:
+    generator = SQLGenerator(_settings())  # warm_engine defaults to None
+    monkeypatch.setattr(
+        SQLGenerator, "_run_mf_subprocess", lambda self, cmd: "SELECT 'from subprocess'"
+    )
+
+    assert generator._compile_metricflow(["mf", "query", "--metrics", "mrr", "--explain"]) == (
+        "SELECT 'from subprocess'"
+    )
+
+
+def test_warm_engine_receives_the_same_argv_as_the_subprocess(monkeypatch) -> None:
+    """Parity guard: one source of truth for how an intent becomes an mf query."""
+    monkeypatch.setattr(
+        sql_generator,
+        "build_dimension_prefix_map",
+        lambda: {"total_subscribers": {"plan_type": "subscriber__plan_type"}},
+    )
+    engine = _FakeWarmEngine()
+    generator = SQLGenerator(_settings(), warm_engine=engine)
+    intent = _intent(["subscriber__plan_type"])
+
+    expected_argv = generator.format_mf_query(intent)
+    generator._compile_metricflow(expected_argv)
+
+    assert engine.calls == [expected_argv]
+
+
+def test_try_build_returns_none_without_a_dbt_project(tmp_path) -> None:
+    """Missing dbt project must disable the engine, not crash startup."""
+    assert WarmMetricFlowEngine.try_build(str(tmp_path), str(tmp_path)) is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# ------------------------------------------------------------------------------
+# MetricFlow --explain output parsing.
+#
+# The parser used to stop at the first blank line. MetricFlow puts one between
+# the CTE list and the outer SELECT for multi-CTE queries, so `ltv` grouped by a
+# joined dimension was truncated to its CTE -- 155 of 1882 chars, invalid SQL,
+# silently cached, and shipped inside .sql_template_cache.json.
+# ------------------------------------------------------------------------------
+
+# Mirrors real `mf query --metrics ltv --group-by subscriber__country --explain`
+# output: a CTE, a BLANK LINE, then the outer SELECT.
+_LTV_STDOUT = """WITH sma_10005_cte AS (
+  SELECT
+    subscriber_id AS subscriber
+    , country
+  FROM STREAMING_ANALYTICS.marts.dim_subscribers sem_subscribers_src_10000
+)
+
+SELECT
+  subscriber__country AS subscriber__country
+  , CAST(total_revenue AS DOUBLE) / CAST(NULLIF(total_subscribers, 0) AS DOUBLE) AS ltv
+FROM (
+  SELECT
+    COALESCE(subq_12.subscriber__country, subq_22.subscriber__country) AS subscriber__country
+  FROM sma_10005_cte subq_12
+) subq_30
+"""
+
+
+def test_extract_sql_keeps_everything_after_a_blank_line() -> None:
+    """The regression: the outer SELECT must survive the blank line."""
+    generator = SQLGenerator(_settings())
+    sql = generator._extract_sql_from_mf_output(_LTV_STDOUT, "mf query ...")
+
+    assert "sma_10005_cte" in sql
+    assert "AS ltv" in sql, "outer SELECT was truncated"
+    assert len(sql) > 400
+
+
+def test_extract_sql_stops_at_cli_emoji_chrome() -> None:
+    """Trailing CLI decoration must not be captured as SQL."""
+    generator = SQLGenerator(_settings())
+    chrome = "\nSuccess \U0001f984 - query completed after 1.20 seconds\n"
+    sql = generator._extract_sql_from_mf_output(_LTV_STDOUT + chrome, "mf query ...")
+
+    assert "Success" not in sql
+    assert "AS ltv" in sql
+
+
+def test_extract_sql_rejects_truncated_cte_only_output() -> None:
+    """A CTE with no outer SELECT must raise, not be returned and cached."""
+    generator = SQLGenerator(_settings())
+    truncated = (
+        "WITH sma_10005_cte AS (\n"
+        "  SELECT subscriber_id AS subscriber, country\n"
+        "  FROM STREAMING_ANALYTICS.marts.dim_subscribers\n"
+        ")"
+    )
+    with pytest.raises(SQLGenerationError, match="no top-level SELECT"):
+        generator._extract_sql_from_mf_output(truncated, "mf query ...")
+
+
+def test_extract_sql_accepts_plain_select() -> None:
+    generator = SQLGenerator(_settings())
+    sql = generator._extract_sql_from_mf_output(
+        "SELECT SUM(mrr_usd) AS mrr\nFROM STREAMING_ANALYTICS.marts.fct_mrr_monthly\n",
+        "mf query ...",
+    )
+    assert sql.startswith("SELECT")
+
+
+def test_has_top_level_select_distinguishes_truncation() -> None:
+    assert sql_generator._has_top_level_select("SELECT 1")
+    assert sql_generator._has_top_level_select("WITH c AS (SELECT 1) SELECT * FROM c")
+    assert sql_generator._has_top_level_select("SELECT * FROM (SELECT 1) x")
+    assert not sql_generator._has_top_level_select("WITH c AS (SELECT 1)")
+    assert not sql_generator._has_top_level_select("WITH c AS (\n SELECT 1\n)\n")

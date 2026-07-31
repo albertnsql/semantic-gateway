@@ -24,6 +24,7 @@ import re
 import subprocess
 import concurrent.futures
 import sys
+import time
 from typing import TYPE_CHECKING, Any
 
 import snowflake.connector
@@ -62,6 +63,97 @@ def _sanitize_filter_value(value: str) -> str:
             f"Filter value contains disallowed characters: {value!r}"
         )
     return value
+
+
+_OUTER_OP_MAP: dict[str, str] = {
+    "eq": "=", "neq": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
+}
+
+
+def _sql_literal(value) -> str:
+    """Render a filter value as a SQL literal, quoting and escaping non-numerics."""
+    raw = str(value)
+    try:
+        float(raw)
+        return raw
+    except ValueError:
+        return "'{}'".format(raw.replace("'", "''"))
+
+
+def _has_top_level_select(sql: str) -> bool:
+    """
+    True if *sql* contains a SELECT outside every parenthesised group.
+
+    Used to detect truncated MetricFlow output. ``WITH cte AS ( SELECT … )`` with
+    nothing after it is parenthesis-balanced and looks plausible, but it is not a
+    runnable statement — its only SELECT lives inside the CTE. Scanning depth-0
+    text distinguishes that from a real ``WITH … SELECT …`` or a plain SELECT.
+    """
+    depth = 0
+    top_level: list[str] = []
+    for ch in sql:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            top_level.append(ch)
+    return re.search(r"\bSELECT\b", "".join(top_level), re.IGNORECASE) is not None
+
+
+def wrap_with_outer_predicates(sql: str, post_filters: list) -> str:
+    """
+    Apply predicates to an already-compiled query by wrapping it in a subquery.
+
+    Used when the filtered column is also a group-by dimension: the compiled SQL
+    already SELECTs that column, so filtering the outer result is equivalent to
+    compiling the predicate in — and it works for ratio metrics too, where
+    re-aggregating a filtered subset would be wrong.
+
+    Args:
+        sql: Compiled SQL (dates already injected).
+        post_filters: ``[(column, FilterClause), …]`` — columns must already be
+            resolved to the names the compiled SQL emits.
+
+    Returns:
+        ``SELECT * FROM (<sql>) subq_flt WHERE …``, or *sql* unchanged if no
+        predicate could be safely rendered.
+    """
+    if not post_filters:
+        return sql
+
+    predicates: list[str] = []
+    for col, f in post_filters:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", col):
+            logger.warning("Outer predicate: skipping unsafe column name %r.", col)
+            continue
+        if f.operator == "in":
+            vals = f.value if isinstance(f.value, list) else [f.value]
+            if not vals:
+                continue
+            predicates.append(
+                "{} IN ({})".format(col, ", ".join(_sql_literal(v) for v in vals))
+            )
+        else:
+            op = _OUTER_OP_MAP.get(f.operator)
+            if op is None:
+                logger.warning(
+                    "Outer predicate: unsupported operator %r on %r — skipping.",
+                    f.operator, col,
+                )
+                continue
+            predicates.append(f"{col} {op} {_sql_literal(f.value)}")
+
+    if not predicates:
+        return sql
+
+    inner = sql.strip().rstrip(";")
+    return (
+        "SELECT * FROM (\n"
+        + inner
+        + "\n) subq_flt\nWHERE "
+        + "\n  AND ".join(predicates)
+    )
 from pydantic import BaseModel
 
 from core.exceptions import SnowflakeConnectionError, SQLGenerationError
@@ -325,10 +417,17 @@ class SQLGenerator:
         "clicked_recommendations":"event_timestamp",
     }
 
-    def __init__(self, settings: "Settings", pool=None, template_cache: SQLTemplateCache | None = None) -> None:
+    def __init__(
+        self,
+        settings: "Settings",
+        pool=None,
+        template_cache: SQLTemplateCache | None = None,
+        warm_engine=None,
+    ) -> None:
         self._settings = settings
         self._pool = pool                        # SnowflakePool — injected at startup; None = legacy mode
         self._template_cache = template_cache    # SQLTemplateCache — injected at startup; None = disabled
+        self._warm_engine = warm_engine          # WarmMetricFlowEngine — None = subprocess only
 
     # ──────────────────────────────────────────────── public
 
@@ -359,10 +458,19 @@ class SQLGenerator:
         compiled_sql: str | None = None
         used_template_cache = False
 
-        # ── Pre-process filters to strip redundant group-by dimensions ──
-        # (e.g. "show churn by plan type" → plan_type in dims AND in filters).
-        # This ensures they don't incorrectly disable the SQL Template Cache.
-        effective_filters = []
+        # ── Partition filters: post-aggregation vs. must-reach-MetricFlow ──────
+        # A filter on a column that is ALSO a group-by dimension is special: the
+        # compiled SQL already SELECTs that column, so the predicate can be applied
+        # to the *outer* result instead of being compiled in. That means the query
+        # stays eligible for the L1 template cache AND the filter still narrows.
+        #
+        # This used to unconditionally DROP such filters as "redundant", which was
+        # only true for the LLM's habit of enumerating every value of the dimension
+        # it groups by ("churn by plan type" → plan_type IN (basic,standard,premium)).
+        # For a genuinely narrowing filter it silently widened the answer: asking
+        # "how many churned in 2025 for country US" returned all 15 countries.
+        post_filters: list = []       # applied as an outer WHERE on the compiled SQL
+        effective_filters: list = []  # compiled in by MetricFlow / fallback builder
         if intent.filters:
             global_dim_map = build_dimension_prefix_map()
             primary_metric = intent.metrics[0] if intent.metrics else ""
@@ -375,12 +483,19 @@ class SQLGenerator:
                     elif _bare_dimension_name(col) in dim_map:
                         col = dim_map[_bare_dimension_name(col)]
                 if col in (intent.dimensions or []):
-                    logger.info("Stripping redundant filter on '%s' before cache check (already a dimension).", col)
+                    post_filters.append((col, f))
+                    logger.info(
+                        "Filter on '%s' is also a group-by dimension — applying it as an "
+                        "outer predicate so the template cache stays usable.", col,
+                    )
                     continue
 
                 effective_filters.append(f)
-        
-        # Override the intent filters so format_mf_query receives the clean list
+
+        # Override the intent filters so format_mf_query receives the clean list.
+        # post_filters are deliberately excluded here and re-applied uniformly
+        # after compilation, so every path (cache hit, MetricFlow, fallback) gets
+        # exactly one copy of the predicate.
         intent.filters = effective_filters
 
         # Filtered queries are NOT eligible for the template cache — the compiled SQL
@@ -460,7 +575,7 @@ class SQLGenerator:
             logger.info("Executing MetricFlow: %s", " ".join(mf_command))
 
             try:
-                compiled_sql = self._run_mf_subprocess(mf_command)
+                compiled_sql = self._compile_metricflow(mf_command)
                 mf_success = True
             except Exception as exc:
                 if isinstance(exc, SQLGenerationError):
@@ -557,6 +672,19 @@ class SQLGenerator:
                         "Failed to store SQL template (non-fatal): %s", tpl_exc
                     )
 
+        # ── Re-apply group-by-dimension filters as an outer predicate ─────────────
+        # Deliberately AFTER the template-cache write above: the cache must keep the
+        # reusable *unfiltered* template, or a "country = US" request would poison
+        # the shared `metric × country` key and every later breakdown would return
+        # only the US row. Applied once here, so it lands regardless of which path
+        # (cache hit / MetricFlow / fallback builder) produced the SQL.
+        if post_filters and compiled_sql:
+            compiled_sql = wrap_with_outer_predicates(compiled_sql, post_filters)
+            logger.info(
+                "Applied %d outer predicate(s) for group-by-dimension filter(s): %s",
+                len(post_filters), [c for c, _ in post_filters],
+            )
+
         # Audit label — reflect which path actually produced the SQL.
         if mf_command and not used_template_cache:
             _mf_cmd = " ".join(mf_command)
@@ -582,6 +710,36 @@ class SQLGenerator:
             estimated_row_count=None,
             sql_review=review_result,
         )
+
+    def _compile_metricflow(self, mf_command: list[str]) -> str:
+        """
+        Compile *mf_command* to SQL, preferring the warm in-process engine.
+
+        The engine and the subprocess are given the identical argv list, so the
+        two paths cannot produce different SQL. If the engine is absent or
+        raises, we fall through to the subprocess: slower, but never wrong.
+
+        Args:
+            mf_command: argv list from :meth:`format_mf_query`.
+
+        Returns:
+            Compiled SQL.
+        """
+        if self._warm_engine is not None:
+            started = time.perf_counter()
+            try:
+                sql = self._warm_engine.explain_argv(mf_command)
+                logger.info(
+                    "MetricFlow compiled in-process in %.0f ms (no subprocess).",
+                    (time.perf_counter() - started) * 1000,
+                )
+                return sql
+            except Exception as exc:
+                logger.warning(
+                    "Warm MetricFlow engine failed (%s) — retrying via subprocess.", exc,
+                )
+
+        return self._run_mf_subprocess(mf_command)
 
     def _run_mf_subprocess(self, mf_command: list[str]) -> str:
         """Run MetricFlow subprocess and return the extracted SQL string.
@@ -1046,9 +1204,26 @@ class SQLGenerator:
                 capturing = True
 
             if capturing:
-                # Stop at blank lines after we've collected something
-                if not line.strip() and sql_lines:
-                    break
+                # A blank line (or `mf`'s own emoji-decorated chrome, e.g.
+                # "Success 🦄 — query completed…") ends the SQL block ONLY if what
+                # we have so far is already a complete statement.
+                #
+                # The previous version broke at the first blank line unconditionally.
+                # MetricFlow puts one between the CTE list and the outer SELECT for
+                # multi-CTE queries — ratio metrics grouped by a joined dimension —
+                # so `ltv × subscriber__country` was truncated to its CTE: 155 of
+                # 1882 chars, invalid SQL, no exception raised, and therefore cached
+                # and shipped inside .sql_template_cache.json.
+                stripped = line.strip()
+                if (not stripped or not stripped.isascii()) and sql_lines:
+                    partial = "\n".join(sql_lines)
+                    if _has_top_level_select(partial) and partial.count("(") == partial.count(")"):
+                        break
+                    if not stripped:
+                        # Blank line *inside* the statement — keep it so the text
+                        # matches what the in-process engine returns.
+                        sql_lines.append(line)
+                    continue
                 sql_lines.append(line)
 
         sql = "\n".join(sql_lines).strip()
@@ -1064,6 +1239,18 @@ class SQLGenerator:
                 "MetricFlow --explain returned no SQL output.",
                 mf_command=mf_command,
                 stderr=stdout[:300],
+            )
+
+        # Structural guard: a `WITH …` query must have a SELECT outside its CTE
+        # parentheses. Failing loudly here is what stops a truncated compile from
+        # being cached — the previous silent truncation shipped two invalid
+        # templates to production.
+        if not _has_top_level_select(sql):
+            raise SQLGenerationError(
+                "MetricFlow --explain produced SQL with no top-level SELECT — the "
+                "output was probably truncated. Refusing to use or cache it.",
+                mf_command=mf_command,
+                stderr=sql[:300],
             )
 
         return sql

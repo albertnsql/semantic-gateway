@@ -57,6 +57,21 @@ class Settings(BaseSettings):
         "../dbt_streaming_analytics/streaming_analytics/target/manifest.json"
     )
     metrics_path: str = "../dbt_streaming_analytics/streaming_analytics/metrics"
+    # Root of the dbt project — MetricFlow needs dbt_project.yml and profiles.yml here.
+    dbt_project_dir: str = "../dbt_streaming_analytics/streaming_analytics"
+    # Hold one warm in-process MetricFlowEngine instead of spawning `mf` per compile.
+    # Measured on this project: 0.02s per compile vs 22-34s for the subprocess (~500x),
+    # at the cost of ~100 MB resident and ~13-22s of extra startup.
+    #
+    # DEFAULT OFF, deliberately, for two reasons that must be cleared first:
+    #   1. `main.py` builds it inside lifespan(), and tests/test_query_endpoint.py boots
+    #      the real lifespan per test — 17 boots x ~15s would add ~4 min to the suite.
+    #      Make the build lazy (first cache miss) before enabling by default.
+    #   2. SQL parity is verified byte-identical on 5 of 7 shapes; `ltv x dimension` and
+    #      `mrr + filter` still need confirming (both look like the SUBPROCESS truncating
+    #      at a blank line in _extract_sql_from_mf_output, not the engine diverging).
+    # The subprocess path is unchanged and remains the fallback either way.
+    metricflow_in_process: bool = False
     semantic_models_path: str = (
         "../dbt_streaming_analytics/streaming_analytics/models/semantic"
     )
