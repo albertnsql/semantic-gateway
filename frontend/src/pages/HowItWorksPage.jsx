@@ -7,7 +7,7 @@ import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { getMetrics } from '../api/metrics';
 import {
-  MessageSquare, Brain, Map, Code2, ShieldCheck, Zap, GitBranch,
+  MessageSquare, Brain, Code2, ShieldCheck, Zap, GitBranch,
   ArrowRight, Database, Server, Layers, Shield, Cpu, Monitor,
   AlertTriangle, BookOpen, Terminal,
 } from 'lucide-react';
@@ -18,9 +18,13 @@ const SH = `20px 20px 40px rgba(13,148,136,0.18),-12px -12px 28px rgba(255,255,2
 const B  = `12px 12px 24px rgba(13,148,136,0.30),-8px -8px 16px rgba(255,255,255,0.4),inset 4px 4px 8px rgba(255,255,255,0.4),inset -4px -4px 8px rgba(0,0,0,0.08)`;
 const BG = `30px 30px 60px rgba(13,148,136,0.08),-30px -30px 60px #ffffff,inset 10px 10px 20px rgba(13,148,136,0.04),inset -10px -10px 20px rgba(255,255,255,0.8)`;
 
-// ── Step data — corrected against query.py / classifier.py ──────────────────
-// Step 05 updated: "Speculative review" (not in code) → "Semantic validation"
-// which IS the actual Stage 3 in query.py: validator.validate(intent)
+// ── Step data — mirrors the Stage numbers in gateway/api/routes/query.py ────
+// Keep these in sync with that file. Two corrections that matter:
+//   * Routing and entity resolution are ONE LLM call, not two. There is no
+//     IntentClassifier round trip in the pipeline — query_type comes back from
+//     IntentExtractor.extract() alongside the metric and dimensions.
+//   * Validation and the cache read happen BEFORE SQL compilation (Stages 2 and
+//     3, then Stage 5), not after. The page used to show compile → validate.
 const STEPS = [
   {
     num: '01', icon: MessageSquare,
@@ -28,55 +32,55 @@ const STEPS = [
     tag: 'Input', title: 'Ask in plain English',
     badge: 'Entry point',
     summary: 'You type a question like "What\'s churn by plan type this quarter?" — no SQL knowledge, no schema memorization needed.',
-    detail: 'The question arrives at the React frontend and is sent as a raw string in a POST /api/v1/query body to the FastAPI Gateway. No classification or SQL happens yet — this is purely the user input stage. The gateway generates a unique request_id for the full pipeline trace.',
+    detail: 'The question arrives at the React frontend and is sent as a raw string in a POST /api/v1/query body to the FastAPI Gateway, together with any prior conversation turns. No classification or SQL happens yet. The gateway generates a unique request_id that traces the whole pipeline in the logs.',
   },
   {
     num: '02', icon: Brain,
     gradient: 'from-violet-400 to-violet-600', accent: '#7C3AED',
-    tag: 'Routing', title: 'Classify intent',
-    badge: 'Guardrail',
-    summary: 'The gateway decides if this is a metric question, a schema question, or completely out of scope — before touching any data.',
-    detail: 'IntentClassifier.classify() calls Gemini 1.5 Flash (primary) with a strict system prompt that routes to one of three QueryType values: METRIC_QUERY, SCHEMA_QUESTION, or OUT_OF_SCOPE. Schema and out-of-scope questions return template responses immediately — they never reach the SQL pipeline. This is the primary defence against prompt-injection and arbitrary SQL generation.',
+    tag: 'Routing + resolution', title: 'Extract intent and route',
+    badge: 'One LLM call',
+    summary: 'A single model call decides what kind of question this is and maps your words to certified metrics, dimensions, filters and a time range.',
+    detail: 'IntentExtractor.extract() makes ONE call — Google Gemini Flash Lite as primary, with Groq and OpenRouter as automatic fallbacks — that returns both a query_type (metric_query, schema_question, out_of_scope) and the structured intent. Schema and out-of-scope questions answer immediately and never reach the SQL pipeline. The prompt pins ambiguous wording deterministically: a bare "churn" always resolves to churn_rate, never the raw count. Filters must come from the current question, so a follow-up cannot silently inherit an earlier turn\'s scope. Unresolvable terms return needs_clarification — never a silent guess.',
   },
   {
-    num: '03', icon: Map,
-    gradient: 'from-amber-400 to-amber-600', accent: '#D97706',
-    tag: 'Resolution', title: 'Resolve entities & dimensions',
-    badge: 'Semantic mapping',
-    summary: 'Plan type, country, cohort — the gateway maps your words to certified fields in the semantic model.',
-    detail: 'IntentExtractor.extract() calls Gemini again to parse the metric name, dimensions, filters, and time range from the raw question. MetricRegistry.get_dimensions_for_metric() resolves allowed dimensions per metric. Entity-prefixed names (e.g. subscriber__plan_type) are resolved via a dynamic dimension prefix map built from the dbt manifest on startup. Unresolvable terms cause a 422 needs_clarification response — never a silent failure.',
+    num: '03', icon: Zap,
+    gradient: 'from-orange-400 to-orange-600', accent: '#EA580C',
+    tag: 'Cache', title: 'Result cache check',
+    badge: 'Fast path',
+    summary: 'Asked this exact question before? The answer returns here, in about a second.',
+    detail: 'QueryCache is keyed on the fully parsed intent — metric, dimensions, time range and filters — not on the raw question string, so two differently-worded questions with the same meaning share an entry. This check sits at Stage 2, before validation and compilation, so a hit skips everything downstream including Snowflake. That is why it lands this early rather than next to execution.',
   },
   {
-    num: '04', icon: Code2,
-    gradient: 'from-teal-400 to-teal-600', accent: '#0D9488',
-    tag: 'Compilation', title: 'Generate governed SQL',
-    badge: 'Core guarantee',
-    summary: 'MetricFlow compiles SQL from certified metric definitions — not a freeform LLM guess at your schema.',
-    detail: 'SQLGenerator.generate() invokes the MetricFlow CLI subprocess with the resolved metric name, dimensions, and time grain. MetricFlow reads the dbt semantic model YAML and produces grain-safe SQL that respects the certified join topology. A SQLTemplateCache layer (TTL-keyed by metric + dimension set) skips the subprocess entirely on repeated combinations — the {start_date}/{end_date} parameterization fix was critical to making date-range cache hits actually work.',
-  },
-  {
-    num: '05', icon: ShieldCheck,
+    num: '04', icon: ShieldCheck,
     gradient: 'from-emerald-400 to-emerald-600', accent: '#059669',
     tag: 'Validation', title: 'Semantic validation',
     badge: 'Safety gate',
-    summary: 'Before SQL is generated, the gateway validates the resolved intent against grain rules, certified dimensions, and metric definitions.',
-    detail: 'SemanticValidator.validate(intent) runs in Stage 3 of the pipeline — before SQL generation. It checks: (1) all requested metrics are certified, (2) all dimensions are valid for those metrics, (3) the time grain is supported. Any violation returns HTTP 422 with the specific rule that was broken. This is what blocks cross-grain joins and uncertified column references — structurally, not via prompting.',
+    summary: 'Before any SQL exists, the resolved intent is checked against grain rules, certified dimensions and metric definitions.',
+    detail: 'SemanticValidator.validate(intent) runs at Stage 3 — before SQL generation, not after. It checks that every requested metric is certified, that each dimension is valid for those metrics, and that the time grain is supported. A violation returns HTTP 422 naming the specific rule broken. This is what structurally blocks cross-grain joins and uncertified column references, rather than relying on the prompt to behave.',
   },
   {
-    num: '06', icon: Zap,
-    gradient: 'from-orange-400 to-orange-600', accent: '#EA580C',
-    tag: 'Execution', title: 'Cache check & execute',
-    badge: 'Performance',
-    summary: 'Seen this exact query before? Instant answer. Otherwise the validated SQL runs against Snowflake.',
-    detail: 'An intent-keyed QueryCache is checked first (keyed on the full parsed intent dict, not the raw SQL string). On a CACHE MISS, SQLGenerator.execute_query() dispatches the compiled SQL to the shared Snowflake connection pool (SnowflakePool, sized dynamically from SNOWFLAKE_POOL_SIZE). Results are capped at max_rows and stored back into the cache with a configurable TTL so the next identical query is served in milliseconds.',
+    num: '05', icon: Code2,
+    gradient: 'from-teal-400 to-teal-600', accent: '#0D9488',
+    tag: 'Compilation', title: 'Compile governed SQL',
+    badge: 'Core guarantee',
+    summary: 'MetricFlow compiles the SQL from your certified metric definitions on every single query — the LLM never writes SQL.',
+    detail: 'A warm in-process MetricFlow engine, built once at startup, compiles from the dbt semantic manifest in roughly 60 milliseconds. It runs FIRST on every request: the semantic layer is the source of truth, so nothing is served from a pre-built template while the engine is healthy, and a metric definition change takes effect on deploy. Behind it sit three fallbacks in order — a compiled-template cache, the mf CLI subprocess, and a governed builder — used only if the engine is unavailable. A filter on a column you also grouped by is applied as an outer predicate, so narrowing to one country returns one row instead of quietly returning all of them.',
+  },
+  {
+    num: '06', icon: Server,
+    gradient: 'from-cyan-400 to-cyan-600', accent: '#0891B2',
+    tag: 'Execution', title: 'Run it on Snowflake',
+    badge: 'Pooled',
+    summary: 'The compiled SQL executes against Snowflake over a warm connection pool.',
+    detail: 'SQLGenerator.execute_query() dispatches the compiled SQL through SnowflakePool, opened at startup so no request pays connection setup. Results are capped at the caller\'s max_rows and written back into the intent-keyed cache with a configurable TTL. Execution is typically the single largest slice of the response time — around 1.5 to 2 seconds — now that compilation costs milliseconds.',
   },
   {
     num: '07', icon: GitBranch,
-    gradient: 'from-cyan-400 to-cyan-600', accent: '#0891B2',
-    tag: 'Output', title: 'Return result + lineage',
+    gradient: 'from-amber-400 to-amber-600', accent: '#D97706',
+    tag: 'Output', title: 'Return result, lineage and summary',
     badge: 'Full traceability',
-    summary: 'You get your answer, the SQL that produced it, and a traceable path back to the raw source tables.',
-    detail: 'LineageResolver.resolve_metric() walks the dbt manifest graph from the metric node back to raw source tables. The final response payload includes: query results (rows), compiled SQL, the lineage graph, a Gemini-generated 2-sentence narrative summary, and the request_id for tracing. Lineage is queryable in the Lineage Explorer — every node is a certified dbt model or source.',
+    summary: 'You get the answer, the SQL that produced it, a path back to the raw source tables, and a plain-English summary.',
+    detail: 'LineageResolver.resolve_metric() walks the dbt manifest from the metric node back through marts, intermediate and staging models to the raw sources — every node a real dbt object, not a hardcoded label. A SECOND LLM call then writes a short narrative from the returned rows; it is constrained to describe what the numbers show and is explicitly barred from asserting causes or recommending actions, because it sees values without knowing which metric answered the question. The payload carries rows, compiled SQL, the lineage graph, the narrative and the request_id.',
   },
 ];
 
@@ -90,7 +94,7 @@ const HARD = [
 
 // ── Pipeline nodes — verified against actual gateway code ───────────────────
 // FastAPI Gateway = Steps 02, 03, 04, 05, 06 (central orchestrator)
-// Gemini LLM = Step 02 (classification), Step 03 (intent extraction)
+// Gemini LLM = Step 02 (intent + routing, one call) and Step 07 (narrative)
 // Snowflake DWH = Step 06 (query execution)
 // MetricFlow = Step 04 (SQL compilation)
 // React Frontend = Step 07 (result display) and initial user input (Step 01)
@@ -98,9 +102,9 @@ const PIPELINE = [
   { icon: Database, label: 'Raw SaaS\nData',       gradient: 'from-sky-400 to-sky-600',         step: null,     note: null },
   { icon: Server,   label: 'Snowflake\nDWH',       gradient: 'from-cyan-400 to-cyan-600',       step: '06',     note: 'Execution' },
   { icon: Code2,    label: 'dbt\nModels',          gradient: 'from-amber-400 to-amber-600',     step: null,     note: null },
-  { icon: Layers,   label: 'MetricFlow\nSemantic', gradient: 'from-teal-400 to-teal-600',       step: '04',     note: 'SQL compile' },
-  { icon: Shield,   label: 'FastAPI\nGateway',     gradient: 'from-emerald-400 to-emerald-600', step: '02–06',  note: 'Orchestrator' },
-  { icon: Cpu,      label: 'Gemini 1.5\nLLM',      gradient: 'from-teal-400 to-teal-700',       step: '02–03',  note: 'Classify + Extract' },
+  { icon: Layers,   label: 'MetricFlow\nSemantic', gradient: 'from-teal-400 to-teal-600',       step: '05',     note: 'SQL compile' },
+  { icon: Shield,   label: 'FastAPI\nGateway',     gradient: 'from-emerald-400 to-emerald-600', step: '02–07',  note: 'Orchestrator' },
+  { icon: Cpu,      label: 'Gemini\nLLM',          gradient: 'from-teal-400 to-teal-700',       step: '02 + 07', note: 'Intent + narrative' },
   { icon: Monitor,  label: 'React\nFrontend',      gradient: 'from-cyan-400 to-teal-600',       step: '01 + 07', note: 'Input + Output' },
 ];
 
@@ -270,7 +274,7 @@ export default function HowItWorksPage() {
           </div>
           <span className="text-[#4A7B76]/35">·</span>
           <span className="text-xs font-semibold text-[#4A7B76]" style={{ fontFamily: 'DM Sans, sans-serif' }}>
-            7 steps · MetricFlow · Gemini 1.5 · Snowflake
+            7 steps · 2 LLM calls · MetricFlow · Snowflake
           </span>
         </div>
 
@@ -386,7 +390,7 @@ export default function HowItWorksPage() {
             The 7 steps mapped onto the full stack. Step badges show which steps each node handles.
           </p>
           <p className="text-xs font-medium text-[#4A7B76]" style={{ fontFamily: 'DM Sans, sans-serif' }}>
-            FastAPI Gateway is the central orchestrator — it coordinates steps 02 through 06.
+            FastAPI Gateway is the central orchestrator — it coordinates steps 02 through 07.
           </p>
         </div>
 

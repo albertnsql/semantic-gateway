@@ -50,6 +50,16 @@ class LineageTrace(BaseModel):
 
 # ──────────────────────────────────────────────── Layer classification
 
+# Display order for a lineage path. dbt lineage flows one direction only, so the
+# rendered chain must always read raw → staging → intermediate → marts regardless
+# of the order upstream models happen to be discovered in.
+_LAYER_ORDER: dict[str, int] = {
+    "raw": 0,
+    "staging": 1,
+    "intermediate": 2,
+    "marts": 3,
+}
+
 _LAYER_KEYWORDS: dict[str, str] = {
     "raw": "raw",
     "source": "raw",
@@ -180,17 +190,30 @@ class LineageResolver:
                 )
             )
 
-        # Also pull manifest source tables (leaves)
-        source_nodes = self._manifest.get_source_tables()
-        for sn in source_nodes:
-            # Format: "source.streaming_analytics.raw.subscribers"
-            parts = sn.split(".")
-            if len(parts) >= 3:
-                table_name = parts[-1]
-                if table_name not in source_tables and any(
-                    table_name in m for m in upstream_models
-                ):
-                    source_tables.append(table_name)
+        # Fallback only. get_upstream_models() now follows source. nodes, so the loop
+        # above already collected them as fully-qualified names ("raw.subscribers").
+        # This block emits the BARE table name ("subscribers"), so running it
+        # unconditionally listed every source twice in two different formats — which
+        # is exactly what showed up in the Lineage Explorer. Keep it for models whose
+        # sources genuinely are not linked in the manifest.
+        if not source_tables:
+            for sn in self._manifest.get_source_tables():
+                # Format: "source.streaming_analytics.raw.subscribers"
+                parts = sn.split(".")
+                if len(parts) >= 3:
+                    table_name = parts[-1]
+                    if table_name not in source_tables and any(
+                        table_name in m for m in upstream_models
+                    ):
+                        source_tables.append(table_name)
+
+        # Order the displayed path by dbt layer: raw → staging → intermediate → marts.
+        # Do NOT rely on the order get_upstream_models() happens to return: it emits
+        # sources first, and `reversed()` above then pushed them to the END, so the
+        # Lineage Explorer rendered staging → intermediate → raw → marts. Sorting by
+        # layer here is explicit and immune to changes in the parser's ordering.
+        # `sorted` is stable, so within-layer order is preserved.
+        steps.sort(key=lambda s: _LAYER_ORDER.get(s.layer, len(_LAYER_ORDER)))
 
         logger.debug(
             "Resolved lineage for '%s': %d steps, %d source tables.",

@@ -605,8 +605,21 @@ ORDER BY 2 DESC
 
 def _sql_mrr_bridge(plans: list[str], years: list[int], countries: list[str], max_data_date: str) -> str:
     # Returns one row per (period_month, mrr_type) for the last 12 months.
-    # mrr_usd is always positive in fct_mrr_monthly; contraction and churned rows
-    # are negated here so the frontend can stack them below the zero baseline.
+    #
+    # A bridge component must be a MOVEMENT, so this sums mrr_change_usd — not
+    # mrr_usd, which is the subscription's full monthly price. Using mrr_usd
+    # overstated Expansion ($4,204 vs the real $1,738 uplift for 2026-06) and
+    # reconciled with the actual month-over-month MRR change in only 1 of 12
+    # months; the formula below reconciles to the cent in 11 of 12. It also makes
+    # Expansion match the certified `expansion_mrr` metric, so chat and dashboard
+    # now agree by construction instead of by coincidence.
+    #
+    # Churn needs the extra term: mrr_change_usd carries only PLAN-CHANGE deltas
+    # (its measure description enumerates new/expansion/contraction and omits
+    # churned on purpose — `retained` is likewise all zero). A churned
+    # subscription's loss is carried by mrr_usd on the row, so subtract it. The
+    # 7-of-502 churned rows with a non-zero change are subscriptions that also
+    # changed plan before leaving; adding both terms keeps them correct.
     plan_filter = _plan_clause(plans)
     country_filter = _country_clause_sub(countries)
     return f"""
@@ -614,7 +627,7 @@ def _sql_mrr_bridge(plans: list[str], years: list[int], countries: list[str], ma
 SELECT
     period_month,
     mrr_type,
-    SUM(CASE WHEN mrr_type IN ('contraction','churned') THEN -mrr_usd ELSE mrr_usd END) AS value
+    SUM(mrr_change_usd + CASE WHEN mrr_type = 'churned' THEN -mrr_usd ELSE 0 END) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE mrr_type IN ('new', 'expansion', 'contraction', 'churned')
   AND period_month >= DATEADD(month, -12, '{max_data_date}'::date)
