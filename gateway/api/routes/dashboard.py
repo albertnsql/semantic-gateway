@@ -28,6 +28,8 @@ from fastapi.responses import JSONResponse
 from fastapi.encoders import jsonable_encoder
 import decimal
 
+from config import settings
+
 def make_json_safe(obj):
     if isinstance(obj, list):
         return [make_json_safe(i) for i in obj]
@@ -44,6 +46,57 @@ router = APIRouter(tags=["Dashboard"])
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _DB = "STREAMING_ANALYTICS"
+# Resolves under DuckDB too: DuckDB derives the catalog name from the database
+# FILENAME (streaming_analytics.duckdb) and matches identifiers case-insensitively,
+# so these three-part names needed no change in the migration.
+
+
+# ── SQL dialect shims ─────────────────────────────────────────────────────────
+#
+# This module hand-writes SQL rather than going through MetricFlow, so it is the
+# one place that has to know which warehouse it is talking to. Exactly three
+# Snowflake builtins used here are absent from DuckDB — DATEADD, INITCAP and
+# TO_CHAR — and 5 of the 13 widgets hit them.
+#
+# These emit per-engine SQL instead of hard-coding DuckDB, so warehouse_engine can
+# be flipped back to snowflake without reverting the widget bodies. Everything
+# else the widgets use (QUALIFY, ::casts, DATE_TRUNC, NULLIF, ROUND) is common to
+# both and was left alone.
+
+_ENGINE = settings.warehouse_engine.lower()
+
+
+def _month_offset(base_date: str, months: int) -> str:
+    """
+    SQL for ``base_date`` shifted by ``months`` (negative = earlier).
+
+    DuckDB has no DATEADD. Interval arithmetic returns a TIMESTAMP, so the result
+    is cast back to DATE — otherwise comparisons against DATE columns like
+    period_month silently widen and the ``>= / <`` window boundaries shift.
+    """
+    if _ENGINE == "duckdb":
+        return f"CAST(DATE '{base_date}' + ({months} * INTERVAL 1 MONTH) AS DATE)"
+    return f"DATEADD('month', {months}, '{base_date}'::date)"
+
+
+def _initcap(expr: str) -> str:
+    """
+    SQL that capitalises the first letter of ``expr``.
+
+    Only used on single-word plan names (basic/standard/premium), which is why the
+    DuckDB form capitalises just the first character rather than every word —
+    it is not a general INITCAP replacement.
+    """
+    if _ENGINE == "duckdb":
+        return f"(UPPER(SUBSTR({expr}, 1, 1)) || LOWER(SUBSTR({expr}, 2)))"
+    return f"INITCAP({expr})"
+
+
+def _month_label(expr: str) -> str:
+    """SQL rendering ``expr`` as a 'Mon YYYY' label (e.g. 'Jun 2026')."""
+    if _ENGINE == "duckdb":
+        return f"STRFTIME({expr}, '%b %Y')"
+    return f"TO_CHAR({expr}, 'Mon YYYY')"
 
 # Whitelisted plan values — must match actual PLAN_TYPE values in fct_mrr_monthly / dim_subscribers
 _ALLOWED_PLANS: frozenset[str] = frozenset({"basic", "standard", "premium"})
@@ -593,7 +646,7 @@ WITH deduped AS (
     QUALIFY ROW_NUMBER() OVER (PARTITION BY subscriber_id ORDER BY period_month DESC) = 1
 )
 SELECT
-    INITCAP(plan_type) AS name,
+    {_initcap('plan_type')} AS name,
     COUNT(DISTINCT subscriber_id) AS value
 FROM deduped
 WHERE 1=1
@@ -630,8 +683,8 @@ SELECT
     SUM(mrr_change_usd + CASE WHEN mrr_type = 'churned' THEN -mrr_usd ELSE 0 END) AS value
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE mrr_type IN ('new', 'expansion', 'contraction', 'churned')
-  AND period_month >= DATEADD(month, -12, '{max_data_date}'::date)
-  AND period_month < DATEADD(month, 1, '{max_data_date}'::date)
+  AND period_month >= {_month_offset(max_data_date, -12)}
+  AND period_month < {_month_offset(max_data_date, 1)}
   {plan_filter}
   {country_filter}
 GROUP BY 1, 2
@@ -647,8 +700,8 @@ SELECT
     SUM(mrr_usd)                AS mrr
 FROM {_DB}.marts.fct_mrr_monthly
 WHERE is_active = TRUE
-  AND period_month >= DATEADD('month', -12, '{max_data_date}'::date)
-  AND period_month < DATEADD('month', 1, '{max_data_date}'::date)
+  AND period_month >= {_month_offset(max_data_date, -12)}
+  AND period_month < {_month_offset(max_data_date, 1)}
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY period_month
@@ -660,15 +713,15 @@ def _sql_retention_trend(plans: list[str], years: list[int], countries: list[str
     return f"""
 -- Dashboard: retention_trend — Retention Rate Trend (12 months)
 SELECT
-    TO_CHAR(DATE_TRUNC('month', period_month), 'Mon YYYY') AS name,
+    {_month_label("DATE_TRUNC('month', period_month)")} AS name,
     DATE_TRUNC('month', period_month) AS sort_key,
     ROUND(
       100.0 - (COUNT(DISTINCT CASE WHEN mrr_type = 'churned' THEN subscriber_id END)::FLOAT * 100.0 /
       NULLIF(COUNT(DISTINCT CASE WHEN mrr_type != 'inactive' THEN subscriber_id END), 0)), 1
     ) AS retention_rate
 FROM {_DB}.marts.fct_mrr_monthly
-WHERE period_month >= DATEADD('month', -12, '{max_data_date}'::date)
-  AND period_month < DATEADD('month', 1, '{max_data_date}'::date)
+WHERE period_month >= {_month_offset(max_data_date, -12)}
+  AND period_month < {_month_offset(max_data_date, 1)}
   {_plan_clause(plans)}
   {_country_clause_sub(countries)}
 GROUP BY DATE_TRUNC('month', period_month), name
@@ -681,12 +734,12 @@ def _sql_sessions_trend(plans: list[str], years: list[int], countries: list[str]
     return f"""
 -- Dashboard: sessions_trend — Stream session count by month, last 12 months (bar chart)
 SELECT
-    TO_CHAR(DATE_TRUNC('month', session_start), 'Mon YYYY') AS name,
+    {_month_label("DATE_TRUNC('month', session_start)")} AS name,
     DATE_TRUNC('month', session_start)                       AS sort_key,
     COUNT(*)                                                     AS sessions
 FROM {_DB}.marts.fct_stream_sessions
-WHERE session_start >= DATEADD('month', -12, '{max_data_date}'::date)
-  AND session_start < DATEADD('month', 1, '{max_data_date}'::date)
+WHERE session_start >= {_month_offset(max_data_date, -12)}
+  AND session_start < {_month_offset(max_data_date, 1)}
   {plan_filter}
   {_country_clause_sub(countries)}
 GROUP BY DATE_TRUNC('month', session_start), name

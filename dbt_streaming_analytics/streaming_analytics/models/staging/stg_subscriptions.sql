@@ -21,7 +21,7 @@ final as (
         cast(is_trial as boolean) as is_trial,
         cast(payment_method as varchar) as payment_method,
         cast(cancellation_reason as varchar) as cancellation_reason,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 

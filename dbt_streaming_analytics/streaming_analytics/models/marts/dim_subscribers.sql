@@ -45,7 +45,7 @@ final as (
         coalesce(p.total_upgrades, 0) as total_upgrades,
         coalesce(p.total_downgrades, 0) as total_downgrades,
         case when s.subscription_status = 'churned' then true else false end as is_churned,
-        datediff('day', s.signup_date, coalesce(s.churn_date, current_date())) as tenure_days
+        {{ dbt.datediff('s.signup_date', 'coalesce(s.churn_date, current_date())', 'day') }} as tenure_days
     from subscribers s
     left join engagement e on s.subscriber_id = e.subscriber_id
     left join cohorts c on s.subscriber_id = c.subscriber_id

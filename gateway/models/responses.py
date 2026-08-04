@@ -154,3 +154,18 @@ class HealthResponse(BaseModel):
         default=0,
         description="Number of active (non-expired) entries in the query result cache.",
     )
+    warehouse_engine: str = Field(
+        default="unknown",
+        description=(
+            "Which warehouse is serving queries: duckdb | snowflake. "
+            "snowflake_connected refers to whichever one this names."
+        ),
+    )
+    memory: dict = Field(
+        default_factory=dict,
+        description=(
+            "Resident memory snapshot: rss_mb, peak_mb, limit_mb, pct_of_limit, "
+            "source. Values are null when RSS cannot be sampled on this platform; "
+            "limit_mb/pct_of_limit are null when no container limit is detectable."
+        ),
+    )

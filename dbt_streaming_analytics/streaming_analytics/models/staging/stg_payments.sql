@@ -25,7 +25,7 @@ final as (
         cast(is_renewal as boolean) as is_renewal,
         cast(discount_applied as boolean) as discount_applied,
         cast(discount_pct as decimal(5,4)) as discount_pct,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 

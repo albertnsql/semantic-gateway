@@ -18,7 +18,7 @@ final as (
         cast(change_type as varchar) as change_type,
         cast(change_date as date) as change_date,
         cast(change_reason as varchar) as change_reason,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 

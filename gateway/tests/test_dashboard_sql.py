@@ -90,6 +90,67 @@ def _snowflake_configured() -> bool:
 
 _HAS_SNOWFLAKE = _snowflake_configured()
 
+
+def _duckdb_ready() -> bool:
+    """True when the DuckDB file exists and has marts built."""
+    try:
+        import os
+
+        import duckdb
+
+        from config import settings
+
+        path = os.path.abspath(settings.duckdb_path)
+        if not os.path.exists(path):
+            return False
+        con = duckdb.connect(path)
+        try:
+            return bool(
+                con.execute(
+                    "SELECT COUNT(*) FROM information_schema.tables "
+                    "WHERE table_schema = 'marts'"
+                ).fetchone()[0]
+            )
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+def _warehouse_pool():
+    """
+    Build a pool for whichever warehouse is configured.
+
+    The reconciliation assertions below are the only ones in this file with teeth,
+    and their SQL is dialect-neutral (CASE, LAG, USING) — so the gate is about
+    warehouse REACHABILITY, not about Snowflake specifically. Keeping it
+    Snowflake-only is what silently disabled them when the trial expired.
+    """
+    from config import settings
+
+    if settings.warehouse_engine.lower() == "duckdb":
+        from core.duckdb_pool import DuckDBPool
+
+        return DuckDBPool(settings=settings)
+
+    from core.snowflake_pool import SnowflakePool
+
+    return SnowflakePool(settings=settings, size=1)
+
+
+def _warehouse_available() -> bool:
+    """Whether the configured warehouse can actually answer a query."""
+    try:
+        from config import settings
+    except Exception:
+        return False
+    if settings.warehouse_engine.lower() == "duckdb":
+        return _duckdb_ready()
+    return _HAS_SNOWFLAKE
+
+
+_HAS_WAREHOUSE = _warehouse_available()
+
 _RECONCILE_SQL = """
 WITH movement AS (
     SELECT period_month,
@@ -124,7 +185,7 @@ ORDER BY d.period_month
 """
 
 
-@pytest.mark.skipif(not _HAS_SNOWFLAKE, reason="Snowflake credentials not configured")
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="No warehouse reachable")
 def test_bridge_components_reconcile_with_actual_mrr_change() -> None:
     """
     The components must sum to the real month-over-month change in active MRR.
@@ -132,10 +193,7 @@ def test_bridge_components_reconcile_with_actual_mrr_change() -> None:
     This is the assertion the widget never had. Under the old formula it failed in
     11 of 12 months, by up to $1,984 in a single month.
     """
-    from config import settings
-    from core.snowflake_pool import SnowflakePool
-
-    pool = SnowflakePool(settings=settings, size=1)
+    pool = _warehouse_pool()
     pool.initialise()
     try:
         with pool.acquire() as conn:
@@ -159,7 +217,7 @@ def test_bridge_components_reconcile_with_actual_mrr_change() -> None:
     )
 
 
-@pytest.mark.skipif(not _HAS_SNOWFLAKE, reason="Snowflake credentials not configured")
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="No warehouse reachable")
 def test_bridge_expansion_matches_the_certified_metric() -> None:
     """
     Expansion in the bridge must equal the `expansion_mrr` metric.
@@ -168,10 +226,7 @@ def test_bridge_expansion_matches_the_certified_metric() -> None:
     metric in MetricFlow. They disagreed ($4,204.22 vs $1,738.06) because only the
     metric used the movement column.
     """
-    from config import settings
-    from core.snowflake_pool import SnowflakePool
-
-    pool = SnowflakePool(settings=settings, size=1)
+    pool = _warehouse_pool()
     pool.initialise()
     try:
         with pool.acquire() as conn:

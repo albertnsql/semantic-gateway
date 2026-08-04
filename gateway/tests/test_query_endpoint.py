@@ -243,6 +243,10 @@ def client():
     mock_settings = MagicMock()
     mock_settings.gateway_version = "1.0.0"
     mock_settings.gateway_env = "test"
+    # Must be a real str: /health returns it as HealthResponse.warehouse_engine and
+    # pydantic rejects a MagicMock. A bare MagicMock() attribute would 500 the
+    # endpoint rather than fail a clean assertion.
+    mock_settings.warehouse_engine = "duckdb"
     mock_settings.snowflake_account = "test.snowflakecomputing.com"
     mock_settings.snowflake_user = "test_user"
     mock_settings.snowflake_password = "test_password"

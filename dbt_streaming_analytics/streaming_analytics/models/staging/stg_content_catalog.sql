@@ -24,7 +24,7 @@ final as (
         cast(director as varchar) as director,
         cast(production_country as varchar) as production_country,
         cast(date_added_platform as date) as date_added_platform,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 

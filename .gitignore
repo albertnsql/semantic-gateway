@@ -43,3 +43,12 @@ Audit.md
 Claude.md
 CLAUDE.md
 gateway/build_templates.ps1
+
+# DuckDB warehouse — a BUILD ARTIFACT, never commit it.
+# 210 MB with raw+staging+marts, 98.5 MB for marts only, i.e. right at GitHub's
+# 100 MB per-file hard limit. Rebuild instead:
+#   python load_raw_data_to_duckdb.py
+#   cd dbt_streaming_analytics/streaming_analytics && dbt run   # DBT_TARGET=duckdb
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp/

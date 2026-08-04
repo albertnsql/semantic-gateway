@@ -12,8 +12,8 @@ plan_history as (
 ),
 
 months as (
-    select dateadd(month, seq4(), '2020-01-01'::date) as period_month
-    from table(generator(rowcount => 120)) -- 10 years of months
+    -- 10 years of months
+    {{ date_series('2020-01-01', 120, 'month', 'period_month') }}
 ),
 
 -- 1. Get the very first plan for subscribers who changed plans
@@ -103,7 +103,7 @@ subscription_periods as (
         and m.period_month < date_trunc('month', t.valid_to)
         and m.period_month <= case 
             when t.status = 'active' then date_trunc('month', current_date())
-            else dateadd(month, 1, date_trunc('month', coalesce(t.end_date, current_date())))
+            else {{ dbt.dateadd('month', 1, "date_trunc('month', coalesce(t.end_date, current_date()))") }}
         end
 )
 

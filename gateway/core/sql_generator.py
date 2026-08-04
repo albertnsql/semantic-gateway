@@ -791,9 +791,29 @@ class SQLGenerator:
                 logger.warning("dbt_project_dir is unset — cannot build the warm engine.")
                 return None
 
+            # RAM before/after the build. This is the one measurement worth having
+            # on a 512 MB instance: config.py documents ~100 MB resident for the
+            # engine, and this is where that claim becomes observable. Logging
+            # here rather than in main.py's pre-warm thread covers BOTH entry
+            # paths — startup pre-warm and the lazy first-miss build.
+            from core import memory
+
+            rss_before = memory.rss_mb()
+            build_started = time.perf_counter()
+
             self._warm_engine = WarmMetricFlowEngine.try_build(
                 dbt_project_dir=project_dir,
                 dbt_profiles_dir=project_dir,
+            )
+
+            memory.log_status(
+                "MetricFlow engine built in %.1fs (%s)"
+                % (
+                    time.perf_counter() - build_started,
+                    "ok" if self._warm_engine is not None else "FAILED",
+                ),
+                target_logger=logger,
+                baseline_mb=rss_before,
             )
             return self._warm_engine
 
@@ -1056,6 +1076,11 @@ class SQLGenerator:
         Raises:
             SnowflakeConnectionError: On connection failure or query timeout.
         """
+        # DuckDBPool exposes its own execute(): it enforces the read-only guard and
+        # uppercases column names to match Snowflake's DictCursor, so downstream
+        # response shaping is unchanged by the engine swap.
+        if self._pool is not None and hasattr(self._pool, "execute"):
+            return self._pool.execute(compiled_sql)
         if self._pool is not None:
             return self._execute_with_pool(compiled_sql)
         return self._execute_direct(compiled_sql)

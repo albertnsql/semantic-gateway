@@ -15,6 +15,7 @@ import logging
 
 from fastapi import APIRouter, Request
 
+from core import memory
 from models.responses import HealthResponse
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,8 @@ async def health_check(request: Request) -> HealthResponse:
     settings = state.settings
 
     # ── Core checks ───────────────────────────────────────────────────────────
+    # snowflake_connected predates the DuckDB migration and now means "the
+    # configured warehouse is connected"; warehouse_engine below says which one.
     snowflake_ok: bool = getattr(state, "snowflake_connected", False)
     manifest_loaded  = getattr(state.manifest_parser, "_loaded", False)
     metrics_count    = len(state.metric_registry.list_metrics())
@@ -73,6 +76,12 @@ async def health_check(request: Request) -> HealthResponse:
     cache_stats = query_cache.stats() if query_cache else {}
     cache_entries = cache_stats.get("active_entries", 0)
 
+    # ── Resident memory ───────────────────────────────────────────────────────
+    # Deliberately does NOT affect overall_status: being near the memory ceiling
+    # is something to alert a human about, not a reason to fail a health probe
+    # and trigger the restart that loses the warm MetricFlow engine.
+    memory_status = memory.memory_status()
+
     # ── Overall status ────────────────────────────────────────────────────────
     overall_status = "healthy" if (manifest_loaded and metrics_count > 0) else "degraded"
 
@@ -88,4 +97,6 @@ async def health_check(request: Request) -> HealthResponse:
         llm_primary=llm_primary,
         llm_fallback=llm_fallback,
         cache_entries=cache_entries,
+        memory=memory_status,
+        warehouse_engine=settings.warehouse_engine,
     )

@@ -14,7 +14,7 @@ final as (
         cast(genre as varchar) as genre,
         cast(is_primary as boolean) as is_primary,
         cast(tag_type as varchar) as tag_type,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 

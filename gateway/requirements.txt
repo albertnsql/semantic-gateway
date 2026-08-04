@@ -12,5 +12,14 @@ httpx>=0.27.0
 chromadb>=0.4.0
 dbt-core>=1.8.0
 dbt-snowflake>=1.8.0
+# DuckDB is the active warehouse (warehouse_engine=duckdb) since the Snowflake
+# trial expired; dbt-snowflake stays installed so DBT_TARGET=dev still works if
+# that account is revived.
+dbt-duckdb>=1.10.1
+duckdb>=1.5.5
 dbt-metricflow>=0.13.0
 urllib3>=1.21.1,<2.0.0
+# RSS sampling for the RAM log lines (core/memory.py). Optional at runtime — the
+# module falls back to /proc/self/statm on Linux and GetProcessMemoryInfo on
+# Windows, so a failed wheel build degrades the log line, not the gateway.
+psutil>=5.9.0

@@ -32,6 +32,8 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from config import settings
 from cache import QueryCache
+from core import memory
+from core.duckdb_pool import DuckDBPool
 from core.intent_extractor import IntentExtractor
 from core.lineage_resolver import LineageResolver
 from core.manifest_parser import ManifestParser
@@ -69,6 +71,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("OpenAI model: %s", settings.openai_model)
     logger.info("=" * 60)
 
+    # ── 0. Memory reporting ───────────────────────────────────────────────────
+    # Sampled before anything else is built, so every later line has a real
+    # baseline to subtract. On a 512 MB Render instance this baseline is the
+    # number that decides whether the warm MetricFlow engine (+101 MB measured)
+    # still fits.
+    baseline_rss_mb: float | None = None
+    if settings.log_memory:
+        memory.configure(
+            limit_mb=settings.memory_limit_mb,
+            warn_pct=settings.memory_warn_pct,
+        )
+        baseline_rss_mb = memory.log_status("startup (pre-init)", target_logger=logger)
+
     # ── 1. Parse the dbt manifest ─────────────────────────────────────────────
     manifest_parser = ManifestParser()
     try:
@@ -103,17 +118,38 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     response_builder = ResponseBuilder(metric_registry=metric_registry)
 
-    # ── 4. Open Snowflake connection pool (replaces per-query connect) ───────
-    # Dynamically size pool for Render's 512MB RAM constraint
-    pool_size = int(os.getenv("SNOWFLAKE_POOL_SIZE", "5"))
-    snowflake_pool = SnowflakePool(settings=settings, size=pool_size)
-    snowflake_ok   = False
-    try:
-        snowflake_pool.initialise()
-        snowflake_ok = True
-        logger.info("✓ Snowflake pool ready.")
-    except Exception as exc:
-        logger.warning("✗ Snowflake pool init failed: %s", exc)
+    # ── 4. Open the warehouse connection ─────────────────────────────────────
+    # warehouse_engine selects DuckDB (default since the Snowflake trial expired)
+    # or Snowflake. Both pools expose the same interface, so nothing downstream
+    # branches on the engine — see core/duckdb_pool.py.
+    if settings.warehouse_engine.lower() == "duckdb":
+        # dbt and the in-process MetricFlow engine read DUCKDB_PATH from the
+        # environment via profiles.yml. dbt-duckdb resolves a RELATIVE path against
+        # the cwd, and the gateway's cwd is not the dbt project dir, so export an
+        # absolute path here or MetricFlow silently compiles against a different
+        # (or missing) file.
+        os.environ["DUCKDB_PATH"] = os.path.abspath(settings.duckdb_path)
+        os.environ.setdefault("DBT_TARGET", "duckdb")
+
+        snowflake_pool = DuckDBPool(settings=settings)
+        snowflake_ok = False
+        try:
+            snowflake_pool.initialise()
+            snowflake_ok = True
+            logger.info("✓ DuckDB ready at '%s'.", os.environ["DUCKDB_PATH"])
+        except Exception as exc:
+            logger.error("✗ DuckDB init failed: %s", exc)
+    else:
+        # Dynamically size pool for Render's 512MB RAM constraint
+        pool_size = int(os.getenv("SNOWFLAKE_POOL_SIZE", "5"))
+        snowflake_pool = SnowflakePool(settings=settings, size=pool_size)
+        snowflake_ok   = False
+        try:
+            snowflake_pool.initialise()
+            snowflake_ok = True
+            logger.info("✓ Snowflake pool ready.")
+        except Exception as exc:
+            logger.warning("✗ Snowflake pool init failed: %s", exc)
 
     sql_generator = SQLGenerator(settings=settings, pool=snowflake_pool if snowflake_ok else None)
 
@@ -250,6 +286,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     else:
         logger.info("✓ CacheWarmer disabled via environment variable.")
 
+    # ── 9. Memory: post-init reading + idle heartbeat ────────────────────────
+    # The delta against the pre-init baseline is the cost of everything above
+    # (manifest, registry, pool, caches). The MetricFlow engine is deliberately
+    # NOT in it — it builds on a background thread and logs its own delta from
+    # SQLGenerator._get_warm_engine(), which also covers the lazy first-miss path.
+    memory_heartbeat_stop = threading.Event()
+    if settings.log_memory:
+        memory.log_status(
+            "startup (services ready)",
+            target_logger=logger,
+            baseline_mb=baseline_rss_mb,
+        )
+        memory.start_heartbeat(
+            settings.memory_log_interval_seconds,
+            target_logger=logger,
+            stop_event=memory_heartbeat_stop,
+        )
+
     logger.info("=" * 60)
     logger.info(
         "Gateway ready. %d metrics loaded. Listening for requests…",
@@ -260,6 +314,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield  # application runs here
 
     logger.info("AI Semantic Gateway shutting down.")
+    if settings.log_memory:
+        memory.log_status(
+            "shutdown", target_logger=logger, baseline_mb=baseline_rss_mb
+        )
+    memory_heartbeat_stop.set()
     try:
         if hasattr(app.state, "cache_warmer"):
             app.state.cache_warmer.stop()
@@ -336,36 +395,48 @@ async def api_key_auth_middleware(request: Request, call_next):
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     """
-    Log every request with method, path, duration, and status code.
+    Log every request with method, path, duration, status code and RAM status.
+
     Injects a unique X-Request-ID header into both the request state
     and the response.
+
+    The RSS suffix is measured AFTER the handler returns and carries a delta
+    against the reading taken before it, so a query that inflates the process
+    (a MetricFlow build, a large result set) is attributable to the request that
+    caused it rather than to whatever ran next. Disable with
+    ``log_memory_per_request=false``.
     """
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     request.state.request_id = request_id
     start = time.perf_counter()
+
+    track_memory = settings.log_memory and settings.log_memory_per_request
+    rss_before = memory.rss_mb() if track_memory else None
 
     try:
         response = await call_next(request)
     except Exception as exc:
         elapsed = (time.perf_counter() - start) * 1000
         logger.error(
-            "[%s] %s %s → ERROR in %.1f ms: %s",
+            "[%s] %s %s → ERROR in %.1f ms: %s | %s",
             request_id,
             request.method,
             request.url.path,
             elapsed,
             exc,
+            memory.format_status(baseline_mb=rss_before) if track_memory else "rss=off",
         )
         raise
 
     elapsed = (time.perf_counter() - start) * 1000
     logger.info(
-        "[%s] %s %s → %d in %.1f ms",
+        "[%s] %s %s → %d in %.1f ms | %s",
         request_id,
         request.method,
         request.url.path,
         response.status_code,
         elapsed,
+        memory.format_status(baseline_mb=rss_before) if track_memory else "rss=off",
     )
 
     response.headers["X-Request-ID"] = request_id

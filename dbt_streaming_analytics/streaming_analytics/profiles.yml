@@ -1,6 +1,42 @@
 streaming_analytics:
-  target: dev
+  # Switch warehouses with DBT_TARGET=dev (Snowflake) / duckdb.
+  # Defaults to duckdb: the Snowflake trial expired 2026-08-03 and all of its
+  # warehouses are suspended, so `dev` cannot connect until billing is added.
+  target: "{{ env_var('DBT_TARGET', 'duckdb') }}"
   outputs:
+    duckdb:
+      type: duckdb
+      # ABSOLUTE path strongly preferred. dbt-duckdb resolves a relative path
+      # against the CURRENT WORKING DIRECTORY, not the project dir — so the
+      # fallback below is only correct when dbt is invoked from this directory.
+      # The gateway exports DUCKDB_PATH as an absolute path before building the
+      # in-process MetricFlow engine, which runs with a different cwd.
+      #
+      # The FILENAME matters: DuckDB derives the catalog name from it, so
+      # streaming_analytics.duckdb is what makes `database: streaming_analytics`
+      # in models/staging/_sources.yml resolve, and keeps the dashboard route's
+      # STREAMING_ANALYTICS.marts.<table> three-part names working unchanged.
+      path: "{{ env_var('DUCKDB_PATH', '../../streaming_analytics.duckdb') }}"
+      # Layer schemas (staging/intermediate/marts) come from dbt_project.yml via
+      # macros/generate_schema_name.sql, which passes custom names through
+      # verbatim; this is only the fallback for models without a custom schema.
+      schema: marts
+      threads: 4
+
+    # DO NOT add a read-only duckdb target — it cannot work, and the reason is
+    # not obvious. dbt-duckdb hardcodes `read_only=False` in duckdb.connect()
+    # (environments/__init__.py:139 and :159), so no profile key — not
+    # config_options.access_mode, not settings — can make the adapter open the
+    # file read-only. DuckDB then refuses a second connection with a DIFFERENT
+    # config in the same process, so the gateway's own connection is forced to be
+    # read-write too, because it shares a process with the in-process MetricFlow
+    # engine (which goes through dbt-duckdb).
+    #
+    # The serving path therefore CANNOT be made physically read-only here. The
+    # gateway enforces read-only at the SQL layer instead — see
+    # core/duckdb_pool.py, which rejects any statement that is not a single
+    # read-only SELECT before executing it.
+
     dev:
       type: snowflake
       account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"

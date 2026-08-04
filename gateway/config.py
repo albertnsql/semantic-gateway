@@ -47,6 +47,24 @@ class Settings(BaseSettings):
     google_model: str = "gemini-3.1-flash-lite"
     google_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
+    # ----------------------------------------------------------------- Warehouse
+    # Which engine serves queries. Switched to duckdb on 2026-08-03: the Snowflake
+    # trial ended and all of its virtual warehouses were suspended, so every query
+    # returned 503. Set warehouse_engine=snowflake to switch back once billing is
+    # restored — the Snowflake settings below are kept intact for exactly that.
+    #
+    # This flag must agree with the dbt target (DBT_TARGET=duckdb|dev), because the
+    # in-process MetricFlow engine compiles through dbt's profiles.yml. main.py
+    # exports DUCKDB_PATH for dbt/MetricFlow so both sides resolve one file.
+    warehouse_engine: str = "duckdb"
+
+    # Path to the DuckDB file, relative to the gateway working directory.
+    # The FILENAME matters: DuckDB derives the catalog name from it, which is what
+    # makes `database: streaming_analytics` in the dbt sources and the dashboard
+    # route's STREAMING_ANALYTICS.marts.<table> names resolve unchanged.
+    # Build it with load_raw_data_to_duckdb.py + `dbt run`.
+    duckdb_path: str = "../streaming_analytics.duckdb"
+
     # --------------------------------------------------------------- Snowflake
     snowflake_account: str = "your-account.snowflakecomputing.com"
     snowflake_user: str = "snowflake_user"
@@ -122,7 +140,44 @@ class Settings(BaseSettings):
     #   sql_template_cache_maxsize ≤ 50  (each entry ~4 KB SQL string)
     query_cache_maxsize: int = 500           # lower to 100 on 512 MB hosts
     sql_template_cache_maxsize: int = 200    # lower to 50  on 512 MB hosts
-    
+
+    # ------------------------------------------------- Memory (RAM) observability
+    # The caps above were tuned against measured numbers (warm engine 150 -> 251 MB)
+    # that nothing actually reported at runtime, so an OOM restart on Render read
+    # like any other restart. These flags render RSS into the logs via core/memory.py.
+    #
+    #   log_memory=false                 kills every RAM log line at once
+    #   log_memory_per_request=false     keeps startup + heartbeat, drops the per-request suffix
+    #   memory_log_interval_seconds=0    disables the idle heartbeat
+    #
+    # Sampling uses psutil when installed and falls back to /proc/self/statm
+    # (Linux/Render) or GetProcessMemoryInfo (Windows), so it degrades to "n/a"
+    # rather than failing.
+    log_memory: bool = True
+
+    # Append `rss=…` to each request log line. Cheap (one integer read next to a
+    # ~1.5 s Snowflake round trip) and it is what ties a spike to a specific query.
+    log_memory_per_request: bool = True
+
+    # Background heartbeat interval. The per-request line only fires while traffic
+    # flows, so it cannot show drift on an idle instance — which is exactly the
+    # shape of a leak that ends in an OOM restart. 0 disables.
+    #
+    # Off under pytest: test_query_endpoint.py boots the real lifespan per test, and
+    # ~17 daemon threads logging RAM would add noise without ever running long
+    # enough to sample twice.
+    memory_log_interval_seconds: int = 0 if "pytest" in sys.modules else 300
+
+    # Memory ceiling used for the "% of limit" figure. 0 = auto-detect from the
+    # cgroup, which is the correct number on Render (the container limit is what
+    # triggers the OOM kill, not the host's total RAM). Set explicitly only when
+    # running somewhere the cgroup is not readable.
+    memory_limit_mb: int = 0
+
+    # Above this percentage of the limit, RAM status lines log at WARNING.
+    memory_warn_pct: float = 85.0
+
+
     warmup_matrix: dict[str, list[str]] = {
         # MetricFlow-validated dimension names only.
         # Prefixes must match the entity defined in the semantic model:

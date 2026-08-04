@@ -4,8 +4,8 @@
 -- Dependencies: None
 
 with date_spine as (
-    select dateadd(day, seq4(), '2022-01-01'::date) as date_day
-    from table(generator(rowcount => 2192)) -- 6 years of days (2022 to 2027 inclusive)
+    -- 6 years of days (2022 to 2027 inclusive)
+    {{ date_series('2022-01-01', 2192, 'day', 'date_day') }}
 ),
 
 final as (
@@ -19,7 +19,7 @@ final as (
         dayname(date_day) as day_name,
         monthname(date_day) as month_name,
         case when dayofweek(date_day) in (0, 6) then true else false end as is_weekend,
-        case when date_day = last_day(date_day, 'month') then true else false end as is_month_end,
+        case when date_day = {{ dbt.last_day('date_day', 'month') }} then true else false end as is_month_end,
         quarter(date_day) as fiscal_quarter
     from date_spine
 )

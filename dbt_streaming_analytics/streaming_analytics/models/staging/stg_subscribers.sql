@@ -23,7 +23,7 @@ final as (
         cast(churn_reason as varchar) as churn_reason,
         cast(age_group as varchar) as age_group,
         cast(device_preference as varchar) as device_preference,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 

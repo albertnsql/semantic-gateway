@@ -852,6 +852,28 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
 # ── CSV append ────────────────────────────────────────────────────────────────
 
 def append_to_csv(dfs: dict[str, pd.DataFrame], month_label: str) -> None:
+    """
+    Append the generated rows to output/<table>.csv.
+
+    Appending with mode="a" is POSITIONAL — pandas writes columns in the
+    DataFrame's own order and cannot see the header already on disk. Any table
+    whose row dicts are built in a different key order than the original
+    generator used therefore lands with its values silently under the wrong
+    column names, with no error at write time and none at load time either.
+
+    That is exactly what happened to subscription_plan_history: the row dict at
+    build_month_data() orders keys change_date/old_plan/new_plan/change_type/
+    old_mrr_usd/new_mrr_usd, while the header on disk is old_plan/new_plan/
+    old_mrr_usd/new_mrr_usd/change_type/change_date — so six fields were rotated
+    in every monthly append (1007 of 4882 rows before this was caught, repaired
+    by repair_plan_history_csv.py). Prices ended up in change_type, dates in
+    old_plan, and the corruption reached Snowflake too.
+
+    Reindexing to the on-disk header makes the append order-independent for every
+    table, and raises loudly if the generated frame and the header ever disagree
+    on the SET of columns — which is a genuine schema change that should not be
+    silently appended.
+    """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     for table, df in dfs.items():
         if df.empty:
@@ -859,6 +881,20 @@ def append_to_csv(dfs: dict[str, pd.DataFrame], month_label: str) -> None:
             continue
         path = os.path.join(OUTPUT_DIR, f"{table}.csv")
         exists = os.path.exists(path)
+
+        if exists:
+            header = pd.read_csv(path, nrows=0).columns.tolist()
+            if set(header) != set(df.columns):
+                missing = sorted(set(header) - set(df.columns))
+                extra   = sorted(set(df.columns) - set(header))
+                raise ValueError(
+                    f"{table}: generated columns do not match {path}. "
+                    f"Missing from generated data: {missing or 'none'}. "
+                    f"Not in the CSV header: {extra or 'none'}. "
+                    "Refusing to append — fix the generator or migrate the CSV."
+                )
+            df = df[header]  # align to disk order; do NOT rely on dict key order
+
         df.to_csv(path, mode="a", header=not exists, index=False)
         print(f"  [csv]  {table}: appended {len(df):,} rows -> {path}")
 

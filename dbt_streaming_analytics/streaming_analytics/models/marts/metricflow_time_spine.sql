@@ -3,8 +3,7 @@
 -- Grain: One row per day
 
 with days as (
-    select dateadd(day, seq4(), '2020-01-01'::date) as date_day
-    from table(generator(rowcount => 3650))
+    {{ date_series('2020-01-01', 3650, 'day', 'date_day') }}
 ),
 
 final as (

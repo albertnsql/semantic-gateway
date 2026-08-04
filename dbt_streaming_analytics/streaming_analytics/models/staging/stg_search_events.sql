@@ -11,7 +11,7 @@ final as (
     select
         cast(search_id as varchar) as search_id,
         cast(subscriber_id as varchar) as subscriber_id,
-        cast(search_timestamp as timestamp_ntz) as search_timestamp,
+        cast(search_timestamp as {{ dbt.type_timestamp() }}) as search_timestamp,
         cast(query_text as varchar) as query_text,
         cast(query_type as varchar) as query_type,
         cast(results_returned as int) as results_returned,
@@ -19,7 +19,7 @@ final as (
         cast(content_id_clicked as varchar) as content_id_clicked,
         cast(session_started as boolean) as session_started,
         cast(device_type as varchar) as device_type,
-        current_timestamp() as _loaded_at
+        {{ dbt.current_timestamp() }} as _loaded_at
     from source
 )
 
