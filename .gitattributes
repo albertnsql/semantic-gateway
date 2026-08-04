@@ -1,0 +1,20 @@
+# Preventive, not a fix for a current bug: build.sh is committed with LF today
+# (core.autocrlf=true normalises on commit). This pins that guarantee.
+#
+# Why it matters: the repo is developed on Windows and deployed to Linux. If a .sh
+# file ever reaches the repo with CRLF, the trailing \r becomes part of the shebang
+# and Linux reports:
+#
+#     /usr/bin/env: 'bash\r': No such file or directory
+#
+# which reads like a missing interpreter rather than a line-ending problem.
+*.sh text eol=lf
+
+# Windows-only, wants CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never apply text conversion to the DuckDB warehouse or other binaries.
+*.duckdb binary
+*.duckdb.wal binary
+*.parquet binary

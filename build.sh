@@ -2,9 +2,11 @@
 #
 # build.sh — Render build command for the gateway.
 #
-# Point Render's "Build Command" at this file:
+# Point Render's "Build Command" at this file. All three forms work:
 #
-#     ./build.sh
+#     ./build.sh          (needs the executable bit — tracked as 100755 in git)
+#     bash build.sh
+#     sh build.sh
 #
 # Why this script exists at all: the DuckDB warehouse is a 210 MB build artifact
 # that CANNOT live in git (GitHub's per-file hard limit is 100 MB, and even the
@@ -28,9 +30,15 @@
 #                      worth setting, because a half-downloaded DuckDB file fails
 #                      at QUERY time with a confusing error, not at download time.
 #
-set -euo pipefail
+# POSIX-safe on purpose: Render's Build Command may be run with `sh build.sh`, and
+# on Debian /bin/sh is dash, where double-bracket tests and `set -o pipefail` are
+# syntax errors that abort the script before it prints anything useful. So this
+# sticks to single-bracket tests and $0, and turns pipefail on only where the shell
+# supports it. Do not "modernise" these back to bash syntax.
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 DB_PATH="${REPO_ROOT}/streaming_analytics.duckdb"
 DBT_DIR="${REPO_ROOT}/dbt_streaming_analytics/streaming_analytics"
 
@@ -39,7 +47,7 @@ pip install --no-cache-dir -r "${REPO_ROOT}/gateway/requirements.txt"
 
 echo
 echo "=== 2/4 Fetching the DuckDB warehouse ==="
-if [[ -z "${DUCKDB_ASSET_URL:-}" ]]; then
+if [ -z "${DUCKDB_ASSET_URL:-}" ]; then
   echo "ERROR: DUCKDB_ASSET_URL is not set." >&2
   echo "Set it in Render → Environment to the release asset URL for" >&2
   echo "streaming_analytics.duckdb. Without the warehouse every query 503s." >&2
@@ -51,16 +59,16 @@ fi
 curl --fail --location --retry 3 --retry-delay 2 \
      --output "${DB_PATH}" "${DUCKDB_ASSET_URL}"
 
-if [[ ! -s "${DB_PATH}" ]]; then
+if [ ! -s "${DB_PATH}" ]; then
   echo "ERROR: downloaded file is empty: ${DB_PATH}" >&2
   exit 1
 fi
 echo "Downloaded $(du -h "${DB_PATH}" | cut -f1) to ${DB_PATH}"
 
-if [[ -n "${DUCKDB_SHA256:-}" ]]; then
+if [ -n "${DUCKDB_SHA256:-}" ]; then
   echo "Verifying checksum…"
   actual="$(sha256sum "${DB_PATH}" | cut -d' ' -f1)"
-  if [[ "${actual}" != "${DUCKDB_SHA256}" ]]; then
+  if [ "${actual}" != "${DUCKDB_SHA256}" ]; then
     echo "ERROR: checksum mismatch." >&2
     echo "  expected: ${DUCKDB_SHA256}" >&2
     echo "  actual  : ${actual}" >&2
@@ -86,7 +94,7 @@ cd "${DBT_DIR}"
 dbt compile --profiles-dir .
 
 for artifact in target/manifest.json target/semantic_manifest.json; do
-  if [[ ! -s "${artifact}" ]]; then
+  if [ ! -s "${artifact}" ]; then
     echo "ERROR: ${artifact} was not produced — the gateway needs it for" >&2
     echo "lineage resolution and for the warm MetricFlow engine." >&2
     exit 1
