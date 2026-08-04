@@ -962,3 +962,67 @@ def test_fallback_builder_emits_the_mapped_time_column() -> None:
     sql = generator._build_fallback_sql(intent)
     assert "churn_date BETWEEN" in sql
     assert "signup_date" not in sql
+
+
+class TestDuckDBNeverFallsBackToSnowflake:
+    """
+    A failed DuckDB startup must NOT silently connect to Snowflake.
+
+    Render 2026-08-04: the DuckDB code was deployed and warehouse_engine was
+    duckdb, but the warehouse file was absent, so DuckDBPool.initialise() failed
+    and SQLGenerator received pool=None. execute_query() then fell through to
+    _execute_direct() — the Snowflake path — and every widget reported "Your free
+    trial has ended", pointing the investigation at a dead dependency instead of
+    at the missing file.
+    """
+
+    @staticmethod
+    def _duckdb_settings():
+        s = _settings()
+        s.warehouse_engine = "duckdb"
+        s.duckdb_path = "../streaming_analytics.duckdb"
+        return s
+
+    def test_missing_duckdb_pool_raises_instead_of_connecting_to_snowflake(
+        self, monkeypatch
+    ) -> None:
+        generator = SQLGenerator(self._duckdb_settings())  # pool defaults to None
+
+        def _must_not_run(*_a, **_k):
+            raise AssertionError(
+                "_execute_direct (Snowflake) must never run when engine=duckdb"
+            )
+
+        monkeypatch.setattr(SQLGenerator, "_execute_direct", _must_not_run)
+
+        with pytest.raises(Exception) as excinfo:
+            generator.execute_query("SELECT 1")
+
+        message = str(excinfo.value)
+        assert "duckdb" in message.lower()
+        assert "build.sh" in message, "error must name the actionable fix"
+        assert "trial" not in message.lower(), "must not surface a Snowflake error"
+
+    def test_snowflake_engine_still_uses_the_direct_path(self, monkeypatch) -> None:
+        """The guard must not break the dormant Snowflake configuration."""
+        s = _settings()
+        s.warehouse_engine = "snowflake"
+        generator = SQLGenerator(s)
+        monkeypatch.setattr(
+            SQLGenerator, "_execute_direct", lambda self, sql: [{"OK": 1}]
+        )
+        assert generator.execute_query("SELECT 1") == [{"OK": 1}]
+
+    def test_duckdb_pool_execute_is_preferred_when_present(self) -> None:
+        class _FakePool:
+            def __init__(self):
+                self.seen = []
+
+            def execute(self, sql):
+                self.seen.append(sql)
+                return [{"VALUE": 42}]
+
+        pool = _FakePool()
+        generator = SQLGenerator(self._duckdb_settings(), pool=pool)
+        assert generator.execute_query("SELECT 1") == [{"VALUE": 42}]
+        assert pool.seen == ["SELECT 1"]

@@ -1081,6 +1081,26 @@ class SQLGenerator:
         # response shaping is unchanged by the engine swap.
         if self._pool is not None and hasattr(self._pool, "execute"):
             return self._pool.execute(compiled_sql)
+
+        # NEVER fall through to the Snowflake direct path when DuckDB is the
+        # configured warehouse. _execute_direct() is Snowflake-specific, so when
+        # DuckDBPool.initialise() failed at startup (pool=None) the gateway used to
+        # silently connect to Snowflake instead — which on Render 2026-08-04 turned
+        # a missing warehouse FILE into a stream of "Your free trial has ended"
+        # errors, hiding the real cause behind a dead dependency. Fail loudly with
+        # the actionable message instead.
+        engine = str(getattr(self._settings, "warehouse_engine", "snowflake")).lower()
+        if self._pool is None and engine == "duckdb":
+            raise SnowflakeConnectionError(
+                "DuckDB is the configured warehouse (warehouse_engine=duckdb) but no "
+                "connection is available — DuckDBPool.initialise() failed at startup. "
+                "Look for 'DuckDB init failed' in the startup log. Usual causes: the "
+                f"warehouse file is missing at '{getattr(self._settings, 'duckdb_path', '?')}' "
+                "(on Render, the Build Command must be ./build.sh so the release asset "
+                "is downloaded), DUCKDB_ASSET_URL is wrong, or `dbt run` was never run "
+                "so the file has no 'marts' schema. Refusing to fall back to Snowflake."
+            )
+
         if self._pool is not None:
             return self._execute_with_pool(compiled_sql)
         return self._execute_direct(compiled_sql)

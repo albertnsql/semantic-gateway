@@ -74,6 +74,58 @@ class DuckDBReadOnlyViolation(Exception):
     """Raised when SQL reaching the serving path is not a single read-only query."""
 
 
+# gateway/core/duckdb_pool.py -> gateway/core -> gateway -> repo root
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def resolve_duckdb_path(configured_path: str) -> str:
+    """
+    Resolve the DuckDB file to an absolute path that does not depend on the cwd.
+
+    ``duckdb_path`` defaults to ``../streaming_analytics.duckdb``, which is only
+    correct when the process cwd is ``gateway/``. That assumption is invisible
+    until a deploy runs uvicorn from a different directory, at which point the file
+    "does not exist" and the whole warehouse looks broken — so try the repo root
+    (derived from this module's location, not from the cwd) before giving up.
+
+    Order: absolute path as given → the repo root → relative to the cwd.
+
+    The REPO ROOT is tried before the cwd deliberately. The default
+    ``../streaming_analytics.duckdb`` means "the repo root" (it is written relative
+    to ``gateway/``), so resolving it against an arbitrary cwd can land on a
+    *different* file one directory up. That is not hypothetical: an empty 12 KB
+    ``streaming_analytics.duckdb`` was created beside the repo during development
+    simply because something opened the relative path from the repo root, and
+    ``duckdb.connect()`` CREATES a missing file rather than failing. Preferring the
+    cwd would have served that empty database in place of the real warehouse.
+
+    Returns:
+        An absolute path. It is NOT guaranteed to exist — callers report that.
+    """
+    if os.path.isabs(configured_path):
+        return configured_path
+
+    root_relative = os.path.abspath(
+        os.path.join(_REPO_ROOT, os.path.basename(configured_path))
+    )
+    if os.path.exists(root_relative):
+        return root_relative
+
+    cwd_relative = os.path.abspath(configured_path)
+    if os.path.exists(cwd_relative):
+        logger.info(
+            "duckdb_path '%s' not found at the repo root; using the cwd-relative "
+            "match at '%s' (cwd=%s).",
+            configured_path,
+            cwd_relative,
+            os.getcwd(),
+        )
+        return cwd_relative
+
+    # Neither exists — report the repo-root form, which is where it belongs.
+    return root_relative
+
+
 def _strip_sql_comments(sql: str) -> str:
     """Remove -- line and /* block */ comments so keywords cannot hide in them."""
     sql = re.sub(r"--[^\n]*", " ", sql)
@@ -144,8 +196,8 @@ class DuckDBPool:
 
     @property
     def path(self) -> str:
-        """Absolute path to the DuckDB file, resolved from settings."""
-        return os.path.abspath(self._settings.duckdb_path)
+        """Absolute path to the DuckDB file, independent of the process cwd."""
+        return resolve_duckdb_path(self._settings.duckdb_path)
 
     def initialise(self) -> None:
         """

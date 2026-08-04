@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from config import settings
 from cache import QueryCache
 from core import memory
-from core.duckdb_pool import DuckDBPool
+from core.duckdb_pool import DuckDBPool, resolve_duckdb_path
 from core.intent_extractor import IntentExtractor
 from core.lineage_resolver import LineageResolver
 from core.manifest_parser import ManifestParser
@@ -128,7 +128,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # the cwd, and the gateway's cwd is not the dbt project dir, so export an
         # absolute path here or MetricFlow silently compiles against a different
         # (or missing) file.
-        os.environ["DUCKDB_PATH"] = os.path.abspath(settings.duckdb_path)
+        # resolve_duckdb_path also falls back to the repo root when the cwd is not
+        # gateway/, so a start command that runs uvicorn from elsewhere does not
+        # silently lose the warehouse.
+        os.environ["DUCKDB_PATH"] = resolve_duckdb_path(settings.duckdb_path)
         os.environ.setdefault("DBT_TARGET", "duckdb")
 
         snowflake_pool = DuckDBPool(settings=settings)
@@ -138,7 +141,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             snowflake_ok = True
             logger.info("✓ DuckDB ready at '%s'.", os.environ["DUCKDB_PATH"])
         except Exception as exc:
+            # ERROR, not warning: with engine=duckdb there is no usable warehouse
+            # after this, and execute_query() now refuses to fall back to
+            # Snowflake, so every query will 503 until this is fixed.
             logger.error("✗ DuckDB init failed: %s", exc)
+            logger.error(
+                "   cwd=%s | configured duckdb_path=%s | resolved=%s",
+                os.getcwd(),
+                settings.duckdb_path,
+                os.environ["DUCKDB_PATH"],
+            )
     else:
         # Dynamically size pool for Render's 512MB RAM constraint
         pool_size = int(os.getenv("SNOWFLAKE_POOL_SIZE", "5"))
