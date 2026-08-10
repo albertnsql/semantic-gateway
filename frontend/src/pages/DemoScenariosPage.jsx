@@ -45,7 +45,7 @@ const SCENARIOS = [
     badgeLabel: 'REJECTED',
     btnVariant: 'outline-red',
     defaultTab: 'Tabular Results',
-    whyItMatters: "This is the kind of grain error that normally slips into a dashboard and silently produces wrong numbers — here it's caught before it reaches Snowflake.",
+    whyItMatters: "This is the kind of grain error that normally slips into a dashboard and silently produces wrong numbers — here it's caught before it reaches the warehouse.",
   },
   {
     id: 'ltv-lineage',

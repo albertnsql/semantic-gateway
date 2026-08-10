@@ -8,7 +8,7 @@ import { Link } from 'react-router-dom';
 import { getMetrics } from '../api/metrics';
 import {
   MessageSquare, Brain, Code2, ShieldCheck, Zap, GitBranch,
-  ArrowRight, Database, Server, Layers, Shield, Cpu, Monitor,
+  ArrowRight, Database, HardDrive, Layers, Shield, Cpu, Monitor,
   AlertTriangle, BookOpen, Terminal,
 } from 'lucide-react';
 
@@ -48,7 +48,7 @@ const STEPS = [
     tag: 'Cache', title: 'Result cache check',
     badge: 'Fast path',
     summary: 'Asked this exact question before? The answer returns here, in about a second.',
-    detail: 'QueryCache is keyed on the fully parsed intent — metric, dimensions, time range and filters — not on the raw question string, so two differently-worded questions with the same meaning share an entry. This check sits at Stage 2, before validation and compilation, so a hit skips everything downstream including Snowflake. That is why it lands this early rather than next to execution.',
+    detail: 'QueryCache is keyed on the fully parsed intent — metric, dimensions, time range and filters — not on the raw question string, so two differently-worded questions with the same meaning share an entry. This check sits at Stage 2, before validation and compilation, so a hit skips everything downstream including the warehouse. That is why it lands this early rather than next to execution.',
   },
   {
     num: '04', icon: ShieldCheck,
@@ -67,12 +67,12 @@ const STEPS = [
     detail: 'A warm in-process MetricFlow engine, built once at startup, compiles from the dbt semantic manifest in roughly 60 milliseconds. It runs FIRST on every request: the semantic layer is the source of truth, so nothing is served from a pre-built template while the engine is healthy, and a metric definition change takes effect on deploy. Behind it sit three fallbacks in order — a compiled-template cache, the mf CLI subprocess, and a governed builder — used only if the engine is unavailable. A filter on a column you also grouped by is applied as an outer predicate, so narrowing to one country returns one row instead of quietly returning all of them.',
   },
   {
-    num: '06', icon: Server,
+    num: '06', icon: HardDrive,
     gradient: 'from-cyan-400 to-cyan-600', accent: '#0891B2',
-    tag: 'Execution', title: 'Run it on Snowflake',
-    badge: 'Pooled',
-    summary: 'The compiled SQL executes against Snowflake over a warm connection pool.',
-    detail: 'SQLGenerator.execute_query() dispatches the compiled SQL through SnowflakePool, opened at startup so no request pays connection setup. Results are capped at the caller\'s max_rows and written back into the intent-keyed cache with a configurable TTL. Execution is typically the single largest slice of the response time — around 1.5 to 2 seconds — now that compilation costs milliseconds.',
+    tag: 'Execution', title: 'Run it on DuckDB',
+    badge: 'Read-only enforced',
+    summary: 'The compiled SQL executes against the DuckDB warehouse over a warm connection pool, and every statement is checked to be read-only first.',
+    detail: 'SQLGenerator.execute_query() dispatches the compiled SQL through DuckDBPool, whose connections are opened at startup so no request pays connection setup. Every statement passes assert_read_only() before execution — anything that is not a single WITH or SELECT is refused, so the guarantee is enforced in SQL rather than left to warehouse permissions. Results are capped at the caller\'s max_rows and written back into the intent-keyed cache with a configurable TTL. Execution now costs milliseconds rather than seconds, which is why the two LLM calls dominate the end-to-end response time. Snowflake stays selectable through a single warehouse_engine setting, and no step above this one changes when it is switched.',
   },
   {
     num: '07', icon: GitBranch,
@@ -95,17 +95,17 @@ const HARD = [
 // ── Pipeline nodes — verified against actual gateway code ───────────────────
 // FastAPI Gateway = Steps 02, 03, 04, 05, 06 (central orchestrator)
 // Gemini LLM = Step 02 (intent + routing, one call) and Step 07 (narrative)
-// Snowflake DWH = Step 06 (query execution)
+// DuckDB warehouse = Step 06 (query execution)
 // MetricFlow = Step 04 (SQL compilation)
 // React Frontend = Step 07 (result display) and initial user input (Step 01)
 const PIPELINE = [
-  { icon: Database, label: 'Raw SaaS\nData',       gradient: 'from-sky-400 to-sky-600',         step: null,     note: null },
-  { icon: Server,   label: 'Snowflake\nDWH',       gradient: 'from-cyan-400 to-cyan-600',       step: '06',     note: 'Execution' },
-  { icon: Code2,    label: 'dbt\nModels',          gradient: 'from-amber-400 to-amber-600',     step: null,     note: null },
-  { icon: Layers,   label: 'MetricFlow\nSemantic', gradient: 'from-teal-400 to-teal-600',       step: '05',     note: 'SQL compile' },
-  { icon: Shield,   label: 'FastAPI\nGateway',     gradient: 'from-emerald-400 to-emerald-600', step: '02–07',  note: 'Orchestrator' },
-  { icon: Cpu,      label: 'Gemini\nLLM',          gradient: 'from-teal-400 to-teal-700',       step: '02 + 07', note: 'Intent + narrative' },
-  { icon: Monitor,  label: 'React\nFrontend',      gradient: 'from-cyan-400 to-teal-600',       step: '01 + 07', note: 'Input + Output' },
+  { icon: Database,  label: 'Raw SaaS\nData',       gradient: 'from-sky-400 to-sky-600',         step: null,     note: null },
+  { icon: HardDrive, label: 'DuckDB\nWarehouse',    gradient: 'from-cyan-400 to-cyan-600',       step: '06',     note: 'Execution' },
+  { icon: Code2,     label: 'dbt\nModels',          gradient: 'from-amber-400 to-amber-600',     step: null,     note: null },
+  { icon: Layers,    label: 'MetricFlow\nSemantic', gradient: 'from-teal-400 to-teal-600',       step: '05',     note: 'SQL compile' },
+  { icon: Shield,    label: 'FastAPI\nGateway',     gradient: 'from-emerald-400 to-emerald-600', step: '02–07',  note: 'Orchestrator' },
+  { icon: Cpu,       label: 'Gemini\nLLM',          gradient: 'from-teal-400 to-teal-700',       step: '02 + 07', note: 'Intent + narrative' },
+  { icon: Monitor,   label: 'React\nFrontend',      gradient: 'from-cyan-400 to-teal-600',       step: '01 + 07', note: 'Input + Output' },
 ];
 
 // ── Divider ──────────────────────────────────────────────────────────────────
@@ -274,7 +274,7 @@ export default function HowItWorksPage() {
           </div>
           <span className="text-[#4A7B76]/35">·</span>
           <span className="text-xs font-semibold text-[#4A7B76]" style={{ fontFamily: 'DM Sans, sans-serif' }}>
-            7 steps · 2 LLM calls · MetricFlow · Snowflake
+            7 steps · 2 LLM calls · MetricFlow · DuckDB
           </span>
         </div>
 

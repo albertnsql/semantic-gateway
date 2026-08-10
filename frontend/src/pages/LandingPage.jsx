@@ -5,19 +5,19 @@ import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { getMetrics } from '../api/metrics';
 import {
-  Database, Server, Code2, Layers, Shield, Cpu, Monitor,
+  Database, HardDrive, Code2, Layers, Shield, Cpu, Monitor,
   XCircle, CheckCircle2, ArrowRight, BookOpen,
 } from 'lucide-react';
 import TopBar from '../components/TopBar';
 
 const PIPELINE = [
-  { icon: Database, label: 'Raw SaaS Data',              gradient: 'from-sky-400 to-sky-600',     featured: false },
-  { icon: Server,   label: 'Snowflake DWH',              gradient: 'from-cyan-400 to-cyan-600',   featured: false },
-  { icon: Code2,    label: 'dbt Models',                 gradient: 'from-amber-400 to-amber-600', featured: false },
-  { icon: Layers,   label: 'MetricFlow\nSemantic Layer', gradient: 'from-teal-400 to-teal-600',   featured: true  },
-  { icon: Shield,   label: 'FastAPI\nGateway',           gradient: 'from-emerald-400 to-emerald-600', featured: false },
-  { icon: Cpu,      label: 'Gemini 1.5\nLLM',               gradient: 'from-teal-400 to-teal-700',   featured: false },
-  { icon: Monitor,  label: 'React\nFrontend',            gradient: 'from-cyan-400 to-teal-600',   featured: false },
+  { icon: Database,  label: 'Raw SaaS Data',              gradient: 'from-sky-400 to-sky-600',     featured: false },
+  { icon: HardDrive, label: 'DuckDB\nWarehouse',          gradient: 'from-cyan-400 to-cyan-600',   featured: false },
+  { icon: Code2,     label: 'dbt Models',                 gradient: 'from-amber-400 to-amber-600', featured: false },
+  { icon: Layers,    label: 'MetricFlow\nSemantic Layer', gradient: 'from-teal-400 to-teal-600',   featured: true  },
+  { icon: Shield,    label: 'FastAPI\nGateway',           gradient: 'from-emerald-400 to-emerald-600', featured: false },
+  { icon: Cpu,       label: 'Gemini 3.1\nLLM',            gradient: 'from-teal-400 to-teal-700',   featured: false },
+  { icon: Monitor,   label: 'React\nFrontend',            gradient: 'from-cyan-400 to-teal-600',   featured: false },
 ];
 
 const PREVENTS = [
@@ -86,7 +86,7 @@ export default function LandingPage() {
             className="text-xs font-bold tracking-widest text-[#0D9488] uppercase"
             style={{ fontFamily: 'DM Sans, sans-serif' }}
           >
-            Production-Grade · MetricFlow · Gemini 1.5 · Snowflake
+            Production-Grade · MetricFlow · Gemini 3.1 · DuckDB
           </span>
         </div>
 
@@ -110,7 +110,7 @@ export default function LandingPage() {
           className="max-w-2xl text-xl font-medium leading-relaxed text-[#4A7B76]"
           style={{ fontFamily: 'DM Sans, sans-serif' }}
         >
-          A governed semantic layer between natural language queries and your Snowflake warehouse.
+          A governed semantic layer between natural language queries and your DuckDB warehouse.
           <br className="hidden sm:block" />
           <span className="text-[#1A3A38] font-semibold"> No hallucinated joins. No metric misuse. No grain violations.</span>
         </p>

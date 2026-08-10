@@ -2,8 +2,9 @@ import { postQuery } from './query';
 import apiClient from './client';
 
 /**
- * Fetch a dashboard widget's data via the dedicated direct-Snowflake endpoint.
- * Bypasses the LLM pipeline entirely — zero LLM calls, ~10x faster than fetchDashboardQuery.
+ * Fetch a dashboard widget's data via the dedicated direct-to-warehouse endpoint.
+ * Bypasses the LLM pipeline entirely — zero LLM calls, no MetricFlow, hand-written static SQL.
+ * Widgets answer in single-digit milliseconds where the NL pipeline takes seconds.
  *
  * @param {string} widgetId  - One of the registered widget IDs (e.g. 'mrr_kpi', 'mrr_trend')
  * @param {Object} filters   - Optional filter params

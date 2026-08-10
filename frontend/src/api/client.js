@@ -5,7 +5,9 @@ import axios from 'axios';
 
 const apiClient = axios.create({
   baseURL: import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1',
-  timeout: 90000,  // 90s — LLM + Snowflake pipeline can take 15-20s per query
+  // 90s — a normal query is ~3-5s (two LLM calls dominate; DuckDB itself is ms),
+  // but a cold gateway can spend ~20-50s waking up and building the MetricFlow engine.
+  timeout: 90000,
   headers: {
     'Content-Type': 'application/json',
   },

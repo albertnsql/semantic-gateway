@@ -4,28 +4,34 @@
  * The gateway answers each query with a SINGLE request (no server-sent stage
  * events), so this is an *estimated*, time-based progression calibrated to the
  * real pipeline:
- *   intent extraction (LLM) → semantic validation → SQL generation
- *   (cached template, in-process fallback, OR ~30 s MetricFlow compile on a
- *   first-time metric) → Snowflake → response.
+ *   intent extraction (LLM #1) → semantic validation → MetricFlow compile
+ *   (warm in-process engine) → DuckDB execution → narrative summary (LLM #2).
+ *
+ * Since the warehouse became a local DuckDB file, the two LLM calls are ~90 %
+ * of the round trip: each runs ~1-2 s, while compilation is ~60-96 ms and the
+ * query itself is single-digit milliseconds. So the typical total is ~3-5 s,
+ * not the ~30 s the Snowflake-era version of this file assumed.
  *
  * The bar advances optimistically and only reaches 100 % when the actual
  * response arrives (the parent unmounts this component), so it never claims to
- * be finished before it is. It works for both the fast (cached, ~2-4 s) and the
- * slow (cache-miss MetricFlow, ~30 s) cases — the fast case simply unmounts
- * early, before the later stages are reached.
+ * be finished before it is. It also covers the two remaining slow cases — a
+ * cold Render instance waking up, and the first query after a restart having to
+ * build the MetricFlow engine (~20 s) if the startup pre-warm has not finished.
  */
 import { useState, useEffect } from 'react';
 
 const CLAY_INSET = `inset 6px 6px 12px rgba(13,148,136,0.10), inset -6px -6px 12px rgba(255,255,255,0.9)`;
 
 // Estimated stage boundaries (seconds), calibrated to observed timings:
-// intent ~1 s, validation <0.1 s, MetricFlow ~30 s on a cache miss, Snowflake ~2 s.
+// intent ~1-2 s, validation <0.1 s, MetricFlow compile ~0.1 s, DuckDB a few ms,
+// narrative summary ~1-2 s. The last stage only shows on a cold gateway.
 const STAGES = [
-  { at: 0.0,  label: 'Extracting intent from your question…' },
-  { at: 1.8,  label: 'Validating against the certified semantic layer…' },
-  { at: 3.0,  label: 'Generating governed SQL…' },
-  { at: 8.0,  label: 'Compiling with MetricFlow — first-time metric, no cached template yet…' },
-  { at: 28.0, label: 'Running the query on Snowflake…' },
+  { at: 0.0, label: 'Extracting intent from your question…' },
+  { at: 1.6, label: 'Validating against the certified semantic layer…' },
+  { at: 2.0, label: 'Compiling governed SQL with MetricFlow…' },
+  { at: 2.4, label: 'Running the query on DuckDB…' },
+  { at: 2.8, label: 'Writing the plain-English summary…' },
+  { at: 8.0, label: 'Warming up the gateway — first query since it restarted…' },
 ];
 
 export default function QueryProgress() {
@@ -38,13 +44,15 @@ export default function QueryProgress() {
   }, []);
 
   // Optimistic fill: quick to ~40 % (intent + validation), then eases toward ~92 %.
+  // The 5 s time constant matches the ~3-5 s typical round trip; it still creeps
+  // rather than stalls if the gateway happens to be cold.
   const pct =
     elapsed < 2
       ? elapsed * 20
-      : Math.min(92, 40 + (1 - Math.exp(-(elapsed - 2) / 12)) * 52);
+      : Math.min(92, 40 + (1 - Math.exp(-(elapsed - 2) / 5)) * 52);
 
   const stage = [...STAGES].reverse().find((s) => elapsed >= s.at) ?? STAGES[0];
-  const showWhy = elapsed > 5;
+  const showWhy = elapsed > 7;
 
   return (
     <div className="flex flex-col gap-3 px-4 py-4 animate-fade-in">
@@ -83,15 +91,16 @@ export default function QueryProgress() {
         />
       </div>
 
-      {/* why-it-takes-time explainer — appears once it's clearly a slow (uncached) query */}
+      {/* why-it-takes-time explainer — appears once the query is clearly slower than usual */}
       {showWhy && (
         <p
           className="text-xs leading-relaxed text-[#4A7B76] animate-fade-in"
           style={{ fontFamily: 'DM Sans, sans-serif' }}
         >
-          First-time metric queries compile{' '}
-          <span className="font-semibold text-[#0D9488]">governed SQL via MetricFlow</span>, which can
-          take ~30 s. The same query afterwards is served from cache in under a second.
+          Taking longer than usual — the gateway is likely waking from sleep, or building its{' '}
+          <span className="font-semibold text-[#0D9488]">in-process MetricFlow engine</span> for the
+          first query since a restart. Queries after this one land in a few seconds, and a repeat of
+          the same question is served from cache.
         </p>
       )}
     </div>
