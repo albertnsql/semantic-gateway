@@ -153,6 +153,18 @@ def _cap_to_last_completed_month(date_str: str) -> str:
     # Return whichever is earlier: fetched date or last-completed-month boundary
     return min(date_str, last_completed_str)
 
+
+def _month_start(date_str: str) -> str:
+    """
+    Normalise any YYYY-MM-DD to the first of its month.
+
+    data_through_date is documented as a month start and 33 sites build windows
+    from it, several as a bare `>= '{data_through_date}'`. A day-level value such
+    as '2026-06-30' would silently narrow those windows to a single day, so every
+    anchor is normalised before it can reach them.
+    """
+    return date_str[:8] + "01"
+
 _DEFAULT_CURRENT_YEAR: int = _dt.date.today().year
 
 
@@ -178,10 +190,27 @@ def _resolve_yoy_dates(years: list[int], max_data_date: str) -> dict:
     prior_year = current_year - 1
 
     # Data-through date: last known data month within current year.
-    # For the current year, falls back to _DEFAULT_DATA_THROUGH (itself dynamic).
-    # For any prior complete year, use Dec.
+    #
+    # This used to hard-code _DEFAULT_DATA_THROUGH — a WALL-CLOCK constant (the last
+    # completed calendar month) — and discard the max_data_date the caller had just
+    # queried from the warehouse. Whenever the data lagged the calendar, every window
+    # built from data_through_date shifted forward into a month with no rows. It went
+    # largely unnoticed because most widgets use the value as an UPPER bound, so they
+    # still contained real data; sessions_by_referral uses it as the LOWER bound of a
+    # single-month window, returned zero rows, and the frontend replaced the empty
+    # result with mock bars behind an "Estimated" badge (DashboardPage.jsx
+    # generateMockBar) — which is how a stale anchor surfaced as fake data.
+    #
+    # max_data_date now wins when it lands inside the selected year. The wall-clock
+    # constant remains the fallback for an unreachable warehouse and for an anchor
+    # that predates the selected year, where it is no more wrong than before.
     if current_year >= _DEFAULT_CURRENT_YEAR:
-        data_through_date = _DEFAULT_DATA_THROUGH          # dynamically computed last-completed month
+        if max_data_date and str(max_data_date)[:4] == str(current_year):
+            data_through_date = _month_start(
+                _cap_to_last_completed_month(str(max_data_date)[:10])
+            )
+        else:
+            data_through_date = _DEFAULT_DATA_THROUGH      # dynamically computed last-completed month
     else:
         data_through_date = f"{current_year}-12-01"        # full year available
 
@@ -806,6 +835,84 @@ _WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str], str], str]] = 
 }
 
 
+# ── Per-fact "data through" anchors ───────────────────────────────────────────
+# Widgets do not all read the same fact table, and the facts do not end on the
+# same date. fct_mrr_monthly is built from a date spine driven by current_date()
+# (int_subscription_periods.sql), so it always runs to the CURRENT calendar month;
+# the event facts stop at the last month actually appended. Anchoring every widget
+# to the MRR max therefore asked fct_stream_sessions for a month it could not have.
+#
+# Observed 2026-08-18: fct_mrr_monthly reached 2026-08-01 while both
+# fct_stream_sessions and fct_payments ended 2026-06-30. Each widget now gets the
+# max of the fact it actually reads.
+_ANCHOR_SQL: dict[str, str] = {
+    "mrr": (
+        f"SELECT MAX(period_month) AS max_date FROM {_DB}.marts.fct_mrr_monthly "
+        "WHERE is_active = TRUE AND mrr_type = 'new'"
+    ),
+    "sessions": (
+        f"SELECT DATE_TRUNC('month', MAX(session_start)) AS max_date "
+        f"FROM {_DB}.marts.fct_stream_sessions"
+    ),
+    "payments": (
+        f"SELECT DATE_TRUNC('month', MAX(payment_date)) AS max_date "
+        f"FROM {_DB}.marts.fct_payments WHERE status = 'succeeded'"
+    ),
+}
+
+# Widget → anchor. Anything absent uses "mrr", which is both the historical
+# behaviour and correct for the fct_mrr_monthly-backed widgets.
+_WIDGET_ANCHOR: dict[str, str] = {
+    "watch_time_kpi":       "sessions",
+    "engagement_kpi":       "sessions",
+    "sessions_trend":       "sessions",
+    "sessions_by_referral": "sessions",
+    "revenue_kpi":          "payments",
+    "mrr_kpi":              "payments",   # backward-compat alias for revenue_kpi
+}
+
+
+def _resolve_anchor_date(sql_gen, query_cache, anchor: str) -> str:
+    """
+    Resolve the "data through" month for one fact table, cached per anchor.
+
+    Returns a month-start string. Falls back to _DEFAULT_DATA_THROUGH when the
+    warehouse is unreachable, and never caches that fallback so the next request
+    retries. Replaces three copies of this logic that had drifted apart.
+    """
+    sql = _ANCHOR_SQL.get(anchor, _ANCHOR_SQL["mrr"])
+    cache_key = {"type": "max_date", "anchor": anchor}
+
+    if query_cache is not None:
+        cached = query_cache.get(cache_key)
+        if cached and cached.get("date"):
+            # Always re-apply the cap on read — guards a disk cache entry written
+            # while the calendar sat in an earlier month.
+            return _cap_to_last_completed_month(str(cached["date"]))
+
+    try:
+        rows = sql_gen.execute_query(sql)
+    except Exception as exc:
+        logger.warning(
+            "Anchor '%s' unresolved (%s) — falling back to %s",
+            anchor, exc, _DEFAULT_DATA_THROUGH,
+        )
+        return _DEFAULT_DATA_THROUGH
+
+    resolved = _DEFAULT_DATA_THROUGH
+    if rows:
+        # DuckDBPool.execute() uppercases column names; SnowflakePool's DictCursor
+        # did the same. Accept either so the helper is engine-agnostic.
+        raw = rows[0].get("MAX_DATE") or rows[0].get("max_date")
+        if raw:
+            resolved = _month_start(str(raw)[:10])
+    resolved = _cap_to_last_completed_month(resolved)
+
+    if query_cache is not None:
+        query_cache.set(cache_key, {"date": resolved})
+    return resolved
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get(
@@ -815,26 +922,11 @@ _WIDGET_SQL: dict[str, Callable[[list[str], list[int], list[str], str], str]] = 
 )
 async def get_dashboard_metadata(request: Request) -> JSONResponse:
     query_cache = getattr(request.app.state, "query_cache", None)
-    max_date = _DEFAULT_DATA_THROUGH
-    if query_cache is not None:
-        cached_md = query_cache.get({"type": "max_date"})
-        if cached_md:
-            # Always re-apply cap on read — guards against stale disk cache entries
-            max_date = _cap_to_last_completed_month(cached_md["date"])
-        else:
-            try:
-                rows = request.app.state.sql_generator.execute_query(
-                    f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE AND mrr_type = 'new'"
-                )
-                if rows and rows[0].get("MAX_DATE"):
-                    max_date = str(rows[0]["MAX_DATE"])[:10]
-                elif rows and rows[0].get("max_date"):
-                    max_date = str(rows[0]["max_date"])[:10]
-                # Cap to last fully-completed month — never expose an in-progress month
-                max_date = _cap_to_last_completed_month(max_date)
-                query_cache.set({"type": "max_date"}, {"date": max_date})
-            except Exception as e:
-                pass
+    # Dashboard-wide "data as of" label — stays on the MRR anchor, which is what it
+    # has always reported and what the fct_mrr_monthly-backed KPIs still use.
+    max_date = _resolve_anchor_date(
+        request.app.state.sql_generator, query_cache, "mrr"
+    )
     return JSONResponse(content={"max_date": max_date})
 
 @router.get(
@@ -971,48 +1063,17 @@ async def get_dashboard_widget(
                 headers={"X-Cache": "HIT"},
             )
 
-    # ── 4. Resolve max_data_date (live from Snowflake, cached) ───────────────
-    max_data_date = _DEFAULT_DATA_THROUGH
+    # ── 4. Resolve max_data_date for the fact THIS widget reads (cached) ─────
     sql_gen = request.app.state.sql_generator
-    if query_cache is not None:
-        cached_md = query_cache.get({"type": "max_date"})
-        if cached_md:
-            # Always re-apply cap on read — guards against stale disk cache entries
-            max_data_date = _cap_to_last_completed_month(cached_md["date"])
-        else:
-            try:
-                md_rows = sql_gen.execute_query(
-                    f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE AND mrr_type = 'new'"
-                )
-                if md_rows and md_rows[0].get("MAX_DATE"):
-                    max_data_date = str(md_rows[0]["MAX_DATE"])[:10]
-                elif md_rows and md_rows[0].get("max_date"):
-                    max_data_date = str(md_rows[0]["max_date"])[:10]
-                # Cap to last fully-completed month — never expose an in-progress month
-                max_data_date = _cap_to_last_completed_month(max_data_date)
-                query_cache.set({"type": "max_date"}, {"date": max_data_date})
-            except Exception:
-                pass  # fall back to _DEFAULT_DATA_THROUGH
-    else:
-        try:
-            md_rows = sql_gen.execute_query(
-                f"SELECT MAX(period_month) as max_date FROM {_DB}.marts.fct_mrr_monthly WHERE is_active = TRUE AND mrr_type = 'new'"
-            )
-            if md_rows and md_rows[0].get("MAX_DATE"):
-                max_data_date = str(md_rows[0]["MAX_DATE"])[:10]
-            elif md_rows and md_rows[0].get("max_date"):
-                max_data_date = str(md_rows[0]["max_date"])[:10]
-            # Cap to last fully-completed month — never expose an in-progress month
-            max_data_date = _cap_to_last_completed_month(max_data_date)
-        except Exception:
-            pass
+    anchor = _WIDGET_ANCHOR.get(widget, "mrr")
+    max_data_date = _resolve_anchor_date(sql_gen, query_cache, anchor)
 
     # ── 5. Build pre-certified SQL ────────────────────────────────────────────
     sql_fn = _WIDGET_SQL[widget]
     compiled_sql = sql_fn(parsed_plans, parsed_years, parsed_countries, max_data_date)
     logger.info(
-        "[%s] Dashboard widget=%s plans=%s years=%s countries=%s max_date=%s — executing SQL",
-        request_id, widget, parsed_plans or "all", parsed_years or "all", parsed_countries or "all", max_data_date
+        "[%s] Dashboard widget=%s plans=%s years=%s countries=%s anchor=%s max_date=%s — executing SQL",
+        request_id, widget, parsed_plans or "all", parsed_years or "all", parsed_countries or "all", anchor, max_data_date
     )
 
     # ── 6. Execute against Snowflake pool ────────────────────────────────────

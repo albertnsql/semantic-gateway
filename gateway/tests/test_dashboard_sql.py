@@ -19,10 +19,21 @@ Two kinds of test here:
 
 from __future__ import annotations
 
+import datetime as _dt
+
 
 import pytest
 
-from api.routes.dashboard import _WIDGET_SQL, _sql_mrr_bridge
+from api.routes.dashboard import (
+    _ANCHOR_SQL,
+    _DEFAULT_DATA_THROUGH,
+    _WIDGET_ANCHOR,
+    _WIDGET_SQL,
+    _month_start,
+    _resolve_anchor_date,
+    _resolve_yoy_dates,
+    _sql_mrr_bridge,
+)
 
 _BRIDGE_ARGS = ([], [], [], "2026-06-01")
 
@@ -247,3 +258,172 @@ def test_bridge_expansion_matches_the_certified_metric() -> None:
     assert abs(float(bridge_expansion) - float(metric_expansion)) < 0.01, (
         f"bridge={float(bridge_expansion):,.2f} metric={float(metric_expansion):,.2f}"
     )
+
+
+# ── Per-fact data-through anchors ─────────────────────────────────────────────
+# Every widget shared one anchor: MAX(period_month) from fct_mrr_monthly. That fact
+# is built from a date spine driven by current_date(), so it runs to the CURRENT
+# calendar month, while the event facts stop at the last appended month. On
+# 2026-08-18 fct_mrr_monthly reached 2026-08-01 and fct_stream_sessions ended
+# 2026-06-30, so sessions_by_referral — the only widget using the anchor as the
+# LOWER bound of a single-month window — asked for July 2026 and got nothing.
+# An empty result is not an error to the frontend: parseChart() swaps in
+# generateMockBar() and labels it "Estimated", so the dashboard showed invented
+# Enterprise/Pro/Free bars where referral sources belong.
+
+
+class TestWidgetAnchors:
+    """Always-on guards on the widget -> fact mapping."""
+
+    def test_session_widgets_use_the_session_anchor(self) -> None:
+        for widget in (
+            "sessions_trend",
+            "sessions_by_referral",
+            "watch_time_kpi",
+            "engagement_kpi",
+        ):
+            assert _WIDGET_ANCHOR.get(widget) == "sessions", widget
+
+    def test_revenue_widgets_use_the_payments_anchor(self) -> None:
+        """revenue_kpi reads fct_payments, which also lags the MRR spine."""
+        for widget in ("revenue_kpi", "mrr_kpi"):
+            assert _WIDGET_ANCHOR.get(widget) == "payments", widget
+
+    def test_mrr_backed_widgets_fall_through_to_the_mrr_anchor(self) -> None:
+        """Absent from the map means 'mrr', which is the historical behaviour."""
+        for widget in (
+            "mrr_trend",
+            "retention_trend",
+            "mrr_bridge",
+            "subs_kpi",
+            "churn_rate_kpi",
+            "net_mrr_growth_kpi",
+            "sub_dist",
+        ):
+            assert _WIDGET_ANCHOR.get(widget, "mrr") == "mrr", widget
+
+    def test_every_anchored_widget_exists(self) -> None:
+        """A typo in _WIDGET_ANCHOR would silently leave that widget on the MRR anchor."""
+        for widget in _WIDGET_ANCHOR:
+            assert widget in _WIDGET_SQL, widget
+
+    def test_each_anchor_queries_the_fact_it_names(self) -> None:
+        assert "fct_mrr_monthly" in _ANCHOR_SQL["mrr"]
+        assert "fct_stream_sessions" in _ANCHOR_SQL["sessions"]
+        assert "fct_payments" in _ANCHOR_SQL["payments"]
+
+    def test_event_anchors_truncate_to_a_month(self) -> None:
+        """
+        session_start / payment_date are timestamps. Without DATE_TRUNC the anchor
+        would be a day-level date, and every window built as
+        >= data_through_date would collapse to a single day.
+        """
+        for anchor in ("sessions", "payments"):
+            assert "DATE_TRUNC('month'" in _ANCHOR_SQL[anchor], anchor
+
+
+class TestResolveYoyDatesHonoursTheAnchor:
+    """
+    _resolve_yoy_dates accepted max_data_date and threw it away for the current
+    year, returning the wall-clock _DEFAULT_DATA_THROUGH instead. 33 sites build
+    windows from the result.
+    """
+
+    def test_current_year_anchor_wins(self) -> None:
+        d = _resolve_yoy_dates([2026], "2026-06-01")
+        assert d["data_through_date"] == "2026-06-01"
+
+    def test_prior_year_window_tracks_the_anchor(self) -> None:
+        """The YoY comparison must move with it, or it compares unequal spans."""
+        d = _resolve_yoy_dates([2026], "2026-06-01")
+        assert d["prior_year_equiv_end"] == "2025-06-01"
+
+    def test_day_level_anchor_is_normalised_to_the_month(self) -> None:
+        d = _resolve_yoy_dates([2026], "2026-06-30")
+        assert d["data_through_date"] == "2026-06-01"
+
+    def test_anchor_from_another_year_is_ignored(self) -> None:
+        """A lagging anchor must not drag a 2026 selection back into 2025."""
+        d = _resolve_yoy_dates([2026], "2025-11-01")
+        assert d["data_through_date"] == _DEFAULT_DATA_THROUGH
+
+    def test_completed_prior_year_still_uses_december(self) -> None:
+        d = _resolve_yoy_dates([2025], "2026-07-01")
+        assert d["data_through_date"] == "2025-12-01"
+
+    def test_missing_anchor_falls_back(self) -> None:
+        d = _resolve_yoy_dates([2026], "")
+        assert d["data_through_date"] == _DEFAULT_DATA_THROUGH
+
+    def test_in_progress_month_is_still_capped(self) -> None:
+        """
+        The cap is what keeps a partial month off the dashboard. An anchor inside
+        the current calendar month must not survive it.
+        """
+        today = _dt.date.today()
+        d = _resolve_yoy_dates([today.year], today.strftime("%Y-%m-%d"))
+        assert d["data_through_date"] <= _DEFAULT_DATA_THROUGH
+
+
+class TestMonthStart:
+    def test_normalises_any_day(self) -> None:
+        assert _month_start("2026-06-30") == "2026-06-01"
+
+    def test_is_idempotent(self) -> None:
+        assert _month_start("2026-06-01") == "2026-06-01"
+
+
+class _PoolShim:
+    """Minimal stand-in for SQLGenerator — _resolve_anchor_date only calls this."""
+
+    def __init__(self, pool) -> None:
+        self._pool = pool
+
+    def execute_query(self, sql: str) -> list[dict]:
+        return self._pool.execute(sql)
+
+
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="No warehouse reachable")
+def test_session_anchor_lands_on_a_month_that_has_sessions() -> None:
+    """
+    The regression, end to end: resolve the anchor the way the route does, build
+    sessions_by_referral from it, and require rows. Zero rows is what the frontend
+    silently replaces with mock bars, so an empty result here IS the bug.
+    """
+    pool = _warehouse_pool()
+    pool.initialise()
+    try:
+        shim = _PoolShim(pool)
+        anchor_date = _resolve_anchor_date(shim, None, "sessions")
+        sql = _WIDGET_SQL["sessions_by_referral"]([], [], [], anchor_date)
+        rows = pool.execute(sql)
+    finally:
+        pool.close_all()
+
+    assert rows, (
+        f"sessions_by_referral returned no rows for anchor {anchor_date} — "
+        "the frontend renders mock 'Estimated' bars in this case"
+    )
+    names = {str(r.get("NAME") or r.get("name")) for r in rows}
+    # Plan tiers here would mean we are looking at generateMockBar output.
+    assert not names & {"Free", "Pro", "Enterprise"}, f"mock-looking labels: {names}"
+
+
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="No warehouse reachable")
+def test_every_anchor_resolves_to_a_completed_month_start() -> None:
+    """
+    The anchors legitimately agree once the event facts are caught up, so this does
+    not assert they differ. It pins the two properties every consumer relies on:
+    a month start, and never an in-progress month.
+    """
+    pool = _warehouse_pool()
+    pool.initialise()
+    try:
+        shim = _PoolShim(pool)
+        resolved = {a: _resolve_anchor_date(shim, None, a) for a in _ANCHOR_SQL}
+    finally:
+        pool.close_all()
+
+    for anchor, value in resolved.items():
+        assert value <= _DEFAULT_DATA_THROUGH, f"{anchor}={value} is not a completed month"
+        assert value.endswith("-01"), f"{anchor}={value} is not a month start"

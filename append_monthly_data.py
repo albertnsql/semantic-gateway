@@ -4,7 +4,29 @@ append_monthly_data.py -- Monthly incremental data loader
 Run this script once after each calendar month ends to:
   1. Generate synthetic event data for that month and append it to the
      existing CSVs in output/.
-  2. Upload the new rows to Snowflake and INSERT them (no truncate).
+  2. Optionally upload the new rows to Snowflake and INSERT them (no truncate).
+
+The existing universe is READ FROM THE SAME output/ CSVs it is appended to
+------------------------------------------------------------------------
+This used to read Snowflake (`RAW.SUBSCRIBERS`, `RAW.SUBSCRIPTIONS`,
+`RAW.CONTENT_CATALOG`) while writing to output/. Those are two separate
+datastores and they had diverged -- Snowflake held ~37.8k subscribers, while
+output/subscribers.csv holds 15,960. The 2026-06 append therefore generated
+events for ~22k subscribers that do not exist in the CSV subscriber table.
+
+Nothing rejected them. The rows are well-formed and the FK is never enforced, so
+they loaded cleanly and inflated the numbers: 354,566 orphan stream_sessions
+(making June 2026 read 471,059 against a ~116k trend, a 4x bar on the dashboard)
+and 16,602 orphan payments, which became exactly the 16,602 NULL-country rows in
+fct_payments because the mart takes country from a LEFT JOIN to dim_subscribers.
+
+Reading the append TARGET makes read and write the same store by construction, so
+they cannot drift again, and `_assert_referential_integrity()` proves it per run
+rather than assuming it. It also removes Snowflake from the read path, which the
+script needs in order to run at all now that the warehouse is DuckDB and the
+Snowflake trial has expired.
+
+Rows already written were repaired by repair_orphan_event_rows.py.
 
 Stateful tables (subscribers, subscriptions, subscription_plan_history)
 are MERGED -- new subscriber IDs are inserted, existing ones are left alone.
@@ -23,6 +45,12 @@ Usage
 
     # Dry run -- generate CSVs only, skip Snowflake upload
     python append_monthly_data.py --month 2026-06 --dry-run
+
+    # Re-run a month already on disk (drops it first, so volume is not doubled)
+    python append_monthly_data.py --month 2026-06 --replace --dry-run
+
+    # Remove a month without regenerating it
+    python append_monthly_data.py --month 2026-06 --drop-month
 
     # Preview row counts without writing anything
     python append_monthly_data.py --month 2026-06 --preview
@@ -201,81 +229,125 @@ NEW_SUBS_PER_MONTH = 500       # net-new signups to create for the month
 MONTHLY_CHURN_RATE = 0.03      # fraction of the active base that churns during the month
 
 
-def _get_sf_connection():
-    """Open a Snowflake connection scoped to the RAW schema."""
-    import snowflake.connector
-    conn = snowflake.connector.connect(
-        user=SF_USER, password=SF_PASSWORD, account=SF_ACCOUNT, role=SF_ROLE,
-    )
-    cur = conn.cursor()
-    cur.execute(f"USE DATABASE {SF_DATABASE};")
-    cur.execute(f"USE SCHEMA {SF_SCHEMA};")
-    cur.execute(f"USE WAREHOUSE {SF_WAREHOUSE};")
-    cur.close()
-    return conn
+# ── Reading the existing universe from output/ ────────────────────────────────
+# Deliberately the same files append_to_csv() writes to. See the module docstring:
+# reading Snowflake while writing CSVs is what produced 354,566 orphan session rows.
+# There is no _get_sf_connection() here any more -- upload_to_snowflake() opens its
+# own connection, and the read path must not acquire one.
+
+
+def _read_output_csv(table: str, usecols: list[str] | None = None) -> pd.DataFrame:
+    """Read output/<table>.csv, or fail with the command that creates it."""
+    path = os.path.join(OUTPUT_DIR, f"{table}.csv")
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"{path} not found. Generate the base dataset first "
+            "(generate_streaming_data.py), then append incremental months."
+        )
+    return pd.read_csv(path, usecols=usecols, low_memory=False)
+
+
+def _val(v):
+    """Normalise a pandas cell to a plain scalar; NaN and '' both become None."""
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return s or None
 
 
 def _iso(v):
-    """Normalise a Snowflake date/datetime/None to an ISO string (or None)."""
-    if v is None or v == "":
+    """
+    Normalise a CSV date cell to a 'YYYY-MM-DD' string (or None).
+
+    Truncated to 10 characters because every consumer calls
+    date.fromisoformat() on the result, and some columns carry a time part.
+    """
+    v = _val(v)
+    if v is None:
         return None
     if hasattr(v, "isoformat"):
-        return v.isoformat()
-    return str(v)
+        return v.isoformat()[:10]
+    return str(v)[:10]
 
 
-def _load_existing_subscribers(conn) -> dict:
-    """Return {subscriber_id: attributes} for every existing subscriber in RAW."""
-    cols = ["subscriber_id", "email", "country", "signup_date", "acquisition_channel",
-            "plan_type", "plan_price_usd", "subscription_status", "trial_start_date",
-            "trial_end_date", "churn_date", "churn_reason", "age_group", "device_preference"]
-    cur = conn.cursor()
-    cur.execute(f"SELECT {', '.join(cols)} FROM SUBSCRIBERS")
+def _as_bool(v) -> bool:
+    """CSV round-trips booleans as the strings 'True'/'False'."""
+    v = _val(v)
+    return v is not None and str(v).lower() in ("true", "t", "1", "yes")
+
+
+_SUBSCRIBER_COLS = [
+    "subscriber_id", "email", "country", "signup_date", "acquisition_channel",
+    "plan_type", "plan_price_usd", "subscription_status", "trial_start_date",
+    "trial_end_date", "churn_date", "churn_reason", "age_group", "device_preference",
+]
+
+
+def _load_existing_subscribers() -> dict:
+    """Return {subscriber_id: attributes} for every subscriber in output/."""
+    df = _read_output_csv("subscribers", usecols=_SUBSCRIBER_COLS)
     sub_info = {}
-    for row in cur.fetchall():
-        r = dict(zip(cols, row))
+    for r in df.to_dict("records"):
         for dc in ("signup_date", "trial_start_date", "trial_end_date", "churn_date"):
             r[dc] = _iso(r[dc])
-        r["plan_price_usd"] = float(r["plan_price_usd"]) if r["plan_price_usd"] is not None else 0.0
-        sub_info[r["subscriber_id"]] = r
-    cur.close()
-    print(f"    loaded {len(sub_info):,} existing subscribers")
+        for c in ("subscriber_id", "email", "country", "acquisition_channel",
+                  "plan_type", "subscription_status", "churn_reason", "age_group",
+                  "device_preference"):
+            r[c] = _val(r[c])
+        price = _val(r["plan_price_usd"])
+        r["plan_price_usd"] = float(price) if price is not None else 0.0
+        if r["subscriber_id"]:
+            sub_info[r["subscriber_id"]] = r
+    print(f"    loaded {len(sub_info):,} existing subscribers from output/subscribers.csv")
     return sub_info
 
 
-def _load_existing_subscriptions(conn):
-    """Return (subscription_rows, subscription_map) for existing subscriptions in RAW."""
-    cols = ["subscription_id", "subscriber_id", "plan_type", "plan_price_usd", "billing_cycle",
-            "status", "start_date", "end_date", "mrr_usd", "is_trial", "payment_method",
-            "cancellation_reason"]
-    cur = conn.cursor()
-    cur.execute(f"SELECT {', '.join(cols)} FROM SUBSCRIPTIONS")
+_SUBSCRIPTION_COLS = [
+    "subscription_id", "subscriber_id", "plan_type", "plan_price_usd", "billing_cycle",
+    "status", "start_date", "end_date", "mrr_usd", "is_trial", "payment_method",
+    "cancellation_reason",
+]
+
+
+def _load_existing_subscriptions():
+    """Return (subscription_rows, subscription_map) for subscriptions in output/."""
+    df = _read_output_csv("subscriptions", usecols=_SUBSCRIPTION_COLS)
     subscription_rows = []
     subscription_map  = defaultdict(list)
-    for row in cur.fetchall():
-        r = dict(zip(cols, row))
-        r["start_date"]     = _iso(r["start_date"])
-        r["end_date"]       = _iso(r["end_date"])
-        r["plan_price_usd"] = float(r["plan_price_usd"]) if r["plan_price_usd"] is not None else 0.0
-        r["mrr_usd"]        = float(r["mrr_usd"]) if r["mrr_usd"] is not None else 0.0
-        r["is_trial"]       = bool(r["is_trial"])
+    for r in df.to_dict("records"):
+        r["start_date"] = _iso(r["start_date"])
+        r["end_date"]   = _iso(r["end_date"])
+        for c in ("subscription_id", "subscriber_id", "plan_type", "billing_cycle",
+                  "status", "payment_method", "cancellation_reason"):
+            r[c] = _val(r[c])
+        price = _val(r["plan_price_usd"])
+        mrr   = _val(r["mrr_usd"])
+        r["plan_price_usd"] = float(price) if price is not None else 0.0
+        r["mrr_usd"]        = float(mrr) if mrr is not None else 0.0
+        r["is_trial"]       = _as_bool(r["is_trial"])
         subscription_rows.append(r)
         subscription_map[r["subscriber_id"]].append(r)
-    cur.close()
-    print(f"    loaded {len(subscription_rows):,} existing subscriptions")
+    print(f"    loaded {len(subscription_rows):,} existing subscriptions from output/subscriptions.csv")
     return subscription_rows, subscription_map
 
 
-def _load_existing_content(conn):
-    """Return (content_ids, content_weights, content_runtime) from RAW.CONTENT_CATALOG."""
-    cur = conn.cursor()
-    cur.execute("SELECT content_id, avg_runtime_minutes FROM CONTENT_CATALOG")
+def _load_existing_content():
+    """Return (content_ids, content_weights, content_runtime) from output/."""
+    df = _read_output_csv("content_catalog", usecols=["content_id", "avg_runtime_minutes"])
     content_ids     = []
     content_runtime = {}
-    for cid, runtime in cur.fetchall():
+    for cid, runtime in zip(df["content_id"], df["avg_runtime_minutes"]):
+        cid = _val(cid)
+        if cid is None:
+            continue
         content_ids.append(cid)
-        content_runtime[cid] = int(runtime) if runtime is not None else 60
-    cur.close()
+        rt = _val(runtime)
+        content_runtime[cid] = int(float(rt)) if rt is not None else 60
     # Per-item popularity isn't stored in the catalog; approximate the original
     # power-law skew so session/rec content selection stays realistically long-tailed.
     content_weights = [float(np.random.power(0.3)) for _ in content_ids]
@@ -283,18 +355,21 @@ def _load_existing_content(conn):
     return content_ids, content_weights, content_runtime
 
 
-def _load_monthly_session_counts(conn, month_start: date) -> list[tuple[str, int]]:
-    """Trailing monthly session counts from RAW (months strictly before month_start)."""
-    cur = conn.cursor()
-    cur.execute(f"""
-        SELECT TO_CHAR(DATE_TRUNC('month', session_start::timestamp), 'YYYY-MM') AS mo,
-               COUNT(*)
-        FROM STREAM_SESSIONS
-        WHERE session_start::timestamp < '{month_start.isoformat()}'
-        GROUP BY 1 ORDER BY 1
-    """)
-    rows = [(m, int(c)) for m, c in cur.fetchall() if m is not None]
-    cur.close()
+def _load_monthly_session_counts(month_start: date) -> list[tuple[str, int]]:
+    """
+    Trailing monthly session counts (months strictly before month_start).
+
+    Only session_start is read -- stream_sessions.csv is well over a million rows.
+    This replaces a TO_CHAR/DATE_TRUNC query that DuckDB could not have run anyway
+    (it has no TO_CHAR; dashboard.py shims the same three Snowflake builtins).
+    """
+    df = _read_output_csv("stream_sessions", usecols=["session_start"])
+    ts = pd.to_datetime(df["session_start"], errors="coerce", format="mixed")
+    ts = ts[ts.notna() & (ts < pd.Timestamp(month_start))]
+    if ts.empty:
+        return []
+    counts = ts.dt.strftime("%Y-%m").value_counts().sort_index()
+    rows = [(m, int(n)) for m, n in counts.items()]
     return rows[-6:]   # last 6 months is enough to estimate the trend
 
 
@@ -322,6 +397,46 @@ def _session_volume_target(history: list[tuple[str, int]]) -> int | None:
         g = 0.05
     g = min(max(g, 0.0), 0.10)
     return int(prev * (1 + g))
+
+
+def _assert_referential_integrity(results: dict, new_sub_ids: set) -> None:
+    """
+    Refuse to append rows that reference a subscriber which will not exist on disk.
+
+    The known set is read FRESH from output/subscribers.csv rather than taken from
+    sub_info, deliberately. The entire 2026-06 failure was sub_info coming from a
+    different store than the one being written to -- a guard that trusted sub_info
+    would have passed while 354,566 orphan rows went to disk. Validating against
+    the append target is the only version of this check with teeth.
+    """
+    on_disk = set(
+        _read_output_csv("subscribers", usecols=["subscriber_id"])["subscriber_id"]
+        .astype(str)
+    )
+    known = on_disk | {str(s) for s in new_sub_ids}
+
+    problems = []
+    for table, df in results.items():
+        if df.empty or "subscriber_id" not in df.columns:
+            continue
+        refs = df["subscriber_id"].astype(str)
+        unknown = set(refs) - known
+        if unknown:
+            problems.append(
+                f"{table}: {len(unknown):,} unknown subscriber_id(s) across "
+                f"{int(refs.isin(unknown).sum()):,} rows "
+                f"(e.g. {sorted(unknown)[:3]})"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "Refusing to append. Generated rows reference subscribers that are "
+            "neither in output/subscribers.csv nor being created by this run:\n  "
+            + "\n  ".join(problems)
+            + "\n\nThis is the check the 2026-06 append did not have. If rows like "
+            "these are already on disk, see repair_orphan_event_rows.py."
+        )
+    print(f"  [fk] all subscriber references resolve ({len(known):,} known ids)")
 
 
 def _generate_new_subscribers(month_start: date, month_end: date):
@@ -443,19 +558,15 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
     Generate all incremental rows for [month_start, month_end].
     Returns a dict of {table_name: DataFrame}.
     """
-    print(f"\nLoading existing subscribers / subscriptions / content from Snowflake...")
-    _conn = _get_sf_connection()
-    try:
-        sub_info = _load_existing_subscribers(_conn)
-        subscription_rows, subscription_map = _load_existing_subscriptions(_conn)
-        content_ids, content_weights, content_runtime = _load_existing_content(_conn)
-        session_history = _load_monthly_session_counts(_conn, month_start)
-    finally:
-        _conn.close()
+    print("\nLoading existing subscribers / subscriptions / content from output/ CSVs...")
+    sub_info = _load_existing_subscribers()
+    subscription_rows, subscription_map = _load_existing_subscriptions()
+    content_ids, content_weights, content_runtime = _load_existing_content()
+    session_history = _load_monthly_session_counts(month_start)
 
     if not sub_info or not content_ids:
         raise RuntimeError(
-            "No existing subscribers/content found in RAW. Load the base dataset "
+            "No existing subscribers/content found in output/. Load the base dataset "
             "(generate_streaming_data.py) before appending an incremental month."
         )
 
@@ -846,10 +957,205 @@ def generate_month(month_start: date, month_end: date, preview: bool = False) ->
     results["subscription_plan_history"] = pd.DataFrame(plan_change_rows)
     print(f"    -> {len(plan_change_rows):,} plan changes generated")
 
+    # Every generated row must reference a subscriber that exists on disk, or will
+    # after this run. Checked before anything is written, including under --preview.
+    print("  Checking referential integrity...")
+    _assert_referential_integrity(results, new_sub_ids)
+
     return results
 
 
 # ── CSV append ────────────────────────────────────────────────────────────────
+
+# ── Write strategy per table ──────────────────────────────────────────────────
+# The Snowflake path distinguishes INSERT from MERGE (_MERGE_TABLES,
+# _CHURN_UPDATE_TABLE). The CSV path did not: it appended every payload, so a churn
+# UPDATE landed as a SECOND row for the same subscription_id. Measured on disk after
+# two appended months: 660 excess rows, 313 subscriptions present three times (the
+# original active row plus one cancelled row per month).
+#
+# That is the cause of the failing unique_stg_subscriptions_subscription_id dbt test,
+# and it is not cosmetic — int_subscription_periods builds a period set per
+# subscription row, so a triplicated subscription contributes three overlapping
+# period sets to fct_mrr_monthly.
+#
+# The churn payload had a second failure on top: it never reached subscribers.csv at
+# all, so the churn state was invisible to the NEXT month's append. With
+# random.seed(42) fixed at module load and a near-identical active list, July then
+# re-churned 313 of the same 316 people June had already churned.
+#
+# Both are fixed by mirroring the Snowflake strategy on the CSV side.
+
+# table → key column to upsert on (one row per key, latest state wins)
+_CSV_UPSERT_KEYS: dict[str, str] = {
+    "subscriptions": "subscription_id",
+}
+
+# The churn payload keeps its own file (it is the Snowflake MERGE source) AND is
+# applied onto subscribers.csv, matching _CHURN_UPDATE_TABLE's MERGE into SUBSCRIBERS.
+_CHURN_APPLY_COLUMNS = ["subscription_status", "churn_date", "churn_reason"]
+
+# The column each table is dated by, for --drop-month. Every one of these tables
+# only ever receives rows dated inside the appended month, so "date in month" is an
+# exact inverse of the append.
+#
+# `subscriptions` is deliberately NOT here. It cannot be identified by date in
+# either direction, and guessing corrupted the file once already:
+#   * start_date in month  → also matches 199 base-generation subscriptions that
+#     legitimately START in 2026-07 (they are the 199 'new' rows in
+#     fct_mrr_monthly for that month), so they were deleted;
+#   * end_date in month    → also matches base subscriptions that legitimately
+#     CANCEL in that month.
+# It is handled by subscriber_id instead — see _drop_month().
+_MONTH_COLUMN: dict[str, str] = {
+    "payments": "payment_date",
+    "stream_sessions": "session_start",
+    "recommendation_events": "event_timestamp",
+    "search_events": "search_timestamp",
+    "user_watchlists": "added_timestamp",
+    "subscribers": "signup_date",
+    "subscribers_churn_updates": "churn_date",
+    "subscription_plan_history": "change_date",
+}
+
+
+def _aligned_to_header(path: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Reindex df to the on-disk header, raising on a genuine schema change."""
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+    if set(header) != set(df.columns):
+        missing = sorted(set(header) - set(df.columns))
+        extra   = sorted(set(df.columns) - set(header))
+        raise ValueError(
+            f"generated columns do not match {path}. "
+            f"Missing from generated data: {missing or 'none'}. "
+            f"Not in the CSV header: {extra or 'none'}. "
+            "Refusing to write — fix the generator or migrate the CSV."
+        )
+    return df[header]
+
+
+def _upsert_csv(table: str, df: pd.DataFrame, key: str) -> None:
+    """
+    Apply df to output/<table>.csv as an upsert on `key` — the CSV equivalent of
+    the Snowflake MERGE. Rows whose key already exists REPLACE it; the rest append.
+    """
+    path = os.path.join(OUTPUT_DIR, f"{table}.csv")
+    if not os.path.exists(path):
+        df.to_csv(path, index=False)
+        print(f"  [csv]  {table}: created with {len(df):,} rows -> {path}")
+        return
+
+    df = _aligned_to_header(path, df)
+    existing = pd.read_csv(path, low_memory=False)
+
+    incoming_keys = set(df[key].astype(str))
+    mask = existing[key].astype(str).isin(incoming_keys)
+    updated = int(mask.sum())
+
+    combined = pd.concat([existing[~mask], df], ignore_index=True)
+    combined = _aligned_to_header(path, combined)
+    combined.to_csv(path, index=False)
+    print(
+        f"  [csv]  {table}: upserted {len(df):,} rows "
+        f"({updated:,} replaced, {len(df) - updated:,} new) -> {path}"
+    )
+
+
+def _apply_churn_to_subscribers(df: pd.DataFrame) -> None:
+    """
+    Write the churn payload's status/date/reason onto the matching subscribers.csv
+    rows. Without this the churn never reaches the authoritative subscriber table,
+    so dim_subscribers keeps reporting the subscriber active AND the next month's
+    append re-churns them.
+    """
+    path = os.path.join(OUTPUT_DIR, "subscribers.csv")
+    if not os.path.exists(path):
+        print("  [warn] subscribers.csv missing — churn state not applied")
+        return
+
+    subs = pd.read_csv(path, low_memory=False).set_index("subscriber_id")
+    payload = df.set_index("subscriber_id")
+    targets = payload.index.intersection(subs.index)
+
+    if len(targets) == 0:
+        print("  [csv]  subscribers: no churn rows matched")
+        return
+
+    for col in _CHURN_APPLY_COLUMNS:
+        if col in payload.columns:
+            subs.loc[targets, col] = payload.loc[targets, col]
+
+    subs.reset_index().to_csv(path, index=False)
+    print(f"  [csv]  subscribers: applied churn state to {len(targets):,} rows -> {path}")
+
+
+def _subscribers_created_in(lo: str, hi: str) -> set[str]:
+    """subscriber_ids whose signup_date falls in [lo, hi] — this month's net-new."""
+    path = os.path.join(OUTPUT_DIR, "subscribers.csv")
+    if not os.path.exists(path):
+        return set()
+    df = pd.read_csv(path, usecols=["subscriber_id", "signup_date"], low_memory=False)
+    hit = df["signup_date"].astype(str).str[:10].between(lo, hi)
+    return set(df.loc[hit, "subscriber_id"].astype(str))
+
+
+def _drop_month(month_start: date, month_end: date, label: str) -> None:
+    """
+    Remove every row a previous append added for this month, so the month can be
+    regenerated instead of double-counted.
+
+    Re-running a month used to silently double its volume — every table is
+    append-only and the ids are fresh uuid4s, so nothing collided and nothing
+    complained.
+
+    Two rules, because the tables come in two shapes:
+
+      * everything in _MONTH_COLUMN → drop rows dated inside the month. Exact,
+        because those tables only ever receive rows dated in the appended month.
+      * `subscriptions` → drop rows belonging to the subscribers this month
+        CREATED. A date rule cannot work here: base-generation subscriptions
+        legitimately start and end in arbitrary future months, so both
+        `start_date in month` and `end_date in month` delete real history.
+
+    Churn is not undone, and does not need to be: with _CSV_UPSERT_KEYS in place a
+    month's churn REPLACES the subscription row rather than adding a copy, so a
+    re-run simply overwrites it. Duplicate rows left behind by the old append-only
+    code are repaired by repair_csv_merge_state.py, not here.
+    """
+    lo = month_start.isoformat()
+    hi = month_end.isoformat()
+    print(f"\nDropping existing rows for {label} ({lo} .. {hi})...")
+
+    # Resolve this BEFORE subscribers.csv is rewritten below — it is the only
+    # precise handle on the subscription rows the append INSERTed.
+    month_subscriber_ids = _subscribers_created_in(lo, hi)
+    print(f"  [info] {len(month_subscriber_ids):,} subscribers were created in {label}")
+
+    for table, date_col in _MONTH_COLUMN.items():
+        path = os.path.join(OUTPUT_DIR, f"{table}.csv")
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path, low_memory=False)
+        if date_col not in df.columns:
+            continue
+        before = len(df)
+        drop = df[date_col].astype(str).str[:10].between(lo, hi)
+        removed = int(drop.sum())
+        if removed:
+            df[~drop].to_csv(path, index=False)
+        print(f"  [drop] {table:<28} removed {removed:>8,} of {before:>10,} rows")
+
+    # subscriptions: by owning subscriber, never by date.
+    path = os.path.join(OUTPUT_DIR, "subscriptions.csv")
+    if os.path.exists(path) and month_subscriber_ids:
+        df = pd.read_csv(path, low_memory=False)
+        before = len(df)
+        drop = df["subscriber_id"].astype(str).isin(month_subscriber_ids)
+        removed = int(drop.sum())
+        if removed:
+            df[~drop].to_csv(path, index=False)
+        print(f"  [drop] {'subscriptions':<28} removed {removed:>8,} of {before:>10,} rows")
+
 
 def append_to_csv(dfs: dict[str, pd.DataFrame], month_label: str) -> None:
     """
@@ -879,24 +1185,28 @@ def append_to_csv(dfs: dict[str, pd.DataFrame], month_label: str) -> None:
         if df.empty:
             print(f"  [skip] {table}: 0 rows generated")
             continue
+
+        # UPDATE-shaped payloads must not be appended — see _CSV_UPSERT_KEYS.
+        key = _CSV_UPSERT_KEYS.get(table)
+        if key:
+            _upsert_csv(table, df, key)
+            continue
+
         path = os.path.join(OUTPUT_DIR, f"{table}.csv")
         exists = os.path.exists(path)
-
         if exists:
-            header = pd.read_csv(path, nrows=0).columns.tolist()
-            if set(header) != set(df.columns):
-                missing = sorted(set(header) - set(df.columns))
-                extra   = sorted(set(df.columns) - set(header))
-                raise ValueError(
-                    f"{table}: generated columns do not match {path}. "
-                    f"Missing from generated data: {missing or 'none'}. "
-                    f"Not in the CSV header: {extra or 'none'}. "
-                    "Refusing to append — fix the generator or migrate the CSV."
-                )
-            df = df[header]  # align to disk order; do NOT rely on dict key order
+            try:
+                df = _aligned_to_header(path, df)
+            except ValueError as exc:
+                raise ValueError(f"{table}: {exc}") from None
 
         df.to_csv(path, mode="a", header=not exists, index=False)
         print(f"  [csv]  {table}: appended {len(df):,} rows -> {path}")
+
+        # The churn payload keeps its own file (Snowflake MERGE source) and is also
+        # written onto subscribers.csv, which is what the next month reads.
+        if table == _CHURN_UPDATE_TABLE:
+            _apply_churn_to_subscribers(df)
 
 
 # ── Snowflake upload ──────────────────────────────────────────────────────────
@@ -1055,6 +1365,14 @@ def main() -> None:
         "--preview", action="store_true",
         help="Print row counts only -- do not write any files."
     )
+    parser.add_argument(
+        "--replace", action="store_true",
+        help="Drop any existing rows for the month before generating it (re-runnable)."
+    )
+    parser.add_argument(
+        "--drop-month", action="store_true",
+        help="Delete the month's existing rows and stop. Does not generate anything."
+    )
     args = parser.parse_args()
 
     months = []
@@ -1074,6 +1392,17 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"  Processing month: {label}  ({month_start} -> {month_end})")
         print(f"{'='*60}")
+
+        if args.drop_month:
+            _drop_month(month_start, month_end, label)
+            print(f"\n  [drop-month] {label} removed. Nothing generated.")
+            continue
+
+        # Drop first so the month is regenerated rather than doubled. Without this a
+        # second run adds a whole second month of rows under fresh uuid4 ids, which
+        # nothing detects.
+        if args.replace:
+            _drop_month(month_start, month_end, label)
 
         dfs = generate_month(month_start, month_end, preview=args.preview)
 

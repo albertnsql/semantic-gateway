@@ -171,7 +171,19 @@ class MetricRegistry:
         for m_name, m_def in self._metrics.items():
             native_count = len(m_def.certified_dimensions)
             
-            if m_name == "ltv":
+            # Metrics measured on sem_payments. Both reach dim_subscribers through
+            # the `subscriber` FOREIGN entity declared on sem_payments, so MetricFlow
+            # compiles e.g. `total_revenue by subscriber__country` as a LEFT JOIN with
+            # no extra config — and build_dimension_prefix_map() already resolves the
+            # bare name `country` to `subscriber__country` for both. This second pass
+            # is the only thing that was gating it: certified_dimensions is built from
+            # the OWNING semantic model alone, and sem_payments declares just
+            # payment_method / currency / is_renewal / payment_date. Without
+            # total_revenue here, "revenue by country" was rejected at
+            # query.py's dimension check as uncertified even though every layer
+            # below it could serve the query. settings.warmup_matrix has always
+            # listed total_revenue x subscriber__country, which is the giveaway.
+            if m_name in ("ltv", "total_revenue"):
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:
                     m_def.certified_dimensions.extend(sub_sem.dimensions + sub_sem.time_dimensions)

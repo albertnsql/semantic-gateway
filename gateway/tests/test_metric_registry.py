@@ -140,6 +140,36 @@ class TestMetricRegistryCertifiedDimensions:
         """payment_method should be a certified dimension for ltv (from sem_payments.yml)."""
         assert registry.is_certified_dimension("ltv", "payment_method")
 
+    def test_country_certified_for_total_revenue(self, registry: MetricRegistry) -> None:
+        """
+        'revenue by country' must be answerable.
+
+        sem_payments declares only payment_method / currency / is_renewal /
+        payment_date, so the first pass gives total_revenue no country. It reaches
+        dim_subscribers through the `subscriber` foreign entity and MetricFlow
+        compiles the join unaided, but the route's dimension check reads
+        certified_dimensions — so without the second-pass enrichment the query was
+        rejected as uncertified while every layer below it could serve it.
+        """
+        assert registry.is_certified_dimension("total_revenue", "country")
+
+    def test_native_payment_dimensions_survive_enrichment(
+        self, registry: MetricRegistry
+    ) -> None:
+        """The subscriber join must ADD to sem_payments' own dims, never replace them."""
+        for dim in ("payment_method", "currency", "is_renewal", "payment_date"):
+            assert registry.is_certified_dimension("total_revenue", dim), dim
+
+    def test_enrichment_does_not_leak_to_unrelated_metrics(
+        self, registry: MetricRegistry
+    ) -> None:
+        """
+        Only metrics with a real join path get subscriber dims. mrr lives on
+        fct_mrr_monthly and is deliberately left out of the enrichment list, so a
+        broadened `if m_name in (...)` that swept it up would show here.
+        """
+        assert not registry.is_certified_dimension("mrr", "acquisition_channel")
+
 
 class TestMetricRegistryIsCertified:
     def test_is_certified_metric_true(self, registry: MetricRegistry) -> None:
