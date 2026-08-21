@@ -8,7 +8,14 @@ import core.sql_generator as sql_generator
 from core.exceptions import SQLGenerationError
 from core.intent_extractor import FilterClause, QueryIntent, TimeRange
 from core.semantic_validator import ValidationResult
-from core.sql_generator import SQLGenerator
+from core.sql_generator import (
+    SQLGenerator,
+    correct_dimension_entity,
+    is_deterministic_mf_error,
+    metric_entities,
+    offset_window_grain,
+    require_metric_time,
+)
 
 
 def _settings() -> SimpleNamespace:
@@ -1026,3 +1033,147 @@ class TestDuckDBNeverFallsBackToSnowflake:
         generator = SQLGenerator(self._duckdb_settings(), pool=pool)
         assert generator.execute_query("SELECT 1") == [{"VALUE": 42}]
         assert pool.seen == ["SELECT 1"]
+
+
+# ── Entity prefixes, offset windows, deterministic errors ─────────────────────
+# Three guards added 2026-08-21, each after a production failure.
+
+
+class TestDimensionEntityCorrection:
+    """
+    The LLM picks the entity prefix, and the validator cannot check it: the
+    certification test runs on the BARE name, so `session__country` passes as
+    `country` and only fails later, inside MetricFlow. The query then falls
+    through to the governed builder, which is a much worse place to be answered
+    from than the semantic layer.
+
+    Correction is deliberately narrow. A prefix is rewritten only when its entity
+    is genuinely unreachable from the metric, so a deliberate choice between two
+    reachable entities, or a warmup_matrix value, is never second-guessed.
+    """
+
+    def test_unreachable_entity_is_corrected(self) -> None:
+        """Observed live: the model sent session__country for total_revenue."""
+        assert correct_dimension_entity("session__country", "total_revenue") == (
+            "subscriber__country"
+        )
+
+    def test_reachable_entity_is_left_alone(self) -> None:
+        for metric, dim in (
+            ("total_revenue", "subscriber__country"),
+            ("total_revenue", "payment__currency"),
+            # total_subscribers measures active_subscribers_count, which lives on
+            # sem_mrr, so `subscription__` is correct here despite the metric name
+            # sounding subscriber-shaped.
+            ("total_subscribers", "subscription__plan_type"),
+            ("mrr", "subscription__plan_type"),
+        ):
+            assert correct_dimension_entity(dim, metric) == dim, f"{metric}/{dim}"
+
+    def test_metric_time_is_never_rewritten(self) -> None:
+        """metric_time is MetricFlow's synthetic dimension, not an entity."""
+        assert correct_dimension_entity("metric_time__month", "net_mrr_growth") == (
+            "metric_time__month"
+        )
+
+    def test_bare_names_pass_straight_through(self) -> None:
+        """Unprefixed names are the mapper's job, not this function's."""
+        assert correct_dimension_entity("country", "total_revenue") == "country"
+
+    def test_unknown_metric_does_not_mangle_the_dimension(self) -> None:
+        assert correct_dimension_entity("subscriber__country", "no_such_metric") == (
+            "subscriber__country"
+        )
+
+    def test_reachable_entities_are_resolved_from_the_manifest(self) -> None:
+        assert "payment" in metric_entities("total_revenue")
+        assert "subscriber" in metric_entities("total_revenue")
+        assert "session" not in metric_entities("total_revenue")
+
+
+class TestOffsetWindowNeedsMetricTime:
+    """
+    MetricFlow refuses to resolve a metric with an offset window unless
+    metric_time is in the group-by, because there is nothing to offset along.
+
+    Production 2026-08-21: `net_mrr_growth by subscription__mrr_type` failed in
+    the warm engine, was retried through the CLI for the identical error, then hit
+    the governed builder which rejects the metric outright, and 500'd after 33.8s.
+    The same query resolves in about 1.3s once metric_time__month is present.
+    """
+
+    def test_offset_metric_gets_metric_time(self) -> None:
+        out = require_metric_time("net_mrr_growth", ["subscription__mrr_type"])
+        assert out == ["metric_time__month", "subscription__mrr_type"]
+
+    def test_grain_comes_from_the_window_not_a_constant(self) -> None:
+        """A week-offset metric must get metric_time__week, not month."""
+        assert offset_window_grain("net_mrr_growth") == "month"
+
+    def test_existing_metric_time_is_not_duplicated(self) -> None:
+        dims = ["metric_time__month", "subscription__mrr_type"]
+        assert require_metric_time("net_mrr_growth", dims) == dims
+
+    def test_any_metric_time_grain_counts_as_present(self) -> None:
+        """Do not add a second time grain just because the user chose a day."""
+        dims = ["metric_time__day"]
+        assert require_metric_time("net_mrr_growth", dims) == dims
+
+    def test_non_offset_metrics_are_untouched(self) -> None:
+        for metric in ("mrr", "total_revenue", "churn_rate", "total_subscribers"):
+            assert offset_window_grain(metric) is None, metric
+            assert require_metric_time(metric, ["subscription__plan_type"]) == [
+                "subscription__plan_type"
+            ]
+
+    def test_empty_dimensions_still_gets_the_grain(self) -> None:
+        assert require_metric_time("net_mrr_growth", []) == ["metric_time__month"]
+
+
+class TestDeterministicMetricFlowErrors:
+    """
+    The fallback chain exists for engine UNAVAILABILITY, where retrying through
+    the CLI can genuinely succeed. A query-resolution error is deterministic:
+    same manifest, same resolver, same input. Retrying it cost 24 seconds in
+    production to reach a byte-identical verdict.
+
+    Classification is conservative on purpose. Anything unrecognised is treated as
+    retryable, so a real engine fault still gets its second chance.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Got error(s) during query resolution.",
+            "The given input does not match any of the available group-by-items for "
+            "SimpleMetric('total_subscribers').",
+            "The query includes a metric 'net_mrr_growth' that specifies a time offset "
+            "in input metrics",
+            "Unable to satisfy the query",
+        ],
+        ids=["resolution", "group-by-items", "time-offset", "unsatisfiable"],
+    )
+    def test_resolution_errors_are_deterministic(self, message: str) -> None:
+        assert is_deterministic_mf_error(message)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Connection reset by peer",
+            "database is locked",
+            "'NoneType' object has no attribute 'splitlines'",
+            "Read timed out",
+            "",
+        ],
+        ids=["conn-reset", "db-locked", "none-output", "timeout", "empty"],
+    )
+    def test_transient_failures_stay_retryable(self, message: str) -> None:
+        """These are exactly the cases the subprocess fallback exists for."""
+        assert not is_deterministic_mf_error(message)
+
+    def test_accepts_an_exception_not_just_a_string(self) -> None:
+        exc = RuntimeError("Got error(s) during query resolution.")
+        assert is_deterministic_mf_error(exc)
+
+    def test_matching_is_case_insensitive(self) -> None:
+        assert is_deterministic_mf_error("GOT ERROR(S) DURING QUERY RESOLUTION.")

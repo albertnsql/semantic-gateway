@@ -61,6 +61,102 @@ def _intent_to_dict(intent) -> dict:
     return intent.model_dump(mode="json", exclude={"raw_llm_response", "original_query"})
 
 
+def _chat_with_fallback(
+    settings,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    purpose: str,
+    max_tokens: int,
+    temperature: float = 0.3,
+    total_budget_s: float = 12.0,
+    per_attempt_s: float = 6.0,
+) -> str:
+    """
+    Ask the LLM, walking the same three providers the IntentExtractor uses.
+
+    The two callers below each built ONE client from
+    ``if google_api_key: gemini else: groq``, so the else branch only fired when
+    the key was ABSENT, never when the call FAILED. The comment claimed "Prefer
+    Gemini, fallback to Groq" but nothing implemented it, and with
+    ``max_retries=0`` a slow Gemini was simply a hard failure.
+
+    Both failed in production on 2026-08-21 within one session: a schema question
+    returned nothing after 10.7s, and a metric answer lost its prose while still
+    returning correct rows, which the UI showed as "No conversational summary
+    available for this result".
+
+    Bounded by a total DEADLINE rather than a per-attempt timeout, so walking
+    three providers cannot turn a decoration into a slow response. Returns an
+    empty string when every provider fails; both callers already handle that.
+    """
+    from openai import OpenAI as _OpenAI
+
+    providers: list[tuple[str, str, str, str]] = []
+    if getattr(settings, "google_api_key", ""):
+        providers.append(
+            ("google", settings.google_api_key, settings.google_base_url, settings.google_model)
+        )
+    if getattr(settings, "openai_api_key", ""):
+        providers.append(
+            ("groq", settings.openai_api_key, settings.llm_base_url, settings.openai_model)
+        )
+    if getattr(settings, "openrouter_api_key", ""):
+        providers.append(
+            ("openrouter", settings.openrouter_api_key,
+             settings.openrouter_base_url, settings.openrouter_model)
+        )
+
+    if not providers:
+        logger.warning("%s: no LLM provider is configured.", purpose)
+        return ""
+
+    deadline = time.perf_counter() + total_budget_s
+    last_error: Exception | None = None
+
+    for index, (label, api_key, base_url, model) in enumerate(providers):
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0.5:
+            logger.warning(
+                "%s: %.1fs budget exhausted before trying %s.", purpose, total_budget_s, label
+            )
+            break
+        try:
+            client = _OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=min(per_attempt_s, remaining),
+                max_retries=0,
+            )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if text:
+                if index > 0:
+                    logger.info(
+                        "%s: served by %s (%s) after %d earlier provider(s) failed.",
+                        purpose, label, model, index,
+                    )
+                return text
+            logger.warning("%s: %s (%s) returned empty content.", purpose, label, model)
+        except Exception as exc:
+            last_error = exc
+            logger.warning("%s: %s (%s) failed: %s", purpose, label, model, exc)
+
+    logger.warning(
+        "%s: every provider failed (%d tried, last error: %s).",
+        purpose, len(providers), last_error,
+    )
+    return ""
+
+
 def _generate_narrative(query: str, results: list[dict], intent, settings) -> str:
     """
     Call Gemini (primary) or Groq (fallback) to produce a concise conversational
@@ -88,8 +184,6 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "time range covers loaded data or whether a filter is narrower than intended."
         )
     try:
-        from openai import OpenAI as _OpenAI
-
         # Build a compact preview (max 10 rows) so we don't blow the context
         preview_rows = results[:10]
         rows_text = "\n".join(
@@ -169,28 +263,13 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "Please provide the 2-sentence conversational summary of these results."
         )
 
-        # Prefer Gemini, fallback to Groq.
-        # Time-boxed: the narrative runs AFTER results are ready and only decorates
-        # them — it must never hold the response hostage (SDK default is 600 s).
-        if getattr(settings, "google_api_key", ""):
-            client = _OpenAI(api_key=settings.google_api_key, base_url=settings.google_base_url,
-                             timeout=8.0, max_retries=0)
-            model  = settings.google_model
-        else:
-            client = _OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url,
-                             timeout=8.0, max_retries=0)
-            model  = settings.openai_model
-
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=150,
+        # The narrative runs AFTER results are ready and only decorates them, so it
+        # gets the tighter of the two budgets: losing the prose is survivable,
+        # holding the whole response is not.
+        return _chat_with_fallback(
+            settings, system_prompt, user_prompt,
+            purpose="Narrative generation", max_tokens=150, total_budget_s=10.0,
         )
-        return (response.choices[0].message.content or "").strip()
     except Exception as exc:
         logger.warning("Narrative generation failed (non-fatal): %s", exc)
         return ""
@@ -213,26 +292,16 @@ def _generate_schema_response(query: str, registry, settings) -> str:
     user_prompt = f"Available Metrics Catalog:\n{metrics_context}\n\nUser Question: {query}"
     
     try:
-        from openai import OpenAI as _OpenAI
-        if getattr(settings, "google_api_key", ""):
-            client = _OpenAI(api_key=settings.google_api_key, base_url=settings.google_base_url,
-                             timeout=8.0, max_retries=0)
-            model  = settings.google_model
-        else:
-            client = _OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url,
-                             timeout=8.0, max_retries=0)
-            model  = settings.openai_model
-
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=300,
+        # A schema answer IS the whole response rather than a decoration, so it gets
+        # a longer budget. Falling through to the deterministic catalogue below is
+        # still far better than returning nothing at all.
+        answer = _chat_with_fallback(
+            settings, system_prompt, user_prompt,
+            purpose="Schema response", max_tokens=300, total_budget_s=18.0,
         )
-        return (response.choices[0].message.content or "").strip()
+        if answer:
+            return answer
+        raise RuntimeError("no provider produced a schema answer")
     except Exception as exc:
         logger.warning("Schema response generation failed: %s", exc)
         all_metric_names = [m.name for m in registry.list_user_facing_metrics()]

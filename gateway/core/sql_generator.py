@@ -202,6 +202,55 @@ _QUERY_TIMEOUT_SECONDS = 30
 
 _DYNAMIC_DIMENSION_MAP: dict[str, dict[str, str]] | None = None
 
+# metric -> the entity names reachable from that metric's semantic models (primary
+# + foreign). Used to tell a CORRECT entity prefix from a wrong one, which the
+# bare-name check in the validator cannot do: `_get_bare_dimension()` strips
+# `subscription__plan_type` down to `plan_type`, which IS certified for
+# total_subscribers, so the query passes validation and then fails to resolve.
+_DYNAMIC_METRIC_ENTITIES: dict[str, set[str]] | None = None
+
+# metric -> the time granularity its offset window is expressed in ('month' for
+# net_mrr_growth). MetricFlow refuses to resolve an offset metric unless
+# metric_time is in the group-by, because there is nothing to offset along:
+#   "specifies a time offset in input metrics ... However, group-by-items do not
+#    include 'metric_time'."
+# net_mrr_growth is the only such metric today.
+_DYNAMIC_OFFSET_GRAINS: dict[str, str] | None = None
+
+# Prefixes that are not entities and must never be "corrected". metric_time is
+# MetricFlow's synthetic time dimension, required in the group-by for any metric
+# with an offset window.
+_RESERVED_DIM_PREFIXES: frozenset[str] = frozenset({"metric_time"})
+
+
+# Substrings that mark a MetricFlow QUERY-RESOLUTION failure rather than an
+# engine problem. The distinction matters because the fallback chain exists for
+# engine *unavailability*, where retrying through the CLI can genuinely succeed.
+# A resolution error is deterministic: same manifest, same resolver, same input.
+# Retrying it buys nothing and costs a subprocess.
+#
+# Observed in production 2026-08-21: net_mrr_growth failed to resolve in the warm
+# engine, was retried through the CLI, returned the byte-identical error 24
+# seconds later, then hit the governed builder and 500'd. Total 33.8 seconds to
+# reach a conclusion available in the first 5 milliseconds.
+_DETERMINISTIC_MF_ERRORS: tuple[str, ...] = (
+    "got error(s) during query resolution",
+    "does not match any of the available group-by-items",
+    "specifies a time offset in input metrics",
+    "unable to satisfy the query",
+)
+
+
+def is_deterministic_mf_error(exc: BaseException | str) -> bool:
+    """
+    True when MetricFlow rejected the QUERY, not when the engine misbehaved.
+
+    Conservative by design: anything unrecognised is treated as retryable, so a
+    genuine engine fault still gets its second chance through the subprocess.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _DETERMINISTIC_MF_ERRORS)
+
 
 def _bare_dimension_name(dimension: str) -> str:
     """
@@ -258,6 +307,8 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                     global_dims[dim_name].append(prefixed)
                     
     metric_map = {}
+    entity_map: dict[str, set[str]] = {}
+    offset_grains: dict[str, str] = {}
     for metric in manifest.get('metrics', []):
         m_name = metric['name']
         input_measures = metric.get('type_params', {}).get('input_measures', [])
@@ -275,6 +326,16 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                     primary_entities.append(e['name'])
                 model_entities.append(e['name'])
                     
+        entity_map[m_name] = set(model_entities)
+
+        # Offset window, if any. Recorded per metric so the group-by can be
+        # completed before compiling instead of failing and falling back.
+        for _inp in (metric.get('type_params') or {}).get('metrics') or []:
+            _win = _inp.get('offset_window')
+            if _win and _win.get('granularity'):
+                offset_grains[m_name] = str(_win['granularity']).lower()
+                break
+
         m_dim_map = {}
         for dim_name, prefixes in global_dims.items():
             if len(prefixes) == 1:
@@ -358,7 +419,98 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
         
     logger.info("Dimension prefix map built: %d metrics mapped", len(metric_map))
     _DYNAMIC_DIMENSION_MAP = metric_map
+    global _DYNAMIC_METRIC_ENTITIES, _DYNAMIC_OFFSET_GRAINS
+    _DYNAMIC_METRIC_ENTITIES = entity_map
+    _DYNAMIC_OFFSET_GRAINS = offset_grains
     return metric_map
+
+
+def offset_window_grain(metric: str) -> str | None:
+    """Granularity of *metric*'s offset window, or None if it has none."""
+    if _DYNAMIC_OFFSET_GRAINS is None:
+        build_dimension_prefix_map()
+    return (_DYNAMIC_OFFSET_GRAINS or {}).get(metric)
+
+
+def require_metric_time(metric: str, dimensions: list[str]) -> list[str]:
+    """
+    Add ``metric_time__<grain>`` when *metric* has an offset window and the
+    group-by lacks it.
+
+    Without this the query cannot resolve at all. Observed in production:
+    ``net_mrr_growth by subscription__mrr_type`` failed in the warm engine, was
+    retried through the CLI subprocess for the identical error, then hit the
+    governed builder, which rejects the metric outright because a flat SELECT
+    cannot express a month-over-month offset. Net result was a 500 after 33.8s
+    for a question the semantic layer can answer in about 1.3s once
+    metric_time__month is present.
+
+    The grain comes from the offset window itself, so a metric offset by a week
+    would get metric_time__week rather than a hard-coded month.
+    """
+    grain = offset_window_grain(metric)
+    if not grain:
+        return dimensions
+
+    dims = list(dimensions or [])
+    if any(d.split("__", 1)[0] == "metric_time" for d in dims):
+        return dims
+
+    injected = f"metric_time__{grain}"
+    logger.info(
+        "Metric '%s' has a %s offset window, which cannot resolve without a time "
+        "grain — adding '%s' to the group-by.", metric, grain, injected,
+    )
+    return [injected] + dims
+
+
+def metric_entities(metric: str) -> set[str]:
+    """Entity names reachable from *metric*'s semantic models (primary + foreign)."""
+    if _DYNAMIC_METRIC_ENTITIES is None:
+        build_dimension_prefix_map()
+    return (_DYNAMIC_METRIC_ENTITIES or {}).get(metric, set())
+
+
+def correct_dimension_entity(dim: str, metric: str) -> str:
+    """
+    Fix an entity prefix that is not reachable from *metric*.
+
+    The LLM picks the prefix, and it picks a plausible-looking wrong one often
+    enough to matter: `total_subscribers by subscription__plan_type`. That metric
+    lives on sem_subscribers, whose entity is `subscriber`, so MetricFlow rejects
+    it and the query falls through to the governed builder, which answered from
+    fct_mrr_monthly and returned **20,086** (a count of subscriptions) where the
+    right answer was **16,460** subscribers. Status was `success` and nothing
+    logged a problem, which is the worst shape a wrong answer can take.
+
+    A prefix is only rewritten when its entity is genuinely unreachable. Anything
+    valid is left exactly as given, so an explicitly configured warmup_matrix
+    value or a deliberate choice between two reachable entities still stands.
+    """
+    if "__" not in dim:
+        return dim
+    entity = dim.split("__", 1)[0]
+    if entity in _RESERVED_DIM_PREFIXES:
+        return dim
+    reachable = metric_entities(metric)
+    if not reachable or entity in reachable:
+        return dim
+
+    bare = _bare_dimension_name(dim)
+    corrected = (build_dimension_prefix_map().get(metric) or {}).get(bare)
+    if not corrected or corrected == dim:
+        logger.warning(
+            "Dimension '%s' uses entity '%s', which is not reachable from metric "
+            "'%s' (reachable: %s). No mapping for bare name '%s' — passing through.",
+            dim, entity, metric, sorted(reachable), bare,
+        )
+        return dim
+
+    logger.warning(
+        "Dimension '%s' uses entity '%s', which is not reachable from metric '%s' "
+        "— correcting to '%s'.", dim, entity, metric, corrected,
+    )
+    return corrected
 
 
 
@@ -461,6 +613,20 @@ class SQLGenerator:
         Raises:
             SQLGenerationError: If MetricFlow CLI fails or returns no SQL.
         """
+        # ── Normalise entity prefixes BEFORE anything reads the names ─────────
+        # Done here rather than in format_mf_query() because the names are read by
+        # the post_filter split, the template-cache key and the outer predicate.
+        # Correcting later would leave the outer predicate referencing a column the
+        # compiled SQL no longer emits, which is a fresh way to return zero rows.
+        _primary = intent.metrics[0] if intent.metrics else ""
+        if _primary:
+            intent.dimensions = [
+                correct_dimension_entity(d, _primary) for d in (intent.dimensions or [])
+            ]
+            for _f in intent.filters or []:
+                _f.column = correct_dimension_entity(_f.column, _primary)
+            intent.dimensions = require_metric_time(_primary, intent.dimensions)
+
         # ── SQL Template Cache check ──────────────────────────────────────────
         # If we have a cached compiled SQL template for this metric+dimension
         # combination, skip the MetricFlow subprocess entirely and inject the
@@ -531,10 +697,17 @@ class SQLGenerator:
                 compiled_sql = self._compile_with_warm_engine(mf_command)
                 mf_success = compiled_sql is not None
             except Exception as exc:
-                logger.warning(
-                    "Warm MetricFlow engine failed (%s) — falling back to the template "
-                    "cache, then the subprocess.", exc,
-                )
+                if is_deterministic_mf_error(exc):
+                    logger.warning(
+                        "MetricFlow cannot resolve this query (%s) — skipping the "
+                        "subprocess and going straight to the template cache.",
+                        str(exc).splitlines()[0] if str(exc) else exc,
+                    )
+                else:
+                    logger.warning(
+                        "Warm MetricFlow engine failed (%s) — falling back to the "
+                        "template cache, then the subprocess.", exc,
+                    )
                 compiled_sql = None
 
         # Filtered queries are NOT eligible for the template cache — the compiled SQL
@@ -869,6 +1042,15 @@ class SQLGenerator:
                 )
                 return sql
             except Exception as exc:
+                if is_deterministic_mf_error(exc):
+                    # The CLI would reach the identical verdict. Raise now and let
+                    # the caller fall through to the template cache / builder.
+                    logger.warning(
+                        "MetricFlow rejected the query itself (%s) — not retrying "
+                        "via subprocess, the result would be identical.",
+                        str(exc).splitlines()[0] if str(exc) else exc,
+                    )
+                    raise
                 logger.warning(
                     "Warm MetricFlow engine failed (%s) — retrying via subprocess.", exc,
                 )
