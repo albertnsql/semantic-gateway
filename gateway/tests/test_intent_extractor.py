@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.exceptions import IntentExtractionError
-from core.intent_extractor import IntentExtractor, QueryIntent, TimeRange
+from core.intent_extractor import FilterClause, IntentExtractor, QueryIntent, TimeRange
 
 
 # ──────────────────────────────────────────────── Shared constants
@@ -242,6 +242,82 @@ class TestFilterExtraction:
 
         intent = extractor.extract("Show me total MRR", AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
         assert intent.filters == []
+
+
+class TestFilterValueCoercion:
+    """
+    A multi-value filter must arrive as a list.
+
+    Every SQL path branches on isinstance(value, list), so a multi-value filter
+    left as a single string renders as ONE literal: IN ('basic,standard'). That is
+    valid SQL matching nothing, so the query returns zero rows with
+    status=success, no error is raised, and the empty result is cached.
+
+    Measured against the live model before the fix: "MRR for basic and standard
+    plans this year", "churn rate by country for US, GB and DE in 2025" and
+    "total revenue for premium and basic plans last 6 months" all returned 0 rows
+    where the correct answers were 2, 3 and 2 rows.
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "basic,standard",
+            "basic, standard",
+            "  basic ,  standard  ",
+            "(basic, standard)",
+            "'basic', 'standard'",
+            '"basic", "standard"',
+            "['basic', 'standard']",
+            '["basic", "standard"]',
+        ],
+        ids=[
+            "bare", "bare-spaced", "bare-padded", "parenthesised",
+            "single-quoted", "double-quoted", "bracketed", "bracketed-json",
+        ],
+    )
+    def test_in_operator_yields_a_real_list(self, raw: str) -> None:
+        f = FilterClause(column="subscription__plan_type", operator="in", value=raw)
+        assert f.value == ["basic", "standard"], f"{raw!r} -> {f.value!r}"
+
+    def test_three_values_all_survive(self) -> None:
+        f = FilterClause(column="subscriber__country", operator="in", value="US,GB,DE")
+        assert f.value == ["US", "GB", "DE"]
+
+    def test_single_value_stays_a_string(self) -> None:
+        """IN ('premium') is already correct — do not wrap it in a list."""
+        f = FilterClause(column="subscription__plan_type", operator="in", value="premium")
+        assert f.value == "premium"
+
+    def test_eq_with_a_comma_is_not_split(self) -> None:
+        """
+        The load-bearing restriction. A comma inside an eq value is part of the
+        value, so splitting on it would corrupt a legitimate single-value filter.
+        """
+        f = FilterClause(column="subscriber__country", operator="eq", value="Smith, John")
+        assert f.value == "Smith, John"
+
+    @pytest.mark.parametrize("operator", ["eq", "neq", "gt", "gte", "lt", "lte"])
+    def test_non_in_operators_are_untouched(self, operator: str) -> None:
+        f = FilterClause(column="c", operator=operator, value="a,b")
+        assert f.value == "a,b"
+
+    def test_bracketed_value_still_parses_for_non_in_operators(self) -> None:
+        """Pre-existing behaviour: a bracketed string is never a scalar."""
+        f = FilterClause(column="c", operator="eq", value="['a', 'b']")
+        assert f.value == ["a", "b"]
+
+    def test_real_list_passes_through(self) -> None:
+        f = FilterClause(column="c", operator="in", value=["basic", "standard"])
+        assert f.value == ["basic", "standard"]
+
+    def test_malformed_brackets_fall_through_to_the_split(self) -> None:
+        f = FilterClause(column="c", operator="in", value="[basic, standard]")
+        assert f.value == ["basic", "standard"]
+
+    def test_empty_string_is_left_alone(self) -> None:
+        f = FilterClause(column="c", operator="in", value="")
+        assert f.value == ""
 
 
 class TestFallbackChain:

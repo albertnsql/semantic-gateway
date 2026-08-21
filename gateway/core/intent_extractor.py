@@ -91,29 +91,72 @@ class FilterClause(BaseModel):
 
     @field_validator("value", mode="before")
     @classmethod
-    def _coerce_stringified_list(cls, v):
+    def _coerce_stringified_list(cls, v, info):
         """
         Turn a stringified list into a real list.
 
-        The LLM sometimes emits an IN value as ``"['basic', 'standard', 'premium']"``
-        rather than a JSON array. Every consumer branches on
-        ``isinstance(value, list)``, so a stringified list was rendered as ONE
-        literal: ``IN ('[''basic'', ''standard'', ''premium'']')`` — which matches
-        nothing and silently returns zero rows. Normalising here fixes all three
-        SQL paths (outer predicates, MetricFlow ``--where``, the fallback builder)
-        at once rather than patching each.
+        Every consumer branches on ``isinstance(value, list)``, so a multi-value
+        filter that arrives as one string renders as ONE SQL literal:
+        ``IN ('basic,standard,premium')``. That is valid SQL which matches nothing,
+        so it returns zero rows with ``status=success`` and no error anywhere, and
+        the empty answer is then written to the L2 result cache. Normalising here
+        fixes all three SQL paths (outer predicates, MetricFlow ``--where``, the
+        fallback builder) at once rather than patching each.
+
+        Two shapes have been observed from the model, and only the first was
+        handled originally:
+
+        * **bracketed** — ``"['basic', 'standard', 'premium']"``. Emitted when the
+          model enumerates every value of a dimension it is already grouping by.
+        * **bare delimited** — ``"basic,standard"``, ``"US,GB,DE"``. Emitted when
+          the *user* names the values ("MRR for basic and standard plans"), which
+          is the far more common case: it accounted for four of five phrasings
+          when this was probed against the live model. Every one of those queries
+          returned zero rows in production.
+
+        Splitting is deliberately restricted to ``operator == "in"``, the only
+        operator for which a list is meaningful. A comma inside an ``eq`` value is
+        part of the value, not a separator, and must survive untouched. A single
+        value stays a plain string: ``IN ('premium')`` is already correct.
+
+        Only the comma is treated as a separator. "and" is not, because it appears
+        inside legitimate dimension values.
         """
-        if isinstance(v, str):
-            stripped = v.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                import ast
-                try:
-                    parsed = ast.literal_eval(stripped)
-                except (ValueError, SyntaxError):
-                    return v
-                if isinstance(parsed, (list, tuple)):
-                    return [str(item) for item in parsed]
-        return v
+        if not isinstance(v, str):
+            return v
+
+        stripped = v.strip()
+
+        # Bracketed forms parse regardless of operator — that was the original
+        # behaviour and a bracketed string is never a scalar value.
+        if stripped.startswith("[") and stripped.endswith("]"):
+            import ast
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                parsed = None
+            if isinstance(parsed, (list, tuple)):
+                return [str(item).strip() for item in parsed]
+            # Malformed brackets fall through to the delimiter split below.
+
+        # info.data holds the fields validated so far. `operator` is declared
+        # before `value`, so it is available here; .get() covers the case where
+        # operator itself failed validation.
+        if (info.data or {}).get("operator") != "in":
+            return v
+
+        inner = stripped
+        for opener, closer in (("[", "]"), ("(", ")")):
+            if inner.startswith(opener) and inner.endswith(closer):
+                inner = inner[1:-1].strip()
+                break
+
+        if "," not in inner:
+            return v
+
+        parts = [part.strip().strip("'\"").strip() for part in inner.split(",")]
+        parts = [part for part in parts if part]
+        return parts or v
 
 
 class QueryIntent(BaseModel):
@@ -401,11 +444,20 @@ class IntentExtractor:
                 raw_response=raw_content,
             ) from exc
 
+        # Filters are logged with their COERCED python type, not just their text.
+        # A multi-value filter that stays a str renders as one SQL literal and
+        # silently returns zero rows, and the previous log line printed metrics,
+        # dimensions and time but not filters — so the one field that caused the
+        # bug was the one field invisible in production.
         logger.info(
-            "Intent extracted: metrics=%s dims=%s time=%s",
+            "Intent extracted: metrics=%s dims=%s time=%s filters=%s",
             intent.metrics,
             intent.dimensions,
             intent.time_range,
+            [
+                f"{f.column} {f.operator} {f.value!r}({type(f.value).__name__})"
+                for f in intent.filters
+            ],
         )
         return intent
 

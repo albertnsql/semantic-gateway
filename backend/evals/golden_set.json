@@ -183,6 +183,19 @@
     "notes": "Filter on billing_cycle dimension — tests filter vs dimension distinction."
   },
   {
+    "id": "filter-multi-001",
+    "category": "filter_extraction",
+    "question": "What is the MRR for basic and standard plans last month?",
+    "expected": {
+      "metrics": ["mrr"],
+      "dimensions": ["plan_type"],
+      "time_range_relative": "last_month",
+      "filters": [{"column": "plan_type", "operator": "in", "value": ["basic", "standard"]}],
+      "needs_clarification": false
+    },
+    "notes": "Multi-value IN filter — the VALUE must arrive as a list. The model emits it as the bare string 'basic,standard' for this phrasing, and every SQL path branches on isinstance(value, list), so left as a string it renders as one literal, IN ('basic,standard'), which is valid SQL matching nothing: 0 rows with status=success, and the empty answer cached. Four of five probed phrasings produced the bare form and the golden set had no multi-value filter case at all, which is why it shipped. Column names are bare because _CERTIFIED_DIMENSIONS in the harness is a bare-name fixture; the live route passes the registry's prefixed map and gets subscription__plan_type. The list value is the assertion with teeth."
+  },
+  {
     "id": "multi-metric-001",
     "category": "multi_metric",
     "question": "Show me MRR and churn rate by country for last quarter",
