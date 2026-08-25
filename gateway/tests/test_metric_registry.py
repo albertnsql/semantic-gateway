@@ -160,15 +160,31 @@ class TestMetricRegistryCertifiedDimensions:
         for dim in ("payment_method", "currency", "is_renewal", "payment_date"):
             assert registry.is_certified_dimension("total_revenue", dim), dim
 
-    def test_enrichment_does_not_leak_to_unrelated_metrics(
+    def test_sem_mrr_metrics_reach_subscriber_dimensions(
         self, registry: MetricRegistry
     ) -> None:
         """
-        Only metrics with a real join path get subscriber dims. mrr lives on
-        fct_mrr_monthly and is deliberately left out of the enrichment list, so a
-        broadened `if m_name in (...)` that swept it up would show here.
+        sem_mrr declares `subscriber` as a FOREIGN entity, so its metrics reach
+        dim_subscribers and MetricFlow compiles the join unaided. Verified with the
+        CLI: mrr / expansion_mrr / churn_rate / retention_rate / total_subscribers
+        by subscriber__country all resolve.
+
+        This previously asserted the opposite, on the documented belief that mrr
+        "has no such join path". That was wrong, and it meant the route rejected
+        "MRR by country" and "churn by country" as uncertified while the semantic
+        layer could answer both.
         """
-        assert not registry.is_certified_dimension("mrr", "acquisition_channel")
+        for metric in ("mrr", "expansion_mrr", "churn_rate", "retention_rate",
+                       "total_subscribers"):
+            assert registry.is_certified_dimension(metric, "country"), metric
+            assert registry.is_certified_dimension(metric, "acquisition_channel"), metric
+
+    def test_enrichment_does_not_invent_dimensions(
+        self, registry: MetricRegistry
+    ) -> None:
+        """The join adds dim_subscribers' columns, not arbitrary names."""
+        assert not registry.is_certified_dimension("mrr", "device_type")
+        assert not registry.is_certified_dimension("mrr", "referral_source")
 
 
 class TestMetricRegistryIsCertified:

@@ -525,14 +525,41 @@ class TestApplyGrainRounding:
     def test_monthly_start_already_first_of_month(self):
         assert apply_grain_rounding("2026-03-01", "period_month", is_start=True) == "2026-03-01"
 
-    def test_monthly_end_advances_to_first_of_next_month(self):
-        assert apply_grain_rounding("2026-06-19", "period_month", is_start=False) == "2026-07-01"
+    # The upper bound is INCLUSIVE. These three previously asserted the first day
+    # of the NEXT month, on the stated assumption that the bound was exclusive.
+    # The predicate MetricFlow actually emits is
+    #   DATE_TRUNC('month', period_month) BETWEEN start AND end
+    # and BETWEEN includes both ends, so every template-cache-served monthly query
+    # covered one extra period. Confirmed against the CLI, which is the authority:
+    #   mf 2026-05-20..2026-08-20 -> '2026-05-01' .. '2026-08-31'
+    #   mf 2026-08-01..2026-08-01 -> '2026-08-01' .. '2026-08-31'
+    #   mf 2026-01-01..2026-12-31 -> '2026-01-01' .. '2026-12-31'
 
-    def test_monthly_end_december_rolls_over_to_next_year(self):
-        assert apply_grain_rounding("2026-12-15", "period_month", is_start=False) == "2027-01-01"
+    def test_monthly_end_is_last_day_of_the_end_month(self):
+        assert apply_grain_rounding("2026-06-19", "period_month", is_start=False) == "2026-06-30"
 
-    def test_monthly_end_last_day_of_month_advances_correctly(self):
-        assert apply_grain_rounding("2026-06-30", "period_month", is_start=False) == "2026-07-01"
+    def test_monthly_end_december_stays_in_december(self):
+        assert apply_grain_rounding("2026-12-15", "period_month", is_start=False) == "2026-12-31"
+
+    def test_monthly_end_last_day_of_month_is_idempotent(self):
+        assert apply_grain_rounding("2026-06-30", "period_month", is_start=False) == "2026-06-30"
+
+    def test_monthly_end_february_leap_year(self):
+        assert apply_grain_rounding("2028-02-10", "period_month", is_start=False) == "2028-02-29"
+
+    def test_monthly_end_february_non_leap_year(self):
+        assert apply_grain_rounding("2027-02-10", "period_month", is_start=False) == "2027-02-28"
+
+    def test_single_month_request_stays_within_one_period(self):
+        """
+        The regression with teeth. fct_mrr_monthly carries a trailing churn-only
+        period, so a "one month" churn_rate request that spilled into the next
+        month read 8.7% where the true monthly rate was 4.4%.
+        """
+        start = apply_grain_rounding("2026-08-01", "period_month", is_start=True)
+        end = apply_grain_rounding("2026-08-01", "period_month", is_start=False)
+        assert (start, end) == ("2026-08-01", "2026-08-31")
+        assert end[:7] == start[:7], "an inclusive bound must not leave the month"
 
     # ── daily grain (payment_date, session_start, signup_date, event_timestamp)
 
@@ -564,19 +591,19 @@ class TestApplyGrainRounding:
     def test_production_scenario_mrr_last_3_months(self):
         """
         User: start=2026-03-19, end=2026-06-19 for mrr (monthly grain).
-        Expected SQL bounds: 2026-03-01 and 2026-07-01.
+        Covers March through June inclusive: 2026-03-01 .. 2026-06-30.
         """
         sql_start = apply_grain_rounding("2026-03-19", "period_month", is_start=True)
         sql_end   = apply_grain_rounding("2026-06-19", "period_month", is_start=False)
         assert sql_start == "2026-03-01"
-        assert sql_end   == "2026-07-01"
+        assert sql_end   == "2026-06-30"
 
     def test_production_scenario_mrr_last_6_months(self):
         """
         User: start=2025-12-19, end=2026-06-19 for mrr (monthly grain).
-        Expected SQL bounds: 2025-12-01 and 2026-07-01.
+        Covers December through June inclusive: 2025-12-01 .. 2026-06-30.
         """
         sql_start = apply_grain_rounding("2025-12-19", "period_month", is_start=True)
         sql_end   = apply_grain_rounding("2026-06-19", "period_month", is_start=False)
         assert sql_start == "2025-12-01"
-        assert sql_end   == "2026-07-01"
+        assert sql_end   == "2026-06-30"

@@ -191,7 +191,25 @@ class MetricRegistry:
                 "engagement_rate", "recommendation_ctr", 
                 "total_recommendations", "clicked_recommendations",
                 "avg_watch_time", "total_watch_time",
-                "avg_buffering_events", "total_buffering_events", "total_sessions"
+                "avg_buffering_events", "total_buffering_events", "total_sessions",
+                # sem_mrr metrics. sem_mrr declares `subscriber` as a FOREIGN entity,
+                # so every one of these reaches dim_subscribers and MetricFlow
+                # compiles the join unaided. Verified with the CLI:
+                #   mrr / expansion_mrr / churn_rate / retention_rate /
+                #   total_subscribers  by subscriber__country  -> all Success
+                #   net_mrr_growth needs metric_time too (require_metric_time adds it)
+                #
+                # Without them the route rejected "MRR by country", "churn by
+                # country" and "retention by acquisition channel" as uncertified,
+                # even though the semantic layer answers all three. Found by the new
+                # `run_evals.py --check-drift`, which flagged the eval fixture
+                # claiming dimensions the registry did not have.
+                #
+                # NOTE: CLAUDE.md previously stated that mrr "has no such join
+                # path". That was wrong — sem_mrr's foreign entity has always been
+                # there.
+                "mrr", "expansion_mrr", "churn_rate", "retention_rate",
+                "total_subscribers", "net_mrr_growth",
             ):
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:

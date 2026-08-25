@@ -222,6 +222,55 @@ _DYNAMIC_OFFSET_GRAINS: dict[str, str] | None = None
 # with an offset window.
 _RESERVED_DIM_PREFIXES: frozenset[str] = frozenset({"metric_time"})
 
+# SNAPSHOT metrics: a count of the population AT A POINT IN TIME, not a sum over a
+# period. fct_mrr_monthly holds one row per subscriber per month, so
+# active_subscribers_count is meaningful within a month and meaningless across
+# months -- COUNT(DISTINCT ...) over every period returns everyone who was EVER
+# active.
+#
+# "Show me total subscribers by plan type" carries no time range, and answered
+# 16,460 (the all-time union, which is also every row in dim_subscribers) when the
+# real July 2026 base was 12,109. No error, no warning: a 36% overstatement
+# reported as success.
+#
+# The semantic-layer fix for this is `non_additive_dimension: {name: period_month,
+# window_choice: max}` on the measure. It was tried and REVERTED, because
+# fct_mrr_monthly's spine is driven by current_date() and its churn rows carry a
+# +1 month offset, so the newest period (2026-09) holds 531 rows with ZERO active
+# subscribers. window_choice picks that phantom month and every answer becomes 0.
+# Removing the phantom period means changing the fact table, which would move every
+# MRR, churn and retention number in the app.
+#
+# So the default is applied here instead: no time range on a snapshot metric means
+# "as of the latest period that actually has data".
+#
+# Every metric here is documented as MONTHLY and reads fct_mrr_monthly. Measured
+# with no time range against the real warehouse:
+#
+#   metric            all periods   Aug 2026   true monthly
+#   churn_rate           46.2%        4.4%      3.4 - 4.4%
+#   retention_rate       53.8%       95.6%        ~96%
+#   total_subscribers    16,460      11,774       11,774
+#
+# The ratios are worse than the count because numerator AND denominator both
+# union: 46% is the share of subscribers who EVER churned, presented as a monthly
+# rate on a business churning about 4% a month.
+#
+# `ltv` is deliberately NOT here even though it shares the
+# active_subscribers_count measure. It is "total revenue per subscriber lifetime",
+# so an all-period denominator is the correct one — defaulting it to the latest
+# month would silently convert LTV into ARPU.
+#
+# The two internal building blocks (monthly_churned_subscribers,
+# monthly_subscriber_base) are omitted too: they are hidden from the LLM by
+# _INTERNAL_METRICS and never arrive as intent.metrics[0], so the default already
+# applies through churn_rate / retention_rate.
+_SNAPSHOT_METRICS: frozenset[str] = frozenset({
+    "total_subscribers",
+    "churn_rate",
+    "retention_rate",
+})
+
 
 # Substrings that mark a MetricFlow QUERY-RESOLUTION failure rather than an
 # engine problem. The distinction matters because the fallback chain exists for
@@ -425,6 +474,60 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
     return metric_map
 
 
+def _latest_period_with_data(pool, metric: str) -> str | None:
+    """
+    Newest value of *metric*'s physical time column that actually has rows.
+
+    Deliberately NOT ``MAX(period_month)``: that lands on the phantom trailing
+    month described above. The measure expression is applied so an all-inactive
+    period cannot win.
+    """
+    time_col = SQLGenerator._METRIC_TIME_COL.get(metric)
+    if not pool or not time_col:
+        return None
+    try:
+        rows = pool.execute(
+            f"SELECT MAX({time_col}) AS mx FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly "
+            "WHERE is_active = TRUE"
+        )
+    except Exception as exc:
+        logger.warning("Could not resolve latest period for '%s': %s", metric, exc)
+        return None
+    if not rows:
+        return None
+    raw = rows[0].get("MX") or rows[0].get("mx")
+    return str(raw)[:10] if raw else None
+
+
+def default_snapshot_time_range(metric: str, time_range, pool):
+    """
+    Give a snapshot metric its latest period when the caller supplied no range.
+
+    Returns *time_range* unchanged for every other metric, and whenever the user
+    did state a period -- an explicit "in 2025" must always win over the default.
+    """
+    if time_range is not None or metric not in _SNAPSHOT_METRICS:
+        return time_range
+
+    latest = _latest_period_with_data(pool, metric)
+    if not latest:
+        logger.warning(
+            "Snapshot metric '%s' has no time range and the latest period could not "
+            "be resolved — the answer will span every period.", metric,
+        )
+        return None
+
+    from core.intent_extractor import TimeRange
+
+    month_start = latest[:8] + "01"
+    logger.info(
+        "Snapshot metric '%s' asked without a time range — defaulting to its latest "
+        "period (%s). Counting every period would union all months and return "
+        "everyone ever active.", metric, month_start,
+    )
+    return TimeRange(start_date=month_start, end_date=latest, relative=None)
+
+
 def offset_window_grain(metric: str) -> str | None:
     """Granularity of *metric*'s offset window, or None if it has none."""
     if _DYNAMIC_OFFSET_GRAINS is None:
@@ -626,6 +729,9 @@ class SQLGenerator:
             for _f in intent.filters or []:
                 _f.column = correct_dimension_entity(_f.column, _primary)
             intent.dimensions = require_metric_time(_primary, intent.dimensions)
+            intent.time_range = default_snapshot_time_range(
+                _primary, intent.time_range, self._pool
+            )
 
         # ── SQL Template Cache check ──────────────────────────────────────────
         # If we have a cached compiled SQL template for this metric+dimension
@@ -1088,6 +1194,16 @@ class SQLGenerator:
                 shell=False,
                 capture_output=True,
                 text=True,
+                # The env already sets PYTHONUTF8=1 so the CHILD writes UTF-8, but
+                # text=True decodes with the PARENT's locale encoding. On Windows
+                # that is cp1252, and the mf CLI's spinner glyphs (U+2807 and
+                # friends) raise UnicodeDecodeError inside subprocess's reader
+                # thread. stdout then arrives as None and the caller dies with
+                # "'NoneType' object has no attribute 'splitlines'", which reads
+                # like a MetricFlow fault and is really a decoding one. errors=
+                # "replace" keeps a mangled spinner from destroying valid SQL.
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
                 env=env,
             )

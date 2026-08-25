@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from datetime import date, datetime
@@ -98,21 +99,142 @@ _CERTIFIED_DIMENSIONS: dict[str, list[str]] = {
     "churn_rate":            ["country", "plan_type", "acquisition_channel", "age_group"],
     "total_subscribers":     ["country", "plan_type", "acquisition_channel", "signup_date"],
     "churned_subscribers":   ["country", "plan_type", "acquisition_channel"],
-    "recommendation_ctr":    ["event_date", "referral_source"],
-    "clicked_recommendations": ["event_date", "referral_source"],
-    "total_recommendations": ["event_date", "referral_source"],
+    # Corrected 2026-08-25: `event_date` does not exist (the column is
+    # event_timestamp) and `referral_source` belongs to sem_stream_sessions, not
+    # sem_recommendation_events. Both were accepted by the eval and rejected in
+    # production. Surfaced by --check-drift.
+    "recommendation_ctr":    ["event_timestamp", "recommendation_type"],
+    "clicked_recommendations": ["event_timestamp", "recommendation_type"],
+    "total_recommendations": ["event_timestamp", "recommendation_type"],
 }
 
+# Corrected 2026-08-25 against SQLGenerator._METRIC_TIME_COL, which is the single
+# source of truth for a metric's physical time column:
+#   total_subscribers   signup_date -> period_month   (moved to fct_mrr_monthly)
+#   churned_subscribers signup_date -> churn_date     (churn EVENT, not signup)
+#   recommendation_ctr  event_date  -> event_timestamp
+# All three had drifted, which is the failure mode `--check-drift` now surfaces.
 _CERTIFIED_TIME_GRAINS: dict[str, dict[str, list[str]]] = {
     "mrr":           {"period_month": ["day", "week", "month", "quarter", "year"]},
     "expansion_mrr": {"period_month": ["month", "quarter"]},
     "ltv":           {"payment_date": ["day", "week", "month"]},
     "engagement_rate": {"session_start": ["day", "week"]},
     "churn_rate":    {"period_month": ["month", "quarter"]},
-    "total_subscribers": {"signup_date": ["day", "week", "month"]},
-    "churned_subscribers": {"signup_date": ["day", "week", "month"]},
-    "recommendation_ctr": {"event_date": ["day", "week", "month"]},
+    "total_subscribers": {"period_month": ["day", "week", "month"]},
+    "churned_subscribers": {"churn_date": ["day", "week", "month"]},
+    "recommendation_ctr": {"event_timestamp": ["day", "week", "month"]},
 }
+
+
+def _load_live_registry():
+    """
+    Load the metric universe the PRODUCTION route passes, not the fixture.
+
+    The fixture and the route differ in a way that matters: it lists BARE
+    dimension names while `registry.get_all_dimension_map()` returns
+    entity-PREFIXED ones (`plan_type` vs `subscription__plan_type`). So the same
+    question yields different output under eval than in production, and the evals
+    never exercise prefix resolution at all -- which is precisely where two
+    wrong-answer bugs lived (an unreachable `session__country`, and a missing
+    `metric_time` on an offset metric).
+
+    Returns (metrics, dimensions, time_grains) or None if the registry cannot be
+    loaded, so `--live-registry` degrades to a clear message rather than a stack
+    trace.
+    """
+    gateway = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "gateway",
+    )
+    if gateway not in sys.path:
+        sys.path.insert(0, gateway)
+    try:
+        from config import settings
+        from core.manifest_parser import ManifestParser
+        from core.metric_registry import MetricRegistry
+
+        # The gateway's path settings are written relative to gateway/ (its cwd in
+        # production), so resolve them from there rather than from the repo root.
+        cwd = os.getcwd()
+        os.chdir(gateway)
+        try:
+            parser = ManifestParser()
+            parser.load(settings.manifest_path)
+            registry = MetricRegistry()
+            registry.load(settings.metrics_path, settings.semantic_models_path, parser)
+        finally:
+            os.chdir(cwd)
+    except Exception as exc:
+        print(f"[!] Could not load the live registry: {exc}")
+        return None
+
+    user_facing = registry.list_user_facing_metrics()
+    return (
+        [m.name for m in user_facing],
+        registry.get_all_dimension_map(),
+        {m.name: registry.get_valid_time_grains_for_metric(m.name) for m in user_facing},
+    )
+
+
+def _report_fixture_drift() -> int:
+    """
+    Print how the fixture differs from the live registry. Returns the finding count.
+
+    The fixture is deliberately a stable subset, so a difference is not
+    automatically a bug. Silent staleness is, though: three time columns had
+    drifted before anyone noticed.
+    """
+    live = _load_live_registry()
+    if live is None:
+        return 0
+    live_metrics, live_dims, live_grains = live
+
+    findings = 0
+    print("\nFixture vs live registry")
+    print("-" * 70)
+
+    missing = [m for m in _CERTIFIED_METRICS if m not in live_metrics]
+    if missing:
+        findings += len(missing)
+        print(f"  [FAIL] in fixture but NOT user-facing in the registry: {missing}")
+
+    not_covered = sorted(set(live_metrics) - set(_CERTIFIED_METRICS))
+    print(f"  [info] {len(_CERTIFIED_METRICS)} of {len(live_metrics)} metrics covered; "
+          f"not evaluated: {not_covered}")
+
+    for metric, grains in _CERTIFIED_TIME_GRAINS.items():
+        live_cols = set((live_grains.get(metric) or {}).keys())
+        if not live_cols:
+            continue
+        stale = set(grains) - live_cols
+        if stale:
+            findings += 1
+            print(f"  [FAIL] {metric}: time column(s) {sorted(stale)} are not in the "
+                  f"registry (it has {sorted(live_cols)})")
+
+    for metric, dims in _CERTIFIED_DIMENSIONS.items():
+        live_bare = {d.split("__")[-1] for d in (live_dims.get(metric) or [])}
+        if not live_bare:
+            continue
+        unknown = [d for d in dims if d.split("__")[-1] not in live_bare]
+        if unknown:
+            findings += 1
+            print(f"  [FAIL] {metric}: dimension(s) {unknown} unknown to the registry")
+
+    prefixed = any("__" in d for dims in live_dims.values() for d in dims)
+    if prefixed:
+        print("  [info] the registry returns entity-PREFIXED dimensions; this fixture "
+              "uses bare names, so prefix resolution is not exercised. "
+              "Use --live-registry to test what production actually passes.")
+
+    print("-" * 70)
+    print(f"  {findings} finding(s)")
+    return findings
+
+
+# Metric universe used for the current run. run_evals() sets this; the default
+# keeps direct imports of _score_case working.
+_universe = (_CERTIFIED_METRICS, _CERTIFIED_DIMENSIONS, _CERTIFIED_TIME_GRAINS)
 
 
 # ---------------------------------------------------------------------------
@@ -297,13 +419,34 @@ def run_evals(
     snapshot: bool = False,
     fail_under: int = 80,
     verbose: bool = False,
+    live_registry: bool = False,
+    check_drift: bool = False,
 ) -> int:
     """
     Load golden set, run every case through the real IntentExtractor,
     score results, print report, optionally write snapshot.
 
+    With *live_registry* the metric universe comes from the real MetricRegistry
+    instead of the curated fixture, so the run exercises what the production route
+    actually passes -- entity-prefixed dimensions included. Expect the pass rate to
+    move, because several golden cases pin bare dimension names.
+
     Returns the exit code (0 = pass, 1 = fail).
     """
+    global _universe
+    _universe = (_CERTIFIED_METRICS, _CERTIFIED_DIMENSIONS, _CERTIFIED_TIME_GRAINS)
+
+    if check_drift:
+        _report_fixture_drift()
+
+    if live_registry:
+        live = _load_live_registry()
+        if live is None:
+            print("[!] --live-registry requested but the registry could not be loaded.")
+            return 1
+        _universe = live
+        print(f"\nUsing the LIVE registry: {len(live[0])} user-facing metric(s), "
+              "entity-prefixed dimensions.")
     # Load golden set
     with _GOLDEN_SET_PATH.open(encoding="utf-8") as fh:
         golden_set: list[dict] = json.load(fh)
@@ -343,9 +486,9 @@ def run_evals(
         try:
             intent = extractor.extract(
                 query=case["question"],
-                available_metrics=_CERTIFIED_METRICS,
-                available_dimensions=_CERTIFIED_DIMENSIONS,
-                available_time_grains=_CERTIFIED_TIME_GRAINS,
+                available_metrics=_universe[0],
+                available_dimensions=_universe[1],
+                available_time_grains=_universe[2],
             )
             result = _score_case(case, intent)
         except Exception as exc:
@@ -462,6 +605,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print full intent JSON for every case, not just failures",
     )
+    p.add_argument(
+        "--live-registry",
+        action="store_true",
+        help="Use the real MetricRegistry instead of the curated fixture "
+             "(entity-prefixed dimensions, all user-facing metrics)",
+    )
+    p.add_argument(
+        "--check-drift",
+        action="store_true",
+        help="Report how the curated fixture differs from the live registry",
+    )
     return p.parse_args()
 
 
@@ -473,5 +627,7 @@ if __name__ == "__main__":
             snapshot=args.snapshot,
             fail_under=args.fail_under,
             verbose=args.verbose,
+            live_registry=args.live_registry,
+            check_drift=args.check_drift,
         )
     )

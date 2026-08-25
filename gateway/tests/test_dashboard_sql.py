@@ -427,3 +427,57 @@ def test_every_anchor_resolves_to_a_completed_month_start() -> None:
     for anchor, value in resolved.items():
         assert value <= _DEFAULT_DATA_THROUGH, f"{anchor}={value} is not a completed month"
         assert value.endswith("-01"), f"{anchor}={value} is not a month start"
+
+
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="No warehouse reachable")
+def test_no_active_subscribers_after_the_latest_active_period() -> None:
+    """
+    The invariant the snapshot-metric default leans on.
+
+    `default_snapshot_time_range()` gives a snapshot metric the latest period that
+    has active rows. MetricFlow then rounds the end of any range UP by one period,
+    so a request for 2026-08 compiles to
+    ``BETWEEN '2026-08-01' AND '2026-09-01'`` and would union two months.
+
+    That is safe only because the trailing period is always churn-only:
+    int_subscription_periods keeps a subscription active while
+    ``period_month <= date_trunc('month', current_date())`` but emits cancellation
+    rows a month PAST the end date, so the month after the newest active one holds
+    rows with zero active subscribers.
+
+    Structural rather than lucky, but subtle enough to deserve an assertion. If the
+    date-spine logic ever changes, this fails here instead of silently inflating
+    every "how many subscribers do we have" answer.
+    """
+    pool = _warehouse_pool()
+    pool.initialise()
+    try:
+        rows = pool.execute(
+            """
+            WITH latest AS (
+                SELECT MAX(period_month) AS p
+                FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly
+                WHERE is_active = TRUE
+            )
+            SELECT m.period_month AS period,
+                   COUNT(DISTINCT CASE WHEN m.is_active THEN m.subscriber_id END) AS active
+            FROM STREAMING_ANALYTICS.marts.fct_mrr_monthly m, latest
+            WHERE m.period_month > latest.p
+            GROUP BY 1
+            ORDER BY 1
+            """
+        )
+    finally:
+        pool.close_all()
+
+    offenders = [
+        f"{str(r.get('PERIOD') or r.get('period'))[:10]}: "
+        f"{int(r.get('ACTIVE') or r.get('active') or 0)} active"
+        for r in rows
+        if int(r.get("ACTIVE") or r.get("active") or 0) > 0
+    ]
+    assert not offenders, (
+        "A period after the latest active month has active subscribers, so the "
+        "snapshot default would union two months and overstate the base:\n  "
+        + "\n  ".join(offenders)
+    )

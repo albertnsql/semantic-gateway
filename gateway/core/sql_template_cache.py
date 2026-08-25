@@ -118,11 +118,29 @@ def apply_grain_rounding(
     MetricFlow normalises filter bounds to the grain period boundary before
     embedding them in SQL:
 
-        month grain → start : first day of the month  (e.g. 2026-03-19 → 2026-03-01)
-                      end   : first day of NEXT month  (e.g. 2026-06-19 → 2026-07-01)
-                              (exclusive upper bound — ``< '2026-07-01'``)
+        month grain → start : first day of the month  (2026-03-19 → 2026-03-01)
+                      end   : LAST day of the end month (2026-06-19 → 2026-06-30)
 
         day grain   → unchanged  (MetricFlow embeds the user date directly)
+
+    The upper bound is INCLUSIVE, because the predicate MetricFlow emits is
+    ``DATE_TRUNC('month', period_month) BETWEEN start AND end`` and BETWEEN is
+    inclusive at both ends. This returned the first day of the NEXT month instead,
+    described in a comment as an exclusive bound — true of ``< '2026-07-01'``, and
+    wrong for the BETWEEN that is actually generated. The result was one extra
+    month in every template-cache-served query on a monthly-grain metric.
+
+    Verified against the CLI, which is the authority here::
+
+        mf --start-time 2026-05-20 --end-time 2026-08-20  →  '2026-05-01' .. '2026-08-31'
+        mf --start-time 2026-08-01 --end-time 2026-08-01  →  '2026-08-01' .. '2026-08-31'
+        mf --start-time 2026-01-01 --end-time 2026-12-31  →  '2026-01-01' .. '2026-12-31'
+
+    The extra month was not cosmetic. `fct_mrr_monthly` carries a trailing
+    churn-only period (cancellations are dated a month past the end date), so a
+    single-month churn_rate request spanning two months read **8.7%** where the
+    true monthly rate was **4.4%** — the phantom month contributes 531 churn rows to
+    the numerator and almost nothing to the denominator.
 
     Args:
         date_str: User-provided date in ``YYYY-MM-DD`` format.
@@ -145,10 +163,14 @@ def apply_grain_rounding(
         if is_start:
             return d.replace(day=1).isoformat()
         else:
-            # Exclusive upper bound: first day of the next calendar month
+            # INCLUSIVE upper bound: last day of the end month, matching the
+            # BETWEEN that MetricFlow emits. Returning the next month's first day
+            # here silently widened every monthly query by one period.
             if d.month == 12:
-                return d.replace(year=d.year + 1, month=1, day=1).isoformat()
-            return d.replace(month=d.month + 1, day=1).isoformat()
+                last = d.replace(year=d.year + 1, month=1, day=1)
+            else:
+                last = d.replace(month=d.month + 1, day=1)
+            return (last - datetime.timedelta(days=1)).isoformat()
 
     # day grain — pass through unchanged (MetricFlow embeds dates as-is)
     return date_str

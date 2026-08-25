@@ -8,9 +8,12 @@ import core.sql_generator as sql_generator
 from core.exceptions import SQLGenerationError
 from core.intent_extractor import FilterClause, QueryIntent, TimeRange
 from core.semantic_validator import ValidationResult
+from core.intent_extractor import TimeRange
 from core.sql_generator import (
+    _SNAPSHOT_METRICS,
     SQLGenerator,
     correct_dimension_entity,
+    default_snapshot_time_range,
     is_deterministic_mf_error,
     metric_entities,
     offset_window_grain,
@@ -1177,3 +1180,86 @@ class TestDeterministicMetricFlowErrors:
 
     def test_matching_is_case_insensitive(self) -> None:
         assert is_deterministic_mf_error("GOT ERROR(S) DURING QUERY RESOLUTION.")
+
+
+class TestSnapshotMetricTimeDefault:
+    """
+    A snapshot metric counts a population AT A POINT IN TIME. fct_mrr_monthly holds
+    one row per subscriber per month, so counting distinct subscribers across every
+    period returns everyone who was EVER active.
+
+    "Show me total subscribers by plan type" carries no time range and answered
+    16,460 -- the all-time union, which also happens to equal every row in
+    dim_subscribers -- where the real base was 11,774. A 40% overstatement returned
+    as `status=success` with nothing logged.
+
+    The semantic-layer fix (non_additive_dimension with window_choice: max) was
+    tried and reverted: fct_mrr_monthly's newest period holds 531 churn rows and
+    ZERO active subscribers, so the window lands on a phantom month and every
+    answer becomes 0.
+    """
+
+    def test_total_subscribers_is_registered_as_a_snapshot(self) -> None:
+        assert "total_subscribers" in _SNAPSHOT_METRICS
+
+    def test_ratio_metrics_on_the_monthly_fact_are_snapshots(self) -> None:
+        """
+        Both sides of these ratios are count_distinct on fct_mrr_monthly, so an
+        all-period query unions numerator AND denominator: churn_rate read 46.2%
+        where the true monthly rate is about 4%.
+        """
+        for metric in ("churn_rate", "retention_rate"):
+            assert metric in _SNAPSHOT_METRICS, metric
+
+    def test_additive_flow_metrics_are_not_snapshots(self) -> None:
+        """Sums over a period are additive and must keep spanning the range asked for."""
+        for metric in ("mrr", "total_revenue", "total_sessions", "expansion_mrr"):
+            assert metric not in _SNAPSHOT_METRICS, metric
+
+    def test_ltv_is_deliberately_excluded(self) -> None:
+        """
+        ltv shares active_subscribers_count with total_subscribers, but it is
+        "total revenue per subscriber lifetime" — an all-period denominator is the
+        correct one. Defaulting it to the latest month would silently turn LTV
+        into ARPU.
+        """
+        assert "ltv" not in _SNAPSHOT_METRICS
+
+    def test_explicit_time_range_always_wins(self) -> None:
+        """A user who said "in 2025" must not have it silently replaced."""
+        stated = TimeRange(start_date="2025-01-01", end_date="2025-12-31", relative=None)
+        out = default_snapshot_time_range("total_subscribers", stated, pool=None)
+        assert out is stated
+
+    def test_non_snapshot_metric_keeps_its_missing_range(self) -> None:
+        assert default_snapshot_time_range("mrr", None, pool=None) is None
+
+    def test_unresolvable_period_degrades_instead_of_guessing(self) -> None:
+        """No warehouse means no default. Better an all-period answer than a made-up date."""
+        assert default_snapshot_time_range("total_subscribers", None, pool=None) is None
+
+    def test_default_is_a_single_month_at_the_latest_period(self) -> None:
+        class _Pool:
+            def execute(self, sql):
+                assert "is_active" in sql, "must exclude all-inactive phantom periods"
+                return [{"MX": "2026-08-01"}]
+
+        out = default_snapshot_time_range("total_subscribers", None, pool=_Pool())
+        assert out is not None
+        assert out.start_date == "2026-08-01"
+        assert out.end_date == "2026-08-01"
+
+    def test_day_level_max_is_normalised_to_the_month_start(self) -> None:
+        class _Pool:
+            def execute(self, sql):
+                return [{"MX": "2026-08-31"}]
+
+        out = default_snapshot_time_range("total_subscribers", None, pool=_Pool())
+        assert out.start_date == "2026-08-01"
+
+    def test_pool_failure_is_not_fatal(self) -> None:
+        class _Pool:
+            def execute(self, sql):
+                raise RuntimeError("warehouse down")
+
+        assert default_snapshot_time_range("total_subscribers", None, pool=_Pool()) is None

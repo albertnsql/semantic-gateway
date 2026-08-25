@@ -30,6 +30,7 @@ from models.responses import (
     ViolationDetail,
 )
 from models.semantic import MetricDefinition
+from api.routes.query import _raw_query_cache_key
 
 
 # ──────────────────────────────────────────────── Helpers
@@ -532,3 +533,85 @@ class TestCacheClearEndpoint:
             mock_settings.admin_secret_key = "secret"
             response = c.post("/api/v1/cache/clear")  # no X-Admin-Key header
             assert response.status_code == 403
+
+
+# ── Raw-question cache key ────────────────────────────────────────────────────
+# The intent-keyed L2 cache sits AFTER the first LLM call, so a repeated question
+# still paid for it: production logged `CACHE HIT - 5462.1 ms`, all of it Gemini
+# re-deriving an intent it had already derived. Measured after the change:
+# 11,662 ms -> 9.8 ms -> 7.2 ms for the same question three times.
+#
+# The risk of a raw-text key is serving one question's answer to another, so
+# everything that can change the extracted intent has to be in it.
+
+
+class _Opts:
+    def __init__(self, max_rows=100):
+        self.max_rows = max_rows
+
+
+class _Msg:
+    def __init__(self, role, content):
+        self.role = role
+        self.content = content
+
+
+class _Body:
+    def __init__(self, query, history=None, dashboard_context=None, max_rows=100):
+        self.query = query
+        self.history = history
+        self.dashboard_context = dashboard_context
+        self.options = _Opts(max_rows)
+
+
+class TestRawQueryCacheKey:
+    def test_identical_requests_share_a_key(self) -> None:
+        a = _raw_query_cache_key(_Body("What is MRR by plan type?"))
+        b = _raw_query_cache_key(_Body("What is MRR by plan type?"))
+        assert a == b
+
+    def test_whitespace_and_case_are_normalised(self) -> None:
+        a = _raw_query_cache_key(_Body("What is MRR by plan type?"))
+        b = _raw_query_cache_key(_Body("  what   IS mrr  by PLAN type?  "))
+        assert a == b
+
+    def test_different_questions_do_not_collide(self) -> None:
+        a = _raw_query_cache_key(_Body("What is MRR by plan type?"))
+        b = _raw_query_cache_key(_Body("What is churn rate by country?"))
+        assert a != b
+
+    def test_history_is_part_of_the_key(self) -> None:
+        """
+        A fragment inherits from history, so the same text after a different
+        conversation is a different question. Without this, "and for 2025?" would
+        serve the previous turn's answer.
+        """
+        plain = _raw_query_cache_key(_Body("and for 2025?"))
+        after = _raw_query_cache_key(
+            _Body("and for 2025?", history=[_Msg("user", "MRR for the US")])
+        )
+        assert plain != after
+
+    def test_different_history_gives_different_keys(self) -> None:
+        one = _raw_query_cache_key(_Body("and for 2025?", history=[_Msg("user", "MRR for the US")]))
+        two = _raw_query_cache_key(_Body("and for 2025?", history=[_Msg("user", "MRR for Germany")]))
+        assert one != two
+
+    def test_dashboard_context_is_part_of_the_key(self) -> None:
+        """Only the dashboard chat sends it, and its prompt block changes the answer."""
+        without = _raw_query_cache_key(_Body("What is MRR?"))
+        with_ctx = _raw_query_cache_key(_Body("What is MRR?", dashboard_context={"filters": {}}))
+        assert without != with_ctx
+
+    def test_max_rows_is_part_of_the_key(self) -> None:
+        """It changes the payload that would be replayed."""
+        ten = _raw_query_cache_key(_Body("What is MRR?", max_rows=10))
+        hundred = _raw_query_cache_key(_Body("What is MRR?", max_rows=100))
+        assert ten != hundred
+
+    def test_key_is_namespaced_away_from_the_intent_cache(self) -> None:
+        """Both live in the same store; a collision would cross-serve."""
+        assert _raw_query_cache_key(_Body("What is MRR?"))["type"] == "raw_query"
+
+    def test_empty_query_does_not_raise(self) -> None:
+        assert _raw_query_cache_key(_Body(""))["q"] == ""

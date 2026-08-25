@@ -15,6 +15,7 @@ No business logic lives here — the route only orchestrates service calls.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 import uuid
@@ -318,6 +319,42 @@ def _generate_schema_response(query: str, registry, settings) -> str:
 
 # ─────────────────────────────────────────── POST /query
 
+def _raw_query_cache_key(body) -> dict:
+    """
+    Cache key for the RAW question, used before intent extraction runs.
+
+    The intent-keyed L2 cache sits AFTER the first LLM call, so a repeated
+    question still pays it in full. Production showed `CACHE HIT - 5462.1 ms`:
+    the lookup is instant, the 5.4 seconds is Gemini re-deriving an intent it had
+    already derived. Extraction and the narrative are roughly 90% of a round trip.
+
+    Everything that can change the extracted intent goes in the key, because two
+    requests sharing it must be guaranteed to produce the same answer:
+
+    * the question, whitespace-normalised and case-folded;
+    * the conversation history, because a fragment ("and for 2025?") inherits from
+      it, so the same text with different history is a different question;
+    * whether dashboard_context was supplied, since only the dashboard chat sends
+      it and its prompt block changes the answer;
+    * max_rows, which changes the payload that would be replayed.
+
+    Deliberately NOT a substitute for the L2 cache: two phrasings of one question
+    share an intent but not a raw key, and L2 still catches those.
+    """
+    history = body.history or []
+    fingerprint = "|".join(
+        f"{getattr(m, 'role', '')}:{(getattr(m, 'content', '') or '').strip()}"
+        for m in history
+    )
+    return {
+        "type": "raw_query",
+        "q": " ".join((body.query or "").split()).lower(),
+        "h": hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16],
+        "dash": bool(body.dashboard_context),
+        "max_rows": getattr(body.options, "max_rows", None),
+    }
+
+
 @router.post(
     "/query",
     response_model=GatewayResponse,
@@ -374,6 +411,26 @@ async def submit_query(
     registry         = request.app.state.metric_registry
     metric_embedder  = getattr(request.app.state, "metric_embedder", None)
     query_cache      = getattr(request.app.state, "query_cache", None)
+
+    # ── Stage 0: Raw-question cache ──────────────────────────────────────────
+    # In front of extraction, so an exact repeat skips BOTH LLM calls instead of
+    # only the warehouse round trip. See _raw_query_cache_key for what is in the key.
+    _raw_key = _raw_query_cache_key(body)
+    if query_cache is not None:
+        _raw_hit = query_cache.get(_raw_key)
+        if _raw_hit is not None:
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                "[%s] RAW CACHE HIT — %.1f ms (skipped intent extraction).",
+                request_id, elapsed,
+            )
+            _raw_hit = dict(_raw_hit)
+            _raw_hit["request_id"] = request_id
+            _raw_hit["cache_hit"] = True
+            _raw_hit = make_json_safe(_raw_hit)
+            resp = JSONResponse(status_code=200, content=_raw_hit)
+            resp.headers["X-Cache"] = "HIT-RAW"
+            return resp
 
     # ── Stage 1: Intent extraction (includes query_type routing) ─────────────
     try:
@@ -603,8 +660,12 @@ async def submit_query(
         all_rows = await anyio.to_thread.run_sync(partial(sql_gen.execute_query, gen_query.compiled_sql))
         results  = all_rows[: body.options.max_rows]
         logger.info(
-            "[%s] Snowflake returned %d rows (capped at %d).",
-            request_id, len(all_rows), body.options.max_rows,
+            # Names the CONFIGURED engine, not Snowflake. A Snowflake-flavoured
+            # message once sent a whole investigation at a dead dependency for a day
+            # (see CLAUDE.md on execute_query never falling back to Snowflake).
+            "[%s] %s returned %d rows (capped at %d).",
+            request_id, _settings.warehouse_engine.capitalize(),
+            len(all_rows), body.options.max_rows,
         )
     except SnowflakeConnectionError as exc:
         logger.error("[%s] Snowflake error: %s", request_id, exc)
@@ -651,6 +712,8 @@ async def submit_query(
     payload = make_json_safe(payload)
     if query_cache is not None:
         await anyio.to_thread.run_sync(partial(query_cache.set, intent_dict, payload))
+        # Also under the raw question, so the next identical ask skips both LLM calls.
+        await anyio.to_thread.run_sync(partial(query_cache.set, _raw_key, payload))
 
     resp = JSONResponse(status_code=200, content=payload)
     resp.headers["X-Cache"] = "MISS"
