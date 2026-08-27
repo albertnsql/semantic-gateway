@@ -136,9 +136,44 @@ class TestMetricRegistryCertifiedDimensions:
         assert isinstance(dims, list)
         assert len(dims) > 0
 
-    def test_payment_method_certified_for_ltv(self, registry: MetricRegistry) -> None:
-        """payment_method should be a certified dimension for ltv (from sem_payments.yml)."""
-        assert registry.is_certified_dimension("ltv", "payment_method")
+    def test_ltv_is_not_certified_for_its_numerators_own_dimensions(
+        self, registry: MetricRegistry
+    ) -> None:
+        """
+        ltv must NOT claim sem_payments' own dimensions.
+
+        This assertion is inverted from the one it replaces, which read
+        "payment_method should be a certified dimension for ltv (from
+        sem_payments.yml)". That was derivation, not capability: it asserted the
+        first pass had copied sem_payments' dimension list, and nothing had ever
+        checked whether MetricFlow could serve the result.
+
+        It cannot. ltv = total_revenue (sem_payments) / total_subscribers
+        (sem_mrr), and a ratio can only be grouped by a dimension reachable from
+        EVERY input. sem_payments reaches {payment, subscriber}, sem_mrr reaches
+        {subscription, subscriber}; `subscriber` is the only shared entity.
+        Confirmed against the real compiler by audit_dimension_coverage.py —
+        ltv claimed 13 dimensions and compiled 9, and these 4 were the failures.
+
+        Certifying them was worse than rejecting them: the route told the user the
+        question was valid, then MetricFlow refused it one layer down.
+        """
+        for dim in ("payment_method", "currency", "is_renewal", "payment_date"):
+            assert not registry.is_certified_dimension("ltv", dim), (
+                f"'{dim}' belongs to sem_payments and is reachable from ltv's "
+                "numerator only — MetricFlow cannot group the ratio by it."
+            )
+
+    def test_ltv_is_certified_for_the_shared_subscriber_dimensions(
+        self, registry: MetricRegistry
+    ) -> None:
+        """
+        The other half of the same rule: what both inputs CAN reach must stay
+        certified, or the fix above would have narrowed ltv into uselessness.
+        Golden case ltv-001 asks for ltv by acquisition_channel.
+        """
+        for dim in ("country", "plan_type", "acquisition_channel", "cohort_month"):
+            assert registry.is_certified_dimension("ltv", dim)
 
     def test_country_certified_for_total_revenue(self, registry: MetricRegistry) -> None:
         """

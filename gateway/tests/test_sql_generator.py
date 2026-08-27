@@ -12,6 +12,7 @@ from core.intent_extractor import TimeRange
 from core.sql_generator import (
     _SNAPSHOT_METRICS,
     SQLGenerator,
+    build_dimension_prefix_map,
     correct_dimension_entity,
     default_snapshot_time_range,
     is_deterministic_mf_error,
@@ -1092,6 +1093,90 @@ class TestDimensionEntityCorrection:
         assert "payment" in metric_entities("total_revenue")
         assert "subscriber" in metric_entities("total_revenue")
         assert "session" not in metric_entities("total_revenue")
+
+
+class TestDimensionPrefixMapOnlyOffersReachablePrefixes:
+    """
+    build_dimension_prefix_map() decides which dimension NAME the LLM is shown
+    (intent_extractor.py rewrites the route's bare names through it before they
+    reach the prompt), so a bad entry is not a formatting slip — it becomes the
+    model's vocabulary, and nothing downstream can recover.
+
+    format_mf_query() trusts anything already containing "__", and
+    correct_dimension_entity() looks up its replacement in THIS map, so it finds
+    the same wrong string and passes it through. There is no later checkpoint.
+
+    Two defects were found by audit_dimension_coverage.py, 15 of 242 certified
+    pairs failing to compile:
+
+    1. Dimensions were prefixed with EVERY entity on their owning model, primary
+       and foreign. `subscriber__billing_cycle` was minted because sem_mrr owns
+       billing_cycle and declares subscriber as a foreign key — but the prefix
+       means "read billing_cycle FROM dim_subscribers", which has no such column.
+    2. The per-metric preferences ran against the unfiltered candidate list, so
+       'prefer session__' selected `session__country` for recommendation_ctr,
+       whose semantic model cannot reach the session entity at all.
+
+    These assert against the real semantic manifest, so they fail if the
+    semantic layer changes shape rather than passing on a mock.
+    """
+
+    def test_a_dimension_is_never_prefixed_with_a_foreign_entity(self) -> None:
+        """
+        billing_cycle lives on sem_mrr (primary entity `subscription`). The only
+        valid prefix is subscription__; subscriber__ names a model that does not
+        have the column.
+        """
+        prefixes = {
+            dims.get("billing_cycle")
+            for dims in build_dimension_prefix_map().values()
+            if dims.get("billing_cycle")
+        }
+        assert prefixes, "billing_cycle vanished from the map entirely"
+        assert prefixes == {"subscription__billing_cycle"}
+
+    def test_no_metric_is_offered_an_unreachable_prefix(self) -> None:
+        """
+        The invariant behind both defects: every prefix a metric is given must
+        name an entity that metric can actually reach. metric_time is synthetic
+        and has no entity.
+        """
+        offences: list[str] = []
+        for metric, dims in build_dimension_prefix_map().items():
+            reachable = metric_entities(metric)
+            if not reachable:
+                continue
+            for bare, qualified in dims.items():
+                entity = qualified.split("__", 1)[0]
+                if entity == "metric_time" or entity in reachable:
+                    continue
+                offences.append(f"{metric} x {bare} -> {qualified}")
+        assert not offences, "unreachable prefixes offered: " + "; ".join(offences)
+
+    def test_recommendation_ctr_reaches_subscriber_dims_not_session(self) -> None:
+        """
+        The concrete regression: 8 of recommendation_ctr's 11 certified
+        dimensions were mapped to session__ and could not compile. Its model
+        declares event / subscriber / content.
+        """
+        dims = build_dimension_prefix_map()["recommendation_ctr"]
+        assert dims["country"] == "subscriber__country"
+        assert dims["plan_type"] == "subscriber__plan_type"
+        assert dims["recommendation_type"] == "event__recommendation_type"
+
+    def test_deliberate_tie_breaks_are_preserved(self) -> None:
+        """
+        Not every duplicate is a bug. plan_type is genuinely defined on three
+        models, and these choices are pinned by settings.warmup_matrix — the fix
+        must not move them, because they decide which fact table answers and
+        therefore which number comes back.
+        """
+        prefix_map = build_dimension_prefix_map()
+        assert prefix_map["total_subscribers"]["plan_type"] == "subscriber__plan_type"
+        assert prefix_map["ltv"]["plan_type"] == "subscriber__plan_type"
+        assert prefix_map["mrr"]["plan_type"] == "subscription__plan_type"
+        assert prefix_map["churn_rate"]["plan_type"] == "subscription__plan_type"
+        assert prefix_map["engagement_rate"]["device_type"] == "session__device_type"
 
 
 class TestOffsetWindowNeedsMetricTime:

@@ -94,7 +94,12 @@ _CERTIFIED_METRICS = [
 _CERTIFIED_DIMENSIONS: dict[str, list[str]] = {
     "mrr":                   ["plan_type", "billing_cycle", "mrr_type", "period_month"],
     "expansion_mrr":         ["plan_type", "billing_cycle", "mrr_type"],
-    "ltv":                   ["payment_method", "currency", "acquisition_channel", "payment_date"],
+    # Corrected 2026-08-26: ltv is a ratio spanning sem_payments and sem_mrr, so it
+    # can only be grouped by dimensions reachable from BOTH — the subscriber ones.
+    # payment_method / currency / payment_date were certified and never compiled;
+    # audit_dimension_coverage.py caught it. Time FILTERING by payment_date still
+    # works (see _CERTIFIED_TIME_GRAINS below) — it is grouping that cannot.
+    "ltv":                   ["country", "plan_type", "acquisition_channel", "age_group"],
     "engagement_rate":       ["device_type", "quality_streamed", "referral_source", "session_start"],
     "churn_rate":            ["country", "plan_type", "acquisition_channel", "age_group"],
     "total_subscribers":     ["country", "plan_type", "acquisition_channel", "signup_date"],

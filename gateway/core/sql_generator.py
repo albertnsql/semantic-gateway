@@ -342,7 +342,23 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
             
     global_dims = {}
     for sm in manifest.get('semantic_models', []):
-        entities = [e['name'] for e in sm.get('entities', []) if e.get('type') in ('primary', 'foreign')]
+        # PRIMARY entity only. `<entity>__<dim>` means "join to the semantic model
+        # whose PRIMARY entity is <entity>, then read <dim> from it" — so a
+        # dimension may only be prefixed with the entity of the model that OWNS
+        # it. Including foreign entities here minted names for columns the target
+        # model does not have: sem_mrr owns `billing_cycle` and declares
+        # `subscriber` as a foreign key, which produced `subscriber__billing_cycle`
+        # — dim_subscribers has no billing_cycle, so it can never resolve. It was
+        # then chosen for total_subscribers and failed at query resolution.
+        #
+        # Legitimate duplicates survive: `country` is defined on BOTH
+        # dim_subscribers and fct_stream_sessions, so `subscriber__country` and
+        # `session__country` both remain candidates and the tie-break below picks.
+        entities = [e['name'] for e in sm.get('entities', []) if e.get('type') == 'primary']
+        if not entities:
+            # No primary entity declared — fall back to the old behaviour rather
+            # than silently dropping every dimension on this model.
+            entities = [e['name'] for e in sm.get('entities', []) if e.get('type') == 'foreign']
         for dim in sm.get('dimensions', []):
             dim_name = dim['name']
             is_time = dim.get('type') == 'time'
@@ -386,79 +402,104 @@ def build_dimension_prefix_map() -> dict[str, dict[str, str]]:
                 break
 
         m_dim_map = {}
+        reachable_entities = entity_map[m_name]
         for dim_name, prefixes in global_dims.items():
-            if len(prefixes) == 1:
-                m_dim_map[dim_name] = prefixes[0]
-            else:
-                chosen = None
-                if m_name in ['total_subscribers', 'churned_subscribers']:
-                    for p in prefixes:
+            # ── Reachability BEFORE any preference ────────────────────────────
+            # A prefix is usable only when its entity is primary-or-foreign on one
+            # of this metric's own semantic models, because that is what gives
+            # MetricFlow a join path. Filtering first is the load-bearing part:
+            # the hand-tuned preferences below used to run against the full
+            # candidate list, so a preference could select an unreachable prefix
+            # and nothing downstream could recover. recommendation_ctr lives on
+            # sem_recommendation_events (event / subscriber / content) and the
+            # 'session__ first' rule handed it `session__country` — 8 of its 11
+            # certified dimensions failed at query resolution because of it.
+            #
+            # correct_dimension_entity() cannot clean this up afterwards: it looks
+            # up its replacement in THIS map, finds the same wrong string, and
+            # passes it through with a warning.
+            candidates = [
+                p for p in prefixes if p.split('__', 1)[0] in reachable_entities
+            ]
+
+            if not candidates:
+                # No entry rather than an arbitrary prefixes[0]. Consumers fall
+                # back to the bare name, which at least does not teach the LLM a
+                # prefix that cannot compile.
+                continue
+
+            if len(candidates) == 1:
+                m_dim_map[dim_name] = candidates[0]
+                continue
+
+            # ── Preferences, applied only among REACHABLE candidates ──────────
+            # Every branch here encodes a deliberate choice between two prefixes
+            # that both resolve; they are unchanged, and warmup_matrix pins
+            # several of them (total_subscribers → subscriber__plan_type,
+            # ltv → subscriber__*). Do not "simplify" these into the generic
+            # primary-entity rule below — that would silently move numbers.
+            chosen = None
+            if m_name in ['total_subscribers', 'churned_subscribers']:
+                for p in candidates:
+                    if p.startswith('subscriber__'):
+                        chosen = p
+                        break
+            elif m_name in ['churn_rate', 'retention_rate']:
+                # churn_rate/retention_rate now live on fct_mrr_monthly:
+                # prefer native subscription__ dims, fall back to subscriber__ joins.
+                for p in candidates:
+                    if p.startswith('subscription__'):
+                        chosen = p
+                        break
+                if not chosen:
+                    for p in candidates:
                         if p.startswith('subscriber__'):
                             chosen = p
                             break
-                elif m_name in ['churn_rate', 'retention_rate']:
-                    # churn_rate/retention_rate now live on fct_mrr_monthly:
-                    # prefer native subscription__ dims, fall back to subscriber__ joins.
-                    for p in prefixes:
-                        if p.startswith('subscription__'):
-                            chosen = p
-                            break
-                    if not chosen:
-                        for p in prefixes:
-                            if p.startswith('subscriber__'):
-                                chosen = p
-                                break
-                elif m_name == 'ltv':
-                    # ltv spans fct_payments (payment entity) AND dim_subscribers.
-                    # Prefer payment__ prefix for payment-domain dims, subscriber__ for subscriber dims.
-                    for p in prefixes:
-                        if p.startswith('payment__'):
-                            chosen = p
-                            break
-                    if not chosen:
-                        for p in prefixes:
-                            if p.startswith('subscriber__'):
-                                chosen = p
-                                break
-                elif m_name in ['mrr', 'expansion_mrr']:
-                    for p in prefixes:
-                        if p.startswith('subscription__'):
-                            chosen = p
-                            break
-                elif m_name in ['engagement_rate', 'recommendation_ctr']:
-                    # engagement_rate: session__ dims (device_type) take priority;
-                    # subscriber__ dims (plan_type, country) are also valid via join.
-                    for p in prefixes:
-                        if p.startswith('session__') or p.startswith('event__'):
-                            chosen = p
-                            break
-                    if not chosen:
-                        for p in prefixes:
-                            if p.startswith('subscriber__'):
-                                chosen = p
-                                break
-                            
+            elif m_name == 'ltv':
+                # ltv spans fct_payments (payment entity) AND dim_subscribers.
+                # Prefer payment__ prefix for payment-domain dims, subscriber__ for subscriber dims.
+                for p in candidates:
+                    if p.startswith('payment__'):
+                        chosen = p
+                        break
                 if not chosen:
-                    for p in prefixes:
-                        if any(p.startswith(pe + '__') for pe in primary_entities):
+                    for p in candidates:
+                        if p.startswith('subscriber__'):
+                            chosen = p
+                            break
+            elif m_name in ['mrr', 'expansion_mrr']:
+                for p in candidates:
+                    if p.startswith('subscription__'):
+                        chosen = p
+                        break
+            elif m_name in ['engagement_rate', 'recommendation_ctr']:
+                # engagement_rate: session__ dims (device_type) take priority;
+                # subscriber__ dims (plan_type, country) are also valid via join.
+                # For recommendation_ctr `session__` is now filtered out above as
+                # unreachable, so this correctly falls through to subscriber__.
+                for p in candidates:
+                    if p.startswith('session__') or p.startswith('event__'):
+                        chosen = p
+                        break
+                if not chosen:
+                    for p in candidates:
+                        if p.startswith('subscriber__'):
                             chosen = p
                             break
 
-                if not chosen:
-                    # Foreign entities on the metric's models are valid MetricFlow
-                    # join paths (e.g. total_revenue on sem_payments → subscriber__country
-                    # via the foreign 'subscriber' entity). Prefer these over an
-                    # arbitrary prefixes[0], which picks unreachable dims like
-                    # session__country and fails query resolution.
-                    for p in prefixes:
-                        if any(p.startswith(me + '__') for me in model_entities):
-                            chosen = p
-                            break
+            if not chosen:
+                for p in candidates:
+                    if any(p.startswith(pe + '__') for pe in primary_entities):
+                        chosen = p
+                        break
 
-                if not chosen:
-                    chosen = prefixes[0]
-                    
-                m_dim_map[dim_name] = chosen
+            if not chosen:
+                # Every remaining candidate is reachable by construction, so this
+                # is a real choice between join paths rather than a shot in the dark.
+                chosen = candidates[0]
+
+            m_dim_map[dim_name] = chosen
                 
         # Add common LLM abbreviation aliases
         if 'content_primary_genre' in m_dim_map:

@@ -62,6 +62,33 @@ _ALLOWED_JOINS: dict[str, list[str]] = {
 }
 
 
+# Ratio metrics whose numerator and denominator live on DIFFERENT semantic models,
+# mapped to the semantic model both inputs can reach.
+#
+# MetricFlow can only group a ratio by a dimension reachable from EVERY input, so
+# such a metric's certified_dimensions must be the INTERSECTION of what its inputs
+# can serve. The owning-model lookup in _find_semantic_for_metric() returns ONE
+# model, which yields a union instead — and the route then accepts a query that
+# MetricFlow rejects at compile time, after the user has been told it was valid.
+#
+# Verified by gateway/audit_dimension_coverage.py: ltv claimed 13 dimensions and
+# compiled 9. The 4 failures were exactly sem_payments' own dimensions
+# (payment_method, currency, is_renewal, payment_date), reachable from the
+# numerator only.
+#
+# Time FILTERING is unaffected and deliberately left alone: both inputs have an
+# agg_time_dimension, so MetricFlow maps them onto metric_time and a time range
+# still applies. It is grouping by the physical time column that cannot work.
+# valid_time_grains therefore stays as the owning model reported it.
+_CROSS_MODEL_RATIOS: dict[str, str] = {
+    # ltv = total_revenue (sem_payments) / total_subscribers (sem_mrr).
+    # sem_payments reaches {payment, subscriber}; sem_mrr reaches
+    # {subscription, subscriber}. `subscriber` is the only shared entity, so only
+    # dim_subscribers dimensions are groupable.
+    "ltv": "sem_subscribers",
+}
+
+
 def _extract_model_name_from_ref(ref_str: str) -> str:
     """Parse ``ref('fct_mrr_monthly')`` → ``fct_mrr_monthly``."""
     ref_str = ref_str.strip()
@@ -183,7 +210,26 @@ class MetricRegistry:
             # query.py's dimension check as uncertified even though every layer
             # below it could serve the query. settings.warmup_matrix has always
             # listed total_revenue x subscriber__country, which is the giveaway.
-            if m_name in ("ltv", "total_revenue"):
+            if m_name in _CROSS_MODEL_RATIOS:
+                # REPLACE rather than extend. See _CROSS_MODEL_RATIOS: the owning
+                # model's own dimensions are reachable from a single input, so
+                # MetricFlow cannot group the ratio by them at all. Keeping them
+                # is what made the route certify `ltv by payment_method` and then
+                # fail at compile time.
+                shared_name = _CROSS_MODEL_RATIOS[m_name]
+                shared_sem = sem_models.get(shared_name)
+                if shared_sem:
+                    m_def.certified_dimensions = list(
+                        shared_sem.dimensions + shared_sem.time_dimensions
+                    )
+                else:
+                    logger.warning(
+                        "Metric '%s' is declared a cross-model ratio sharing '%s', but "
+                        "that semantic model was not loaded — leaving its %d claimed "
+                        "dimension(s) untouched.",
+                        m_name, shared_name, native_count,
+                    )
+            elif m_name == "total_revenue":
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:
                     m_def.certified_dimensions.extend(sub_sem.dimensions + sub_sem.time_dimensions)
