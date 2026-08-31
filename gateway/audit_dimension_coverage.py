@@ -27,9 +27,23 @@ So: push all of them through the real compiler and write down which ones work.
 
 What it tests
 -------------
-Reachability only — "can this metric be grouped by this dimension at all". The
-probe argv carries no time constraint, no ``--where`` and no ``--limit``, so a
-pair that passes here is not thereby proven correct for any *particular* query
+Two axes, because there are three ways a pair can be unusable and the registry
+only ever claimed the first:
+
+1. **Compiles** — can MetricFlow resolve this metric grouped by this dimension.
+2. **Populated** — does the dimension actually carry data. On by default; pass
+   ``--no-execute`` to skip.
+
+The second exists because the first is not enough, and a live query proved it:
+"average engagement by content type over the last 3 months" compiled, executed,
+and returned a single row with genre = ``null`` and engagement 63.563, which the
+narrative then described as "a uniform engagement level across the platform's
+content library". ``fct_stream_sessions.content_primary_genre`` is 100% null —
+``dim_content`` sources it from a bridge table sharing zero content_ids with its
+own spine. Compiling forever, useless forever.
+
+Reachability is probed with no time constraint, no ``--where`` and no ``--limit``,
+so a pair that passes is not thereby proven correct for any *particular* query
 (time-grain validity is a separate axis, already covered by
 ``get_valid_time_grains_for_metric``).
 
@@ -52,10 +66,16 @@ Stop the gateway first — DuckDB's writer lock is process-exclusive.
 Usage
 -----
     cd gateway
-    python audit_dimension_coverage.py                     # full matrix -> csv + summary
+    python audit_dimension_coverage.py                     # compile + population
     python audit_dimension_coverage.py --metric total_revenue --metric mrr
+    python audit_dimension_coverage.py --no-execute        # compile only, no warehouse
+    python audit_dimension_coverage.py --fail-on-new       # CI gate; see below
     python audit_dimension_coverage.py --out coverage.csv
-    python audit_dimension_coverage.py --fail-on-new       # nonzero exit if a pair regressed
+
+``--fail-on-new`` exits 1 when a pair that used to compile no longer does, OR when
+one that used to carry data now returns an empty dimension. The second half is the
+quieter failure: it still compiles, still returns a row, and only the answer is
+empty.
 """
 
 from __future__ import annotations
@@ -107,6 +127,23 @@ class PairResult:
     # had to be rewritten, and a metric that cannot resolve without a time grain.
     entity_corrected: bool = False
     time_injected: bool = False
+    # ── Population: does the pair actually return DATA, not just compile ──────
+    # "" when execution was skipped; otherwise one of _POP_*.
+    population: str = ""
+    rows: int | None = None
+    dim_distinct: int | None = None
+
+
+# A compiling pair can still be useless. Verdicts, in order of severity.
+_POP_OK = "ok"              # >= 2 distinct non-null dimension values
+_POP_SINGLE = "single_value"  # exactly 1 — suspicious, sometimes legitimate
+_POP_ALL_NULL = "all_null"   # 0 — the dimension is empty; a breakdown is impossible
+_POP_ZERO_ROWS = "zero_rows"  # the query returned nothing at all
+_POP_ERROR = "exec_error"    # compiled but would not run
+
+# all_null is the one that silently produces a confident wrong answer, so it is
+# the only verdict treated as a hard failure by --fail-on-new.
+_POP_FAILURES = frozenset({_POP_ALL_NULL, _POP_ERROR})
 
 
 @dataclass
@@ -120,6 +157,10 @@ class Summary:
     @property
     def failed(self) -> list[PairResult]:
         return [r for r in self.results if not r.ok]
+
+    @property
+    def unpopulated(self) -> list[PairResult]:
+        return [r for r in self.results if r.population in _POP_FAILURES]
 
 
 def _classify(message: str, metric: str, probed: str, metric_type: str) -> str:
@@ -192,7 +233,7 @@ def _build_engine(settings):
 
     project_dir = getattr(settings, "dbt_project_dir", "")
     if not project_dir:
-        sys.exit("dbt_project_dir is unset in config — cannot build the engine.")
+        sys.exit("dbt_project_dir is unset in config - cannot build the engine.")
 
     started = time.perf_counter()
     engine = WarmMetricFlowEngine.try_build(
@@ -210,8 +251,79 @@ def _build_engine(settings):
     return engine
 
 
+def _open_warehouse(settings):
+    """
+    Open a connection for the population check, or return None with a reason.
+
+    It has to be READ-WRITE, which looks wrong and is not. DuckDB refuses a second
+    connection to the same file with a different configuration, dbt-duckdb hardcodes
+    `read_only=False`, and this process hosts the warm MetricFlow engine — which
+    goes through dbt-duckdb. Verified: `duckdb.connect(path, read_only=True)` after
+    the engine is built raises "Can't open a connection to same database file with a
+    different configuration". This is the same corner `DuckDBPool` is in, and the
+    same answer: connect read-write and enforce read-only in SQL via
+    assert_read_only(). See CLAUDE.md, DuckDB section, point 3.
+    """
+    path = os.environ.get("DUCKDB_PATH", "")
+    if not path or not os.path.exists(path):
+        return None, f"warehouse file not found at {path or '(DUCKDB_PATH unset)'}"
+    try:
+        import duckdb
+
+        return duckdb.connect(path), ""
+    except Exception as exc:  # a locked file, a bad build, anything
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _check_population(con, sql: str, probed: str) -> tuple[str, int | None, int | None]:
+    """
+    Execute *sql* and judge whether the dimension actually carries data.
+
+    Returns (verdict, row_count, distinct_non_null_dimension_values).
+
+    The signal is the number of distinct non-null dimension values, NOT a row-level
+    null percentage — the compiled query is already aggregated, so it returns one
+    row per dimension value and a row-level rate would be meaningless. Observed:
+    `churned_subscribers x subscriber__churn_reason` returns 7 rows of which one is
+    a `(None, 0)` bucket. That is healthy, and a naive null rate would score it 14%
+    broken. `engagement_rate x session__content_primary_genre` returns exactly one
+    row, `(None, 58.29)` — zero real buckets, which is the shape worth failing on.
+
+    The dimension column is located BY NAME. MetricFlow names result columns after
+    the qualified dimension, and it cannot be assumed to be first: an offset metric
+    gets `metric_time__month` prepended, so `net_mrr_growth x subscription__plan_type`
+    returns three columns with the dimension in the middle.
+    """
+    from core.duckdb_pool import assert_read_only
+
+    # MetricFlow only emits SELECT/WITH, but the connection is read-write, so this
+    # is the same backstop the serving path uses rather than a trust exercise.
+    assert_read_only(sql)
+
+    cursor = con.execute(sql)
+    columns = [d[0] for d in cursor.description]
+    rows = cursor.fetchall()
+
+    if not rows:
+        return _POP_ZERO_ROWS, 0, 0
+
+    try:
+        idx = columns.index(probed)
+    except ValueError:
+        # Should not happen — but guessing a column would silently judge the wrong
+        # one, so say so instead.
+        return _POP_ERROR, len(rows), None
+
+    distinct_non_null = len({r[idx] for r in rows if r[idx] is not None})
+    if distinct_non_null == 0:
+        return _POP_ALL_NULL, len(rows), 0
+    if distinct_non_null == 1:
+        return _POP_SINGLE, len(rows), 1
+    return _POP_OK, len(rows), distinct_non_null
+
+
 def _probe(engine, metric: str, bare: str, prefix_map: dict,
-           metric_type: str = "") -> PairResult:
+           metric_type: str = "", con=None) -> PairResult:
     """Normalise one pair the way the route would, then compile it."""
     from core.sql_generator import correct_dimension_entity, require_metric_time
 
@@ -239,20 +351,43 @@ def _probe(engine, metric: str, bare: str, prefix_map: dict,
             ms=(time.perf_counter() - started) * 1000, **flags,
         )
 
-    return PairResult(
+    result = PairResult(
         metric=metric, bare=bare, probed=probed, group_by=group_by, ok=True,
         ms=(time.perf_counter() - started) * 1000, sql_chars=len(sql or ""), **flags,
     )
 
+    # Compiling is not the same as being populated. Only run for pairs that
+    # compiled — there is nothing to execute otherwise.
+    if con is not None:
+        try:
+            result.population, result.rows, result.dim_distinct = _check_population(
+                con, sql, probed
+            )
+        except Exception as exc:
+            result.population = _POP_ERROR
+            result.detail = f"{type(exc).__name__}: {exc}"[:400].replace("\n", " ")
 
-def _read_previous(path: str) -> dict[tuple[str, str], bool]:
-    """Load a prior run's verdicts, keyed (metric, bare). Missing file -> empty."""
+    return result
+
+
+def _read_previous(path: str) -> dict[tuple[str, str], tuple[bool, str]]:
+    """
+    Load a prior run's verdicts, keyed (metric, bare) -> (compiled, population).
+
+    `population` is "" for a baseline written before the column existed, or by a
+    --no-execute run. The diff treats that as "unknown" rather than as a change,
+    so an older baseline degrades to compile-only comparison instead of reporting
+    238 phantom regressions.
+    """
     if not os.path.exists(path):
         return {}
-    previous: dict[tuple[str, str], bool] = {}
+    previous: dict[tuple[str, str], tuple[bool, str]] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
-            previous[(row["metric"], row["bare_dimension"])] = row["ok"] == "true"
+            previous[(row["metric"], row["bare_dimension"])] = (
+                row["ok"] == "true",
+                row.get("population", "") or "",
+            )
     return previous
 
 
@@ -261,41 +396,67 @@ def _write_csv(path: str, results: list[PairResult]) -> None:
         writer = csv.writer(fh)
         writer.writerow([
             "metric", "bare_dimension", "probed_dimension", "group_by",
-            "ok", "reason", "entity_corrected", "time_injected",
+            "ok", "reason", "population", "rows", "dim_distinct",
+            "entity_corrected", "time_injected",
             "ms", "sql_chars", "detail",
         ])
         for r in sorted(results, key=lambda x: (x.metric, x.bare)):
             writer.writerow([
                 r.metric, r.bare, r.probed, ",".join(r.group_by),
                 "true" if r.ok else "false", r.reason,
+                r.population,
+                "" if r.rows is None else r.rows,
+                "" if r.dim_distinct is None else r.dim_distinct,
                 "true" if r.entity_corrected else "false",
                 "true" if r.time_injected else "false",
                 f"{r.ms:.1f}", r.sql_chars, r.detail,
             ])
 
 
-def _report(summary: Summary, previous: dict[tuple[str, str], bool]) -> int:
+def _report(summary: Summary, previous: dict[tuple[str, str], tuple[bool, str]]) -> int:
     """Print the human-readable summary. Returns the count of regressions."""
     results = summary.results
+    executed = any(r.population for r in results)
     by_metric: dict[str, list[PairResult]] = defaultdict(list)
     for r in results:
         by_metric[r.metric].append(r)
 
-    print(f"\n{'metric':26s} {'pass':>6s} {'fail':>6s}  failing dimensions")
+    print(f"\n{'metric':26s} {'pass':>6s} {'fail':>6s} {'empty':>6s}  problem dimensions")
     print("-" * 100)
     for metric in sorted(by_metric):
         rows = by_metric[metric]
         bad = [r for r in rows if not r.ok]
-        names = ", ".join(sorted(r.bare for r in bad))
-        if len(names) > 52:
-            names = names[:49] + "..."
-        print(f"{metric:26s} {len(rows) - len(bad):6d} {len(bad):6d}  {names}")
+        empty = [r for r in rows if r.population in _POP_FAILURES]
+        names = ", ".join(sorted(r.bare for r in bad + empty))
+        if len(names) > 44:
+            names = names[:41] + "..."
+        print(f"{metric:26s} {len(rows) - len(bad):6d} {len(bad):6d} "
+              f"{len(empty):6d}  {names}")
 
     print("-" * 100)
     total = len(results)
     ok = len(summary.passed)
     pct = (ok / total * 100) if total else 0.0
-    print(f"{'TOTAL':26s} {ok:6d} {total - ok:6d}  {pct:.1f}% of {total} pairs compile")
+    print(f"{'TOTAL':26s} {ok:6d} {total - ok:6d} "
+          f"{len(summary.unpopulated):6d}  {pct:.1f}% of {total} pairs compile")
+
+    if executed:
+        counts = Counter(r.population for r in results if r.population)
+        print("\nPopulation (does the dimension actually carry data)")
+        for verdict in (_POP_OK, _POP_SINGLE, _POP_ZERO_ROWS, _POP_ALL_NULL, _POP_ERROR):
+            if counts.get(verdict):
+                print(f"  {counts[verdict]:4d}  {verdict}")
+        for r in summary.unpopulated:
+            print(f"  [EMPTY] {r.metric} x {r.bare} -> {r.population} "
+                  f"(rows={r.rows}, distinct={r.dim_distinct})")
+        singles = [r for r in results if r.population == _POP_SINGLE]
+        if singles:
+            print("  single-value dimensions (may be legitimate, worth a look):")
+            for r in singles:
+                print(f"      {r.metric} x {r.bare}")
+    else:
+        print("\nPopulation not checked - compile-only run. A pair can compile and "
+              "still return an empty dimension.")
 
     if summary.failed:
         print("\nFailures by cause")
@@ -318,19 +479,32 @@ def _report(summary: Summary, previous: dict[tuple[str, str], bool]) -> int:
 
     regressions: list[PairResult] = []
     if previous:
-        gained, regressions = [], []
+        gained: list[PairResult] = []
         for r in results:
             was = previous.get((r.metric, r.bare))
             if was is None:
                 continue
-            if r.ok and not was:
+            was_ok, was_population = was
+            if r.ok and not was_ok:
                 gained.append(r)
-            elif was and not r.ok:
+            elif was_ok and not r.ok:
+                regressions.append(r)
+            # A pair that stops carrying DATA is a regression too, and a quieter
+            # one: it still compiles, still returns a row, and the answer is just
+            # empty. That is how the content_primary_genre problem reached a user.
+            # Skipped when the baseline predates the column ("") — unknown is not
+            # a change.
+            elif (
+                was_population
+                and was_population not in _POP_FAILURES
+                and r.population in _POP_FAILURES
+            ):
                 regressions.append(r)
         print(f"\nAgainst the previous run: {len(gained)} newly passing, "
               f"{len(regressions)} regressed")
         for r in regressions:
-            print(f"  [REGRESSED] {r.metric} x {r.bare} -> {r.reason}")
+            detail = r.reason or r.population
+            print(f"  [REGRESSED] {r.metric} x {r.bare} -> {detail}")
 
     return len(regressions)
 
@@ -345,7 +519,12 @@ def main() -> int:
     ap.add_argument("--include-internal", action="store_true",
                     help="Also probe ratio building blocks hidden from users.")
     ap.add_argument("--fail-on-new", action="store_true",
-                    help="Exit 1 if any pair that used to compile no longer does.")
+                    help="Exit 1 if a pair that used to compile, or used to carry "
+                         "data, no longer does.")
+    ap.add_argument("--no-execute", action="store_true",
+                    help="Compile only; skip the population check. Use when the "
+                         "warehouse file is unavailable (e.g. CI without the "
+                         "release asset).")
     ap.add_argument("--verbose", action="store_true", help="Log every probe.")
     args = ap.parse_args()
 
@@ -377,15 +556,34 @@ def main() -> int:
     engine = _build_engine(settings)
     previous = _read_previous(args.out)
 
+    # Population check is on by default: a pair that compiles but returns an empty
+    # dimension is indistinguishable from a working one in the compile matrix, and
+    # that gap is what put a null genre breakdown in front of a user. It degrades to
+    # compile-only rather than failing, because the compile pass needs only
+    # semantic_manifest.json while this needs the (gitignored) warehouse file.
+    con = None
+    if args.no_execute:
+        print("  population check SKIPPED (--no-execute)")
+    else:
+        con, why = _open_warehouse(settings)
+        if con is None:
+            print(f"  population check unavailable - {why}")
+            print("  continuing with compile-only results")
+        else:
+            print("  population check enabled")
+
     summary = Summary()
     started = time.perf_counter()
     for i, (metric, bare, metric_type) in enumerate(pairs, 1):
-        result = _probe(engine, metric, bare, prefix_map, metric_type)
+        result = _probe(engine, metric, bare, prefix_map, metric_type, con=con)
         summary.results.append(result)
-        if args.verbose or not result.ok:
-            mark = "ok  " if result.ok else "FAIL"
+        flagged = (not result.ok) or result.population in _POP_FAILURES
+        if args.verbose or flagged:
+            mark = "FAIL" if not result.ok else (
+                "EMPTY" if result.population in _POP_FAILURES else "ok  ")
+            note = result.reason or result.population
             print(f"  [{i:3d}/{len(pairs)}] {mark} {metric} x {bare}"
-                  + ("" if result.ok else f"  ({result.reason})"))
+                  + (f"  ({note})" if note and note != _POP_OK else ""))
         elif i % 25 == 0:
             print(f"  [{i:3d}/{len(pairs)}] ...")
 
@@ -396,9 +594,11 @@ def main() -> int:
 
     regressions = _report(summary, previous)
     _write_csv(args.out, summary.results)
+    if con is not None:
+        con.close()
     print(f"\nWrote {args.out}")
-    print("Feed the PASSING pairs into diagnostics/driver_graph.yml, not the "
-          "claimed list.")
+    print("Feed pairs that BOTH compile and are populated into "
+          "diagnostics/driver_graph.yml, not the claimed list.")
 
     if args.fail_on_new and regressions:
         return 1

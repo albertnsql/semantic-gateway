@@ -19,6 +19,7 @@ import hashlib
 import logging
 import time
 import uuid
+from datetime import date
 from functools import partial
 
 import anyio
@@ -51,6 +52,8 @@ from models.requests import QueryRequest
 from models.responses import GatewayResponse
 
 logger = logging.getLogger(__name__)
+
+_ARTIFACTS = None
 
 router = APIRouter(tags=["Query"])
 
@@ -319,6 +322,136 @@ def _generate_schema_response(query: str, registry, settings) -> str:
 
 # ─────────────────────────────────────────── POST /query
 
+def _artifact_registry():
+    """Memoised known-artifact registry. Parsing a small YAML per request is waste."""
+    global _ARTIFACTS
+    if _ARTIFACTS is None:
+        from core.diagnostics.artifacts import ArtifactRegistry
+        _ARTIFACTS = ArtifactRegistry.load()
+    return _ARTIFACTS
+
+
+def _run_diagnosis(body, intent, request: Request, request_id: str) -> dict | None:
+    """
+    Run the diagnostic graph for one "why" question.
+
+    Returns None on ANY problem — langgraph unavailable, no playbook for the metric,
+    an exception mid-run — so the caller falls through to the out-of-scope reply,
+    which is where these questions went before this path existed. A diagnosis is an
+    upgrade over that answer, never a way to fail a request that used to succeed.
+
+    Runs in a worker thread (the graph and every service under it are sync), so this
+    must not touch the event loop.
+    """
+    try:
+        from core.diagnostics.graph import (
+            get_diagnostic_agent,
+            initial_state,
+            service_config,
+        )
+        from core.diagnostics.state import Budget
+        from core.diagnostics.windows import Window, trailing_months
+    except Exception as exc:  # langgraph absent, or a broken install
+        logger.warning("[%s] diagnostics import failed: %s", request_id, exc)
+        return None
+
+    agent = get_diagnostic_agent()
+    if agent is None:
+        return None
+
+    metric = intent.metrics[0]
+
+    # The question's own period is the target when it gave one. Otherwise the last N
+    # WHOLE months: `inclusive=False` drops the current month because
+    # fct_mrr_monthly's spine runs to current_date() while cancellations carry a
+    # +1 month offset, so the newest month is structurally churn-only and reads as a
+    # collapse. See core/diagnostics/windows.py.
+    if intent.time_range:
+        target = Window.of(intent.time_range.start_date, intent.time_range.end_date)
+    else:
+        target = trailing_months(
+            date.today(), _settings.diagnostics_default_months, inclusive=False
+        )
+
+    budget = Budget(
+        max_probes=_settings.diagnostics_max_probes,
+        deadline_seconds=_settings.diagnostics_deadline_seconds,
+    )
+    state = initial_state(
+        body.query, metric, target,
+        request_id=request_id,
+        filters=list(intent.filters or []),
+        max_dimensions=_settings.diagnostics_max_dimensions,
+        budget=budget,
+    )
+    config = service_config(
+        request.app.state.semantic_validator,
+        request.app.state.sql_generator,
+        query_cache=getattr(request.app.state, "query_cache", None),
+        registry=getattr(request.app.state, "metric_registry", None),
+        thread_id=request_id,
+    )
+
+    try:
+        final = agent.invoke(state, config)
+    except Exception as exc:
+        logger.warning("[%s] diagnosis failed: %s", request_id, exc, exc_info=True)
+        return None
+
+    answer = (final.get("answer") or "").strip()
+    if not answer:
+        return None
+
+    plan = final.get("plan")
+    return {
+        "answer": answer,
+        "metric": metric,
+        "target_window": str(target),
+        "comparison_window": str(plan.comparison) if plan else None,
+        "dimensions_examined": list(plan.dimensions) if plan else [],
+        "hypotheses": [
+            {
+                "dimension": h.dimension,
+                "statement": h.statement,
+                "verdict": h.verdict,
+                "confidence": h.confidence,
+                "explained_share": round(h.explained_share, 4),
+                "evidence": list(h.evidence),
+            }
+            for h in (final.get("hypotheses") or [])
+        ],
+        # The evidence table is what makes a causal claim checkable rather than
+        # plausible, so it ships with the answer rather than staying in the logs.
+        "evidence": [
+            {
+                "id": f.id,
+                "label": f.label,
+                "metric": f.metric,
+                "dimensions": list(f.dimensions),
+                "row_count": f.row_count,
+                "from_cache": f.from_cache,
+                "error": f.error or None,
+                "sql": f.sql if body.options.include_sql else "",
+            }
+            for f in (final.get("findings") or [])
+        ],
+        # Surfaced separately from the prose so the UI can lead with them: a
+        # warning that the finding may be a data artefact has to be read BEFORE the
+        # finding, not after it.
+        "data_warnings": [
+            {"id": a.id, "severity": a.severity, "summary": a.summary,
+             "guidance": a.guidance}
+            for a in (
+                _artifact_registry().applicable(metric, target, plan.comparison)
+                if plan else []
+            )
+        ],
+        "cautions": list(plan.cautions) if plan else [],
+        "notes": list(plan.notes) if plan else [],
+        "stopped_because": final.get("stopped_because") or "",
+    }
+
+
 def _raw_query_cache_key(body) -> dict:
     """
     Cache key for the RAW question, used before intent extraction runs.
@@ -484,7 +617,44 @@ async def submit_query(
             },
         )
 
-    if intent.query_type == "out_of_scope":
+    # ── Stage 1.3: Diagnostic ("why") path ────────────────────────────────────
+    # Everything below is a fall-through: an unavailable graph, an unknown metric or
+    # a failed run all end up in the out_of_scope branch, which is exactly where
+    # these questions went before this path existed. So the worst case is the old
+    # behaviour, never a 500.
+    if intent.query_type == "diagnostic_query":
+        diagnosis = None
+        if not _settings.diagnostics_enabled:
+            logger.info("[%s] diagnostics disabled - treating as out of scope", request_id)
+        elif not intent.metrics:
+            logger.info("[%s] diagnostic query named no metric", request_id)
+        else:
+            diagnosis = await anyio.to_thread.run_sync(
+                partial(_run_diagnosis, body, intent, request, request_id)
+            )
+
+        if diagnosis is not None:
+            elapsed = (time.perf_counter() - start_time) * 1000
+            logger.info(
+                "[%s] Diagnosis returned in %.1f ms (%d probe(s)).",
+                request_id, elapsed, len(diagnosis.get("evidence") or []),
+            )
+            return JSONResponse(
+                status_code=200,
+                content=make_json_safe({
+                    "status": "diagnosis",
+                    "message": diagnosis["answer"],
+                    "narrative_summary": diagnosis["answer"],
+                    "diagnosis": diagnosis,
+                    "sql": None,
+                    "results": None,
+                    "cache_hit": False,
+                    "request_id": request_id,
+                }),
+            )
+        # fall through to out_of_scope
+
+    if intent.query_type in ("out_of_scope", "diagnostic_query"):
         all_metric_names = [m.name for m in registry.list_user_facing_metrics()]
         suggested_query = build_out_of_scope_suggestion(body.query, all_metric_names)
         message = (

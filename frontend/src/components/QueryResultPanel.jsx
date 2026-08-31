@@ -8,6 +8,7 @@ import KpiCard from './KpiCard';
 import StatusBadge from './StatusBadge';
 import SqlViewer from './SqlViewer';
 import LineageGraph from './LineageGraph';
+import DiagnosisPanel from './DiagnosisPanel';
 
 const CLAY_SHADOW = `16px 16px 32px rgba(13,148,136,0.12), -10px -10px 24px rgba(255,255,255,0.9), inset 6px 6px 12px rgba(13,148,136,0.04), inset -6px -6px 12px rgba(255,255,255,1)`;
 const CLAY_INSET  = `inset 8px 8px 16px rgba(13,148,136,0.08), inset -8px -8px 16px rgba(255,255,255,0.9)`;
@@ -421,11 +422,22 @@ export default function QueryResultPanel({ response, error, defaultTab = 'Tabula
   const isSuccess       = status === 'success' || status === 'dry_run';
   const isSchema        = status === 'schema_response';
   const isOutOfScope    = status === 'out_of_scope';
+  const isDiagnosis     = status === 'diagnosis';
 
   const isExpanded = isMostRecent || userExpanded;
 
   if (isClarification) return <ClarificationPanel response={response} />;
   if (isSchema) return <SchemaResponsePanel message={response.message} />;
+  if (isDiagnosis) {
+    return (
+      <div
+        className="flex flex-col backdrop-blur-xl rounded-[32px] w-full animate-slide-in px-8 py-6"
+        style={{ background: 'rgba(255,255,255,0.7)', boxShadow: CLAY_SHADOW }}
+      >
+        <DiagnosisPanel diagnosis={response.diagnosis} message={narrativeSummary || response.message} />
+      </div>
+    );
+  }
   if (isOutOfScope) {
     return <OutOfScopePanel message={response.message} suggestedQuery={response.suggested_query} onSuggestionClick={onSuggestionClick} />;
   }

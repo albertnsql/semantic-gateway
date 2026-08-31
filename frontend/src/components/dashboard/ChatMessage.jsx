@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Database, AlertTriangle, Info, Lightbulb, ChevronRight } from 'lucide-react';
 import SqlViewer from '../SqlViewer';
+import DiagnosisPanel from '../DiagnosisPanel';
 
 export default function ChatMessage({ message, onSuggest, onSuggestPopulate }) {
   const [showAllRows, setShowAllRows] = useState(false);
@@ -151,6 +152,29 @@ export default function ChatMessage({ message, onSuggest, onSuggestPopulate }) {
         <p className="text-sm text-[#1A3A38] leading-relaxed whitespace-pre-line" style={{ fontFamily: 'DM Sans, sans-serif' }}>
           {raw?.message || message.content}
         </p>
+        {message.date && (
+          <p className="text-[9px] text-[#4A7B76] mt-2">
+            {message.date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  // Diagnosis — the "why" path. Rendered before out_of_scope because a failed
+  // diagnosis deliberately falls through to that reply, so both statuses reach here.
+  if (message.status === 'diagnosis') {
+    const raw = message.raw;
+    return (
+      <div
+        className="self-start max-w-[95%] w-full px-4 py-3 rounded-[20px] rounded-tl-[6px] backdrop-blur-xl border-l-4 border-[#7C3AED]"
+        style={{ background: 'rgba(255,255,255,0.80)', boxShadow: '8px 8px 20px rgba(124,58,237,0.08), -6px -6px 16px rgba(255,255,255,0.9)' }}
+      >
+        <DiagnosisPanel
+          diagnosis={raw?.diagnosis}
+          message={raw?.narrative_summary || raw?.message || message.content}
+          compact
+        />
         {message.date && (
           <p className="text-[9px] text-[#4A7B76] mt-2">
             {message.date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}

@@ -23,3 +23,14 @@ urllib3>=1.21.1,<2.0.0
 # module falls back to /proc/self/statm on Linux and GetProcessMemoryInfo on
 # Windows, so a failed wheel build degrades the log line, not the gateway.
 psutil>=5.9.0
+# Orchestrates the diagnostic ("why") path — gateway/core/diagnostics/graph.py is the
+# only module that imports it, so the rest of that package stays testable without it.
+# Pinned to a minor range: node config injection is matched on the RAW annotation
+# string, which is undocumented behaviour that could move (see graph.py's note).
+# Costs 10.7s of import and +68.6MB RSS on first build, so the graph is built lazily
+# behind `diagnostics_enabled` rather than in lifespan() — the instance already sits
+# near 251MB of 512MB with the warm MetricFlow engine loaded.
+# Deliberately NOT installing langchain-openai: the Google -> Groq -> OpenRouter
+# fallback chain already exists in core/llm-adjacent code, and a second provider
+# policy is how those drift apart.
+langgraph>=1.2,<2.0

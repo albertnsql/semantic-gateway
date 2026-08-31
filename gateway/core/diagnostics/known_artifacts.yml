@@ -1,0 +1,123 @@
+# known_artifacts.yml — data problems a diagnosis must not report as business events.
+#
+# WHY THIS EXISTS
+# A diagnostic agent finds whatever moved. It cannot tell a churn spike caused by
+# subscribers leaving from one caused by a bad data append, because both look
+# identical in the numbers. Left alone it will narrate the second as the first, with
+# citations, which is more dangerous than saying nothing.
+#
+# This was not hypothetical. On 2026-08-28 a user asked why churn was high in June
+# 2026 and got a confident 163.7% attribution — for the exact month whose monthly
+# append is documented as having written orphan rows across seven tables. Nothing in
+# the answer mentioned it.
+#
+# WHY IT IS SEPARATE FROM driver_graph.yml's `cautions`
+# Cautions are per-metric and unconditional, so every diagnosis of churn_rate emits
+# all of them. That produced the second half of the same incident: the answer carried
+# "the newest period is churn-only ... reads as a catastrophic churn spike" while the
+# target window was JUNE and the newest period was AUGUST. The most alarming line in
+# the answer did not apply to it.
+#
+# Everything here is WINDOW-SCOPED and only surfaces when the window a diagnosis
+# actually used intersects it. A warning that fires when it does not apply teaches
+# readers to ignore warnings.
+#
+# FIELDS
+#   id        stable slug, so an artifact can be referenced in a bug report
+#   window    fixed {start, end}, OR `relative: current_month_onward` at runtime
+#   metrics   metric names, or `all`
+#   severity  high = the finding is probably an artifact; medium = read with care
+#   summary   what happened, in the reader's terms
+#   guidance  what to do about it
+#   verified_clean  ISO date the warehouse was checked and found repaired. The entry
+#                   STAYS as institutional memory but stops firing — a rebuild from
+#                   unrepaired CSVs brings the problem back, and deleting the entry
+#                   would leave nothing to describe it. Warning about a fixed problem
+#                   tells a reader a real finding might be fake.
+
+version: 1
+
+artifacts:
+
+  - id: mrr-spine-trailing-month
+    # fct_mrr_monthly's date spine is driven by current_date() while cancellations
+    # carry a +1 month offset, so the newest period holds churn rows against almost
+    # no active subscribers. Previously a per-metric caution, which meant it fired on
+    # every churn diagnosis regardless of window.
+    relative: current_month_onward
+    metrics: [churn_rate, retention_rate, mrr, total_subscribers, expansion_mrr, net_mrr_growth]
+    severity: high
+    summary: >
+      This window reaches the end of fct_mrr_monthly, where the date spine runs
+      AHEAD of the calendar: on 2026-08-28 the newest period was 2026-09, holding 531
+      rows of which all 531 were churned - a 100% churn rate against no active
+      subscribers at all.
+    guidance: >
+      A churn spike or subscriber collapse in the newest period is an artefact of the
+      date spine, not behaviour. Re-run ending at the last complete month.
+
+  - id: june-2026-orphan-append
+    # CLAUDE.md, "The monthly append read Snowflake and wrote CSVs (fixed
+    # 2026-08-18)". The generator read its subscriber universe from Snowflake
+    # (~37.8k) while appending to output/subscribers.csv (15,960), so it produced
+    # events for ~22k subscribers that do not exist. Every orphan in every table was
+    # dated inside June 2026 — which is what identified it as one bad append rather
+    # than drift.
+    window:
+      start: 2026-06-01
+      end: 2026-06-30
+    metrics: all
+    severity: high
+    # Verified against the warehouse on 2026-08-28, prompted by a live churn question
+    # about this month. Zero orphan subscribers remain in fct_mrr_monthly (12,532
+    # rows), fct_payments (8,983) or fct_stream_sessions (116,493) -- and that session
+    # count matches the documented TRUE height, so the 4x inflation is gone. June
+    # churn is 502 rows across 502 distinct subscriptions, no duplicates. The repairs
+    # in this build are complete, so this no longer fires.
+    verified_clean: "2026-08-28"
+    summary: >
+      June 2026 contains a known bad monthly append. It generated events for roughly
+      22,000 subscribers absent from the subscriber table, leaving orphan rows in
+      seven tables — 354,566 in stream_sessions, 16,602 in payments, 394 in the churn
+      updates and 496 in the plan history. Every orphan was dated inside this month.
+    guidance: >
+      Treat a movement isolated to June 2026 as suspect until confirmed against a
+      neighbouring month. Repair scripts exist (repair_orphan_event_rows.py); whether
+      this warehouse build includes them determines whether the movement is real.
+
+  - id: payments-null-country
+    # 16,602 payment rows had no country because country arrives via a LEFT JOIN to
+    # dim_subscribers and the orphan rows had no match. 24.6% of 2026 revenue
+    # ($336,095 of $1,366,490) sat in an Unknown bucket the moment revenue was sliced
+    # by country.
+    window:
+      start: 2026-06-01
+      end: 2026-06-30
+    metrics: [total_revenue, ltv]
+    severity: medium
+    # Verified 2026-08-28: zero null-country payment rows in ANY month from 2026-04
+    # onward. repair_orphan_event_rows.py fixed this and the build includes it.
+    verified_clean: "2026-08-28"
+    summary: >
+      Revenue sliced by country in this window may carry a large unattributed bucket:
+      16,602 payment rows lost their country to the same June 2026 append, which at
+      one point placed 24.6% of 2026 revenue in an Unknown bucket.
+    guidance: >
+      Check whether a null country bucket appears in the breakdown before drawing a
+      geographic conclusion.
+
+  - id: content-id-joins-broken
+    # Five dbt relationships tests fail on content_id. The bridge and the catalog
+    # share zero ids, so dim_content.primary_genre is 100% null and
+    # fct_stream_sessions.content_primary_genre inherits it. content_primary_genre is
+    # already excluded from driver_graph decompose_by, so this only fires if a future
+    # change lets a content dimension back in.
+    metrics: [total_sessions, total_watch_time, avg_watch_time, engagement_rate,
+              avg_buffering_events, total_buffering_events]
+    severity: medium
+    summary: >
+      Content attributes are unavailable for session metrics: the content catalogue
+      and the genre bridge share no content ids, so genre is null for every session
+      row and only 8.5% of sessions resolve to a content record at all.
+    guidance: >
+      Any content-level breakdown here is a data gap, not a business finding.

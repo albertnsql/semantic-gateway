@@ -53,3 +53,4 @@ gateway/build_templates.ps1
 *.duckdb.wal
 *.duckdb.tmp/
 SemanticGateway_Project_Overview.docx
+SemanticGateway_Project_Overview.docx.bak

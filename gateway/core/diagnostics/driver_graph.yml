@@ -1,0 +1,373 @@
+# driver_graph.yml — what mechanically moves each metric, and how it can be sliced.
+#
+# PURPOSE
+# The diagnostic planner instantiates probes from this file. It fills slots; it
+# never invents a metric or column name. That is deliberate: free-form planning
+# produces metric x dimension pairs the validator rejects, which burns a probe
+# slot mid-run and leaves the agent concluding from incomplete evidence.
+#
+# THE DIVISION OF LABOUR
+#   driver_graph.yml (structured)  -> what is REACHABLE. Machine-checkable against
+#                                     the registry and dimension_coverage.csv.
+#   backend/skills/*.md (prose)    -> how to REASON. Judgment, priors, business
+#                                     context. Unverifiable by construction.
+# Do not move reachability into prose: an unverifiable claim about which columns
+# exist is exactly how hallucinated dimension names get back in.
+#
+# HOW decompose_by WAS BUILT
+# Every entry is confirmed to compile through MetricFlow by
+# `python audit_dimension_coverage.py` (238/238 as of 2026-08-26), then narrowed
+# by hand. Two categories of verified-but-useless dimension are deliberately
+# EXCLUDED, so their absence is a decision and not an oversight:
+#
+#   1. Raw event-date columns — signup_date, churn_date, payment_date,
+#      session_start, event_timestamp, period_month. All compile as group-bys and
+#      none help explain a gap: "MRR grouped by churn_date" is not a finding.
+#      Time is handled by the metric's time_range, not by grouping. cohort_month
+#      is the exception and IS kept — cohort analysis is a real diagnostic lens.
+#   2. Dimensions with no plausible causal link to the metric in question, even
+#      where the join compiles.
+#   3. Dimensions that are EMPTY in the warehouse. Compiling is not the same as
+#      being populated. The audit now checks both — `population` in
+#      dimension_coverage.csv — but it did not when this file was written, and
+#      `content_primary_genre` was in the six session metrics here until
+#      2026-08-27, when a live query --
+#      "average engagement by content type over the last 3 months" -- returned a
+#      single row with genre = null and engagement 63.563, which the narrative then
+#      described as "a uniform engagement level across the platform's content
+#      library". A broken join reported as a business finding.
+#
+#      Root cause: dim_content.sql takes primary_genre from stg_content_genre_bridge
+#      (is_primary = true) LEFT JOINed on content_id, and the bridge shares ZERO
+#      content_ids with content_catalog -- separate generation runs, fresh uuid4s.
+#      Both tables hold good data on their own (2,500 ids each, 29 genres in the
+#      bridge, 10 in the catalog); only the join between them fails. This is one of
+#      the five known-failing `content_id` relationships tests.
+#
+#      Not worth repairing: only 8.5% of session rows resolve to dim_content at all,
+#      so sourcing genre from the catalog's own populated `genre` column would move
+#      it from 100% null to 91.5% null -- worse, because it would look like it works.
+#
+#      Every other dimension used below came back populated. churn_reason reads
+#      71-78% null, which is correct -- only churned subscribers have one -- and the
+#      audit scores it `ok` because it counts distinct BUCKETS, not row-level nulls.
+#
+#   4. Dimensions that resolve to a SINGLE bucket, which is not a decomposition
+#      either. `expansion_mrr x mrr_type` is the example: that metric carries a
+#      metric-level filter `mrr_type = 'expansion'`, so the group-by can only ever
+#      return one value. Correct by construction, useless as an axis.
+#
+# tests/test_driver_graph.py enforces that every name here is real, that every
+# decompose_by pair is marked ok in dimension_coverage.csv, AND that none is
+# all_null or single_value. Re-run the audit after any semantic-layer change or data
+# refresh; a pair that stops compiling or stops carrying data fails a test rather
+# than silently costing the agent a probe.
+#
+# FIELDS
+#   decompose_by      slice the metric by these to find where a gap concentrates
+#   drivers           other metrics that MECHANICALLY move this one (contribution)
+#   weight_metric     probe this to WEIGHT a mix-vs-rate decomposition (see below)
+#   numerator_metric  the other half of a ratio, so both sides get probed
+#   identities        arithmetic relationships, for decomposing a change
+#   quality_signals   metrics that may CORRELATE. Association only — never state
+#                     one as a cause. Rendered at a lower confidence tier.
+#   cautions          metric-specific traps the planner must respect
+#
+# weight_metric IS NOT "a related metric" — it is the exact denominator, and getting
+# it wrong silently disables the most valuable half of analysis.py.
+#
+# `analysis.decompose()` only performs the mix-vs-rate split when every bucket
+# carries a weight, and MetricFlow returns just the ratio for `churn_rate by
+# plan_type` — no denominator. So the weight comes from a SECOND probe, and it has to
+# be the real denominator or the decomposition will not reconcile: `decompose()`
+# reports a non-zero residual, `build_hypothesis()` returns `inconclusive`, and the
+# agent answers "I cannot tell" to a question it could have answered.
+#
+# `drivers` is about causal relatedness and is NOT a substitute. This file originally
+# gave churn_rate `drivers: [churned_subscribers, total_subscribers]` and no weight —
+# but churn_rate is `monthly_churned_subscribers / monthly_subscriber_base`, and
+# neither driver is that denominator (`churned_subscribers` lives on sem_subscribers;
+# `total_subscribers` is `active_subscribers_count`). Weighting with either produces
+# numbers that look plausible and do not tie out.
+#
+# Two shapes need weights, and only the first has a declared denominator:
+#   * true ratios   — churn_rate, ltv, recommendation_ctr. weight = the denominator.
+#   * average measures — engagement_rate (avg_completion_pct), avg_watch_time,
+#     avg_buffering_events. MetricFlow calls these `simple`, but they are means over
+#     sessions, so the weight is the count metric: total_sessions.
+#
+# `monthly_subscriber_base` and `monthly_churned_subscribers` are in
+# `_INTERNAL_METRICS`, so they are hidden from the LLM prompt — but they ARE
+# certified, so the validator accepts them and a planner probe works. The planner
+# reads this file, not the user-facing metric list, which is what makes that legal.
+#
+# tests/test_driver_graph.py resolves every weight_metric against the dbt YAML, so a
+# ratio whose denominator changes fails a test instead of quietly producing
+# irreconcilable decompositions.
+
+version: 1
+
+defaults:
+  # A ratio can move because its numerator moved, its denominator moved, or both.
+  # Probing only the numerator is the most common way to get a confident wrong
+  # answer out of a ratio, so both inputs are always probed for ratio metrics.
+  probe_both_sides_of_a_ratio: true
+  # Dimensions worth trying first when a gap is isolated to one segment. Ordered
+  # by how often they explain a movement in this business, not alphabetically.
+  preferred_decomposition_order:
+    - plan_type
+    - country
+    - acquisition_channel
+    - cohort_month
+    - billing_cycle
+
+metrics:
+
+  # ── Money ───────────────────────────────────────────────────────────────────
+
+  total_revenue:
+    label: Total Revenue
+    measures: total_revenue_usd on sem_payments
+    decompose_by: [country, plan_type, payment_method, is_renewal, currency, acquisition_channel, age_group, cohort_month, subscription_status]
+    drivers: [total_subscribers, mrr, expansion_mrr, churn_rate]
+    identities:
+      - "total_revenue ~= paying_subscribers * arpu"
+      - "revenue_gap = mix_shift(plan_type) + rate_change_within_plan"
+    quality_signals: []
+    cautions:
+      # The single most useful probe for a country-shaped revenue gap, and it is
+      # not currently queryable: sem_payments declares a `failed_payment_count`
+      # MEASURE but no metric wraps it, so the semantic layer cannot answer
+      # "are payments failing more in DE". payment_method is the closest proxy
+      # available — a market shifting toward a rail with worse auth rates shows
+      # up there. Promoting failed_payment_count to a metric is the highest-value
+      # item on the phase 5 list.
+      - "No failed-payment metric exists. Use payment_method as a proxy and say so."
+      - "is_renewal separates new business from recurring; a gap in one is a very different story from a gap in the other."
+
+  mrr:
+    label: Monthly Recurring Revenue
+    measures: mrr_usd on sem_mrr
+    decompose_by: [plan_type, billing_cycle, mrr_type, country, acquisition_channel, age_group, cohort_month, subscription_status]
+    drivers: [total_subscribers, expansion_mrr, churn_rate, net_mrr_growth]
+    identities:
+      - "mrr ~= active_subscribers * average_plan_price"
+      - "mrr_delta = new + expansion + contraction - churned"
+    quality_signals: []
+    cautions:
+      # mrr_type IS the MRR bridge. For any MRR movement this is the first probe:
+      # it attributes the change to new / expansion / contraction / churned
+      # directly, rather than inferring it from a segment breakdown.
+      - "Probe mrr_type FIRST for any MRR change — it decomposes the movement by construction."
+
+  expansion_mrr:
+    label: Expansion MRR
+    measures: mrr_change_usd on sem_mrr
+    # mrr_type is deliberately absent: expansion_mrr carries a metric-level filter
+    # `mrr_type = 'expansion'`, so grouping by mrr_type can only ever return one
+    # bucket. Found by audit_dimension_coverage.py's single_value warning.
+    decompose_by: [plan_type, billing_cycle, country, acquisition_channel, cohort_month]
+    drivers: [mrr, total_subscribers]
+    identities: []
+    quality_signals: []
+    cautions:
+      # Documented in CLAUDE.md and in the measure description: mrr_change_usd
+      # covers new / expansion / contraction and deliberately OMITS churned, and
+      # `retained` rows are all zero. An agent that reads this as "total MRR
+      # movement" will under-report losses and conclude growth where there is none.
+      - "mrr_change_usd excludes churned subscriptions by design. It is not the full MRR delta."
+
+  net_mrr_growth:
+    label: Net MRR Growth
+    measures: derived, (mrr - prev_mrr) / nullif(prev_mrr, 0)
+    decompose_by: [plan_type, billing_cycle, mrr_type, country, acquisition_channel, cohort_month]
+    drivers: [mrr, expansion_mrr, churn_rate]
+    identities: []
+    quality_signals: []
+    cautions:
+      # Carries offset_window: 1 month. require_metric_time() prepends
+      # metric_time__month automatically, so a probe here always returns a time
+      # series — never a single row.
+      - "Has a 1-month offset window; the group-by always includes metric_time__month."
+
+  ltv:
+    label: Lifetime Value
+    measures: ratio, total_revenue / total_subscribers
+    weight_metric: total_subscribers
+    numerator_metric: total_revenue
+    decompose_by: [country, plan_type, acquisition_channel, age_group, cohort_month, subscription_status]
+    drivers: [total_revenue, total_subscribers, churn_rate]
+    identities:
+      - "ltv ~= arpu / churn_rate"
+    quality_signals: []
+    cautions:
+      # Cross-model ratio: numerator on sem_payments, denominator on sem_mrr.
+      # Only dim_subscribers dimensions are reachable from BOTH inputs, which is
+      # why payment_method and currency are absent here but present on
+      # total_revenue. See _CROSS_MODEL_RATIOS in metric_registry.py.
+      - "Cannot be sliced by payment-side dimensions. Decompose total_revenue instead when the question is about payments."
+
+  # ── Subscribers and churn ───────────────────────────────────────────────────
+
+  total_subscribers:
+    label: Active Subscribers
+    measures: active_subscribers_count on sem_mrr
+    decompose_by: [plan_type, country, acquisition_channel, billing_cycle, age_group, cohort_month, subscription_status]
+    drivers: [churned_subscribers, churn_rate]
+    identities:
+      - "subscribers_delta = new_subscribers - churned_subscribers"
+    quality_signals: []
+    cautions:
+      # SNAPSHOT, not a flow. One row per subscriber per month, so summing across
+      # months counts people repeatedly. _SNAPSHOT_METRICS defaults it to the
+      # latest period when no range is given; a diagnosis comparing periods must
+      # set an explicit range per period rather than querying once.
+      - "Snapshot metric: meaningful within a month, meaningless summed across months."
+      - "Resolves via subscriber__plan_type, which reads plan from dim_subscribers rather than from the subscription. A contested tie-break — do not present the number as the only reading."
+
+  churned_subscribers:
+    label: Churned Subscribers
+    measures: churned_subscribers on sem_subscribers
+    decompose_by: [churn_reason, plan_type, country, acquisition_channel, age_group, cohort_month]
+    drivers: []
+    identities: []
+    quality_signals: [avg_buffering_events, engagement_rate, avg_watch_time]
+    cautions:
+      - "Time-filtering selects the month the churn EVENT happened, not the signup cohort."
+
+  churn_rate:
+    label: Subscriber Churn Rate
+    measures: ratio, monthly_churned_subscribers / monthly_subscriber_base
+    weight_metric: monthly_subscriber_base
+    numerator_metric: monthly_churned_subscribers
+    decompose_by: [churn_reason, plan_type, country, billing_cycle, acquisition_channel, age_group, cohort_month]
+    drivers: [churned_subscribers, total_subscribers]
+    identities:
+      - "churn_rate = monthly_churned_subscribers / monthly_subscriber_base"
+    quality_signals: [avg_buffering_events, engagement_rate, avg_watch_time, total_sessions]
+    cautions:
+      # churn_reason is self-reported and the strongest single probe, but it is
+      # descriptive rather than causal — it records what the subscriber said, not
+      # what happened.
+      - "Probe churn_reason first, but report it as stated reasons, not established cause."
+      - "A rate can rise because the base SHRANK. Always probe monthly_subscriber_base alongside."
+
+  retention_rate:
+    label: Retention Rate
+    measures: derived, 1 - churn_rate
+    decompose_by: [plan_type, country, billing_cycle, acquisition_channel, age_group, cohort_month]
+    drivers: [churn_rate]
+    identities:
+      - "retention_rate = 1 - churn_rate"
+    quality_signals: [avg_buffering_events, engagement_rate, avg_watch_time]
+    cautions:
+      - "Strictly the complement of churn_rate. Diagnose churn_rate and invert; never probe both as independent evidence."
+
+  # ── Engagement and delivery quality ─────────────────────────────────────────
+
+  engagement_rate:
+    label: Engagement Rate
+    measures: avg_completion_pct on sem_stream_sessions
+    weight_metric: total_sessions
+    decompose_by: [device_type, quality_streamed, referral_source, watch_quality_tier, country, plan_type, is_completed, cohort_month]
+    drivers: [avg_watch_time, total_sessions]
+    identities: []
+    quality_signals: [avg_buffering_events, total_buffering_events]
+    cautions:
+      - "device_type and quality_streamed usually explain more than any subscriber attribute. Probe delivery before demographics."
+
+  avg_watch_time:
+    label: Average Watch Time
+    measures: avg_watch_time on sem_stream_sessions
+    weight_metric: total_sessions
+    numerator_metric: total_watch_time
+    decompose_by: [device_type, quality_streamed, referral_source, watch_quality_tier, country, plan_type, cohort_month]
+    drivers: [total_sessions, total_watch_time]
+    identities:
+      - "avg_watch_time = total_watch_time / total_sessions"
+    quality_signals: [avg_buffering_events]
+    cautions: []
+
+  total_watch_time:
+    label: Total Watch Time
+    measures: total_watch_minutes on sem_stream_sessions
+    decompose_by: [device_type, quality_streamed, referral_source, country, plan_type, cohort_month]
+    drivers: [total_sessions, avg_watch_time, total_subscribers]
+    identities:
+      - "total_watch_time = total_sessions * avg_watch_time"
+    quality_signals: [avg_buffering_events]
+    cautions:
+      - "A volume metric: it falls when the subscriber base falls, independently of per-user behaviour. Probe total_subscribers before concluding engagement dropped."
+
+  total_sessions:
+    label: Total Sessions
+    measures: total_sessions on sem_stream_sessions
+    decompose_by: [device_type, referral_source, quality_streamed, country, plan_type, cohort_month]
+    drivers: [total_subscribers]
+    identities: []
+    quality_signals: [avg_buffering_events]
+    cautions:
+      - "Same volume caveat as total_watch_time."
+
+  avg_buffering_events:
+    label: Average Buffering Events
+    measures: avg_buffering_events on sem_stream_sessions
+    weight_metric: total_sessions
+    numerator_metric: total_buffering_events
+    decompose_by: [device_type, quality_streamed, watch_quality_tier, country, plan_type]
+    drivers: [total_buffering_events, total_sessions]
+    identities:
+      - "avg_buffering_events = total_buffering_events / total_sessions"
+    quality_signals: []
+    cautions:
+      # This metric is itself the quality signal other metrics point at, so it is
+      # usually the OBJECT of a correlation claim rather than the subject.
+      - "When cited as evidence for churn or engagement, this is association, not contribution."
+
+  total_buffering_events:
+    label: Total Buffering Events
+    measures: total_buffering_events on sem_stream_sessions
+    decompose_by: [device_type, quality_streamed, watch_quality_tier, country]
+    drivers: [total_sessions, avg_buffering_events]
+    identities: []
+    quality_signals: []
+    cautions:
+      - "Scales with session volume. Prefer avg_buffering_events when comparing segments of different sizes."
+
+  # ── Recommendations ─────────────────────────────────────────────────────────
+
+  recommendation_ctr:
+    label: Recommendation CTR
+    measures: ratio, clicked_recommendations / total_recommendations
+    weight_metric: total_recommendations
+    numerator_metric: clicked_recommendations
+    decompose_by: [recommendation_type, country, plan_type, age_group, acquisition_channel, cohort_month]
+    drivers: [clicked_recommendations, total_recommendations]
+    identities:
+      - "recommendation_ctr = clicked_recommendations / total_recommendations"
+    quality_signals: [engagement_rate]
+    cautions:
+      - "A CTR fall can be fewer clicks OR more impressions. Probe both inputs."
+      # sem_recommendation_events maps to stg_recommendation_events, not a mart —
+      # the only semantic model that does. Its content_id join is also one of the
+      # five known-broken relationships, so content-level slicing is unavailable.
+      - "Backed by a STAGING model, not a mart. No content-level decomposition: the content_id join is one of the five known-failing relationship tests."
+
+  clicked_recommendations:
+    label: Clicked Recommendations
+    measures: clicked_recommendations on sem_recommendation_events
+    decompose_by: [recommendation_type, country, plan_type, age_group, cohort_month]
+    drivers: [total_recommendations]
+    identities: []
+    quality_signals: []
+    cautions: []
+
+  total_recommendations:
+    label: Total Recommendations
+    measures: total_recommendations on sem_recommendation_events
+    decompose_by: [recommendation_type, country, plan_type, age_group, cohort_month]
+    drivers: []
+    identities: []
+    quality_signals: []
+    cautions:
+      - "An impression count driven by product surface changes, not subscriber behaviour."

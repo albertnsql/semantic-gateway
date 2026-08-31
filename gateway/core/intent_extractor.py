@@ -177,7 +177,10 @@ class QueryIntent(BaseModel):
     needs_clarification: bool = False
     clarification_reason: str | None = None
     # Routing decision made in the same LLM call as extraction (replaces the
-    # separate IntentClassifier round trip): metric_query | schema_question | out_of_scope
+    # separate IntentClassifier round trip):
+    #   metric_query | schema_question | diagnostic_query | out_of_scope
+    # diagnostic_query is the only non-metric_query type that still carries
+    # metrics/time_range/filters -- the diagnosis needs all three.
     query_type: str = "metric_query"
 
 
@@ -374,7 +377,7 @@ class IntentExtractor:
         # Anything unrecognised falls back to metric_query (fail-open: the
         # semantic validator still guards the pipeline downstream).
         _qt = str(parsed.get("query_type") or "metric_query").strip().lower()
-        if _qt not in ("metric_query", "schema_question", "out_of_scope"):
+        if _qt not in ("metric_query", "schema_question", "diagnostic_query", "out_of_scope"):
             _qt = "metric_query"
         parsed["query_type"] = _qt
 
@@ -528,7 +531,7 @@ class IntentExtractor:
 
         schema = """
 {
-  "query_type": "<metric_query|schema_question|out_of_scope>",
+  "query_type": "<metric_query|schema_question|diagnostic_query|out_of_scope>",
   "metrics": ["<metric_name>"],
   "dimensions": ["<dimension_name>"],
   "filters": [
@@ -611,9 +614,31 @@ Your job is to FIRST classify the question, THEN (for metric queries) extract st
 - "schema_question": The question asks about what data or metrics exist, what dimensions
   are available, or how the system works. Examples: "What metrics do you have?",
   "What dimensions can I filter by?", "What does MRR mean in this system?"
-- "out_of_scope": The question asks for reasoning, causation, predictions, or anything
-  that cannot be answered by a SQL query. Examples: "Why did MRR drop?",
-  "What should I focus on?", "Predict next quarter's revenue".
+- "diagnostic_query": The question asks WHY a certified metric moved, or what is
+  DRIVING / CAUSING / EXPLAINING a change in it. Examples: "Why did MRR drop?",
+  "Why is revenue lower in Germany?", "What's driving the churn increase?",
+  "Explain the fall in engagement".
+- "out_of_scope": The question cannot be answered from this warehouse at all —
+  predictions, recommendations, or subjects with no certified metric. Examples:
+  "What should I focus on?", "Predict next quarter's revenue",
+  "Why are competitors growing faster?"
+
+The line between the last two is whether a CERTIFIED METRIC is named or clearly
+implied. "Why did MRR drop" is diagnostic because mrr exists; "why are competitors
+growing" is out of scope because nothing in the warehouse measures competitors.
+
+Also keep the boundary with "metric_query" sharp — it turns on whether an
+EXPLANATION is being requested, not on the presence of a comparison:
+- "revenue by country"                     -> metric_query
+- "revenue by country vs last quarter"     -> metric_query  (asks for the numbers)
+- "why is revenue down in Germany"         -> diagnostic_query
+- "what caused the drop in revenue"        -> diagnostic_query
+
+For "diagnostic_query" you MUST still extract `metrics` (exactly one), and
+`time_range` and `filters` if the question gives them — the diagnosis needs the
+metric to decompose, the period to compare, and the scope to hold constant. Leave
+`dimensions` empty: which dimensions to decompose by is decided downstream from a
+curated map, not by you.
 
 For "schema_question" and "out_of_scope", set metrics to [] and stop — do not extract
 dimensions, filters, or time ranges. Dashboard-context answers (see rules below, if
@@ -735,6 +760,14 @@ Output:
 {{"query_type": "schema_question", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Why did churn increase last quarter?"
+Output:
+{{"query_type": "diagnostic_query", "metrics": ["churn_rate"], "dimensions": [], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-03-31", "relative": null}}, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "Why is revenue lower in Germany?"
+Output:
+{{"query_type": "diagnostic_query", "metrics": ["total_revenue"], "dimensions": [], "filters": [{{"column": "country", "operator": "eq", "value": "DE"}}], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "Why are our competitors growing faster than us?"
 Output:
 {{"query_type": "out_of_scope", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 """

@@ -95,6 +95,26 @@ class Settings(BaseSettings):
     # Worth watching resident memory on a 512 MB instance: measured 150 -> 251 MB.
     metricflow_in_process: bool = True
 
+    # ── Diagnostics: the "why" path (core/diagnostics/) ──────────────────────
+    # Off by default. `langgraph` costs 10.7s of import and +68.6MB RSS (measured),
+    # and this instance already sits near 251MB of 512MB with the warm MetricFlow
+    # engine loaded — so when this is false the import never happens at all. The
+    # graph is built lazily on the first diagnostic query and memoised, never in
+    # lifespan(), for the same reason.
+    diagnostics_enabled: bool = False
+    # Decomposition axes per diagnosis. Each costs 2 probes, or 4 for a metric with
+    # a weight_metric. Three is 14 probes for a weighted metric, ~60ms each warm.
+    diagnostics_max_dimensions: int = 3
+    diagnostics_max_probes: int = 16
+    # A diagnosis is bounded by wall clock as well as probe count, because the
+    # characteristic failure of this kind of agent is not stopping.
+    diagnostics_deadline_seconds: float = 25.0
+    # Months of history a diagnosis looks at when the question names no period.
+    # The current month is excluded: fct_mrr_monthly's spine runs to current_date()
+    # while cancellations carry a +1 month offset, so the newest month is
+    # structurally churn-only and reads as a collapse.
+    diagnostics_default_months: int = 6
+
     # Build the engine on a background thread at startup instead of on the first
     # cache miss. Without this the ~27s build lands inside whichever request
     # misses first — production 2026-07-31 logged a 30.3s query that was 27.1s
