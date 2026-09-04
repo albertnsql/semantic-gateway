@@ -399,7 +399,9 @@ class TestCompiledGraph:
             initial_state("why", "total_revenue", TARGET, max_dimensions=2),
             _config(_SqlGenerator(_values_for_revenue_drop()), graph),
         )
-        assert len(final["findings"]) == 2 + 2 * 2
+        # 2 baseline + 1 trend + 2 per dimension. The trend probe is what lets the
+        # answer say whether the comparison window was itself typical.
+        assert len(final["findings"]) == 3 + 2 * 2
 
     def test_zero_llm_calls(self, graph: DriverGraph, monkeypatch) -> None:
         """

@@ -89,11 +89,20 @@ class TestRetiredArtifacts:
     def test_retirement_does_not_silence_everything(
         self, registry: ArtifactRegistry
     ) -> None:
-        """Two of four are retired; the live ones must still fire."""
-        assert len(registry.active()) == 2
-        assert {a.id for a in registry.active()} == {
-            "mrr-spine-trailing-month", "content-id-joins-broken"
-        }
+        """Three of four are retired; the live one must still fire.
+
+        content-id-joins-broken joined them on 2026-08-31, when
+        fct_stream_sessions started coalescing the genre bridge with the catalog
+        and content_primary_genre went from 100% null to 100% populated.
+
+        The registry is down to one live artifact, which is a fine state to be in
+        and a bad one to assert loosely: `active()` returning nothing at all would
+        mean warnings had stopped reaching users entirely, and that is precisely
+        the failure a retirement can cause by accident.
+        """
+        assert len(registry.active()) == 1
+        assert {a.id for a in registry.active()} == {"mrr-spine-trailing-month"}
+        assert len(registry.all()) == 4, "retired entries are kept as memory"
 
     def test_a_retired_artifact_never_matches_regardless_of_window(self) -> None:
         reg = ArtifactRegistry([

@@ -269,6 +269,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         maxsize=settings.query_cache_maxsize,
         disk_path="./.query_cache.json",
     )
+    # ── Allowed filter VALUES ────────────────────────────────────────────────
+    # The prompt names certified dimensions but never their values, so the model
+    # emits whatever the user said: "Germany" against a warehouse storing "DE".
+    # The filter then matches nothing and the query returns zero rows with
+    # status=success. Queried rather than hardcoded because a hardcoded list drifts
+    # on the next data regeneration, and drifting silently is the whole problem.
+    # Best-effort: a failure leaves the prompt exactly as it was before this existed.
+    try:
+        from core import dimension_values as _dimension_values
+
+        # `snowflake_pool` holds the DuckDBPool when warehouse_engine=duckdb - the
+        # name predates the migration and is what the rest of lifespan() uses.
+        intent_extractor._dimension_values = _dimension_values.load(
+            snowflake_pool if snowflake_ok else None
+        )
+        app.state.dimension_values = intent_extractor._dimension_values
+    except Exception as exc:
+        logger.warning("✗ Could not load dimension values: %s", exc)
+        app.state.dimension_values = {}
+
     app.state.query_cache = query_cache
     logger.info(
         "✓ Query cache initialized (TTL: %ds, maxsize: %d, Disk: ./.query_cache.json).",

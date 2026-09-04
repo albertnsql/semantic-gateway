@@ -213,6 +213,11 @@ class IntentExtractor:
         _LLM_TIMEOUT_S = 15.0
         _LLM_MAX_RETRIES = 0
 
+        # Allowed filter VALUES per dimension, injected by main.py's lifespan once
+        # the warehouse is open. Empty until then, which reproduces the old prompt
+        # exactly -- so a warehouse that never opens degrades rather than breaks.
+        self._dimension_values: dict[str, list[str]] = {}
+
         # Primary Client (Google Gemini)
         self._primary_model = settings.google_model
         if settings.google_api_key:
@@ -521,6 +526,12 @@ class IntentExtractor:
             f"  - {m}" for m in selected_metrics
         )
 
+        from core.dimension_values import format_for_prompt
+        # Without this the model emits whatever the user said -- "Germany" against a
+        # warehouse storing "DE" -- and the filter matches zero rows with
+        # status=success. See core/dimension_values.py.
+        _filter_values_block = format_for_prompt(getattr(self, "_dimension_values", {}))
+
         from core.sql_generator import build_dimension_prefix_map
         dim_map_dynamic = build_dimension_prefix_map()
 
@@ -707,6 +718,7 @@ which is exactly why the rule above is mandatory rather than advisory.
 
 ## CERTIFIED DIMENSIONS MAP (metric → allowed dimensions):
 {dims_section}
+{_filter_values_block}
 {_data_reference_block}
 {_dashboard_context_block}
 ## TIME RANGE RESOLUTION:

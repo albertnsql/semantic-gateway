@@ -66,6 +66,7 @@ else:
         RunnableConfig = dict
 
 from core.diagnostics.analysis import (
+    baseline_representativeness,
     build_hypothesis,
     decompose,
     is_broad_based,
@@ -184,6 +185,10 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
             metric=plan.metric, target=plan.target, comparison=plan.comparison,
             probes=keep, dimensions=plan.dimensions, cautions=plan.cautions,
             weight_metric=plan.weight_metric,
+            # `trend` must be carried, or a trimmed plan silently loses the baseline
+            # representativeness check and the answer stops warning about an
+            # unrepresentative comparison without saying why.
+            trend=plan.trend,
             notes=plan.notes + ["the probe budget trimmed this plan"],
         )
 
@@ -366,6 +371,24 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
             "totals could not be established."
         )
 
+    # A gap is only as meaningful as what it is measured against. A live June churn
+    # diagnosis reported +163.7% against a May that was itself 41% below the trailing
+    # 12-month average; against trend the figure is +55%. Both correct, one useful.
+    # This says so rather than swapping the baseline for another guessable one.
+    check = _baseline_check(plan, state.get("findings") or [], baseline)
+    if check is not None and not check.representative:
+        message = (
+            f"Read that against trend: the comparison period was itself "
+            f"{abs(check.deviation):.0%} {check.direction} the trailing "
+            f"{check.trend_months}-month average, so it is not a typical baseline"
+        )
+        if check.trend_relative_gap is not None:
+            message += (
+                f". Against that average the target is "
+                f"{check.trend_relative_gap:+.0%}"
+            )
+        lines.append(message + ".")
+
     explaining = [h for h in hypotheses if h.verdict in ("explains", "partial")]
     ruled_out = [h for h in hypotheses if h.verdict == "not_it"]
 
@@ -436,6 +459,44 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
         lines.append(f"Stopped early: {budget.why_spent()}.")
 
     return {"answer": "\n".join(lines), "stopped_because": stopped}
+
+
+def _baseline_check(plan: ProbePlan, findings: list[Finding], baseline):
+    """
+    Judge whether the comparison window was typical of recent history.
+
+    Only for a single-month comparison: that is where an unrepresentative baseline
+    distorts the headline, and it keeps the arithmetic exact. Returns None whenever a
+    verdict cannot be supported — no trend rows, a multi-month comparison, unknown
+    totals — because "could not tell" and "was typical" read identically in an answer
+    and only one of them is honest.
+    """
+    if plan.trend is None or baseline is None:
+        return None
+    if plan.comparison.months_spanned != 1:
+        return None
+
+    by_label = {f.label: f for f in findings if f.ok}
+    trend_finding = by_label.get(f"{plan.metric}, trend window")
+    if trend_finding is None or not trend_finding.rows:
+        return None
+
+    key = next(
+        (k for k in trend_finding.rows[0] if k.lower() == plan.metric.lower()), None
+    )
+    if key is None:
+        return None
+
+    # One row per month, because the trend probe groups by metric_time__month.
+    monthly = [
+        float(r[key]) for r in trend_finding.rows if r.get(key) is not None
+    ]
+    target_total, comparison_total, _ = baseline
+    return baseline_representativeness(
+        comparison_value=comparison_total,
+        trend_monthly=monthly,
+        target_value=target_total if plan.target.months_spanned == 1 else None,
+    )
 
 
 def _baseline_gap(plan: ProbePlan, findings: list[Finding]):

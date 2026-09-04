@@ -16,6 +16,12 @@ semantic_models:
         type: categorical
       - name: is_renewal
         type: categorical
+      # Why a payment failed. Already selected by fct_payments and populated for
+      # every failed row (5 values: insufficient_funds, bank_declined, invalid_card,
+      # fraud_detected, card_expired). Exposed so a revenue diagnosis can answer
+      # "why are payments failing" rather than only "how many failed".
+      - name: failure_reason
+        type: categorical
       - name: payment_date
         type: time
         type_params:
@@ -29,5 +35,13 @@ semantic_models:
       - name: failed_payment_count
         description: Count of failed payments
         expr: case when status = 'failed' then payment_id else null end
+        agg: count
+        agg_time_dimension: payment_date
+      - name: payment_count
+        description: >
+          All payment attempts regardless of status. Denominator for the payment
+          failure rate - a raw failure COUNT rises with volume, so it cannot answer
+          "are payments failing more here" on its own.
+        expr: payment_id
         agg: count
         agg_time_dimension: payment_date

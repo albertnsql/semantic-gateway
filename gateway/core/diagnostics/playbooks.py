@@ -39,7 +39,7 @@ _GRAPH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver_g
 # `decompose()` can split mix from rate; without them only the additive
 # decomposition is available.
 ProbeRole = Literal["baseline", "target", "comparison", "weight_target",
-                    "weight_comparison", "driver", "quality"]
+                    "weight_comparison", "driver", "quality", "trend"]
 
 
 @dataclass(frozen=True)
@@ -77,6 +77,7 @@ class ProbePlan:
     cautions: list[str] = field(default_factory=list)
     weight_metric: str = ""
     notes: list[str] = field(default_factory=list)
+    trend: Window | None = None   # longer trailing window, for baseline sanity
 
 
 class DriverGraph:
@@ -122,19 +123,39 @@ class DriverGraph:
     def preferred_order(self) -> list[str]:
         return list(self._defaults.get("preferred_decomposition_order") or [])
 
+    def decompose_first(self, metric: str) -> list[str]:
+        """Dimensions this metric wants probed ahead of the global preference."""
+        return list(self.entry(metric).get("decompose_first") or [])
+
     def ordered_dimensions(self, metric: str, limit: int | None = None) -> list[str]:
         """
         Decomposition axes, highest-yield first.
 
-        `preferred_decomposition_order` is a hand-tuned prior about which slices
-        usually explain a movement in this business; anything not named there keeps
-        its file order behind them. Sorting alphabetically instead would put
-        `acquisition_channel` before `plan_type` for no reason.
+        Three tiers, in order:
+
+        1. `decompose_first` — the metric's OWN priority, which beats the global
+           preference. This exists because the global list is a business-wide prior
+           and some metrics have a better one. `payment_failure_rate` is the case:
+           `failure_reason` separates a card-quality problem (invalid_card,
+           card_expired) from a bank or risk one (bank_declined, fraud_detected),
+           which is the split that decides who fixes it. A live run picked
+           plan_type / country / acquisition_channel and never touched it, because
+           the global order put those first.
+        2. `preferred_decomposition_order` — the business-wide prior. Sorting
+           alphabetically instead would put `acquisition_channel` before `plan_type`
+           for no reason.
+        3. whatever remains, in file order.
+
+        Anything in `decompose_first` that is not also in `decompose_by` is ignored:
+        `decompose_by` is the verified set and stays the single gate on what can be
+        asked.
         """
         available = self.decompose_by(metric)
-        preferred = [d for d in self.preferred_order if d in available]
-        rest = [d for d in available if d not in preferred]
-        ordered = preferred + rest
+        first = [d for d in self.decompose_first(metric) if d in available]
+        preferred = [d for d in self.preferred_order
+                     if d in available and d not in first]
+        rest = [d for d in available if d not in first and d not in preferred]
+        ordered = first + preferred + rest
         return ordered[:limit] if limit else ordered
 
 
@@ -177,6 +198,7 @@ def plan_time_comparison(
     include_weights: bool = True,
     filters: Sequence[Any] = (),
     weight_available: Any = None,
+    trend_months: int = 12,
 ) -> ProbePlan:
     """
     Plan a "why did this move" diagnosis: target window versus a comparison window.
@@ -224,11 +246,27 @@ def plan_time_comparison(
             "available - mix and rate cannot be separated"
         )
 
+    # A longer trailing window ending where the comparison ends. One extra probe
+    # (~60ms) that answers "was the baseline typical" -- the question a live June
+    # diagnosis could not answer, reporting +163.7% against a May that was itself 41%
+    # below trend. See analysis.baseline_representativeness.
+    trend = trailing_window(comparison, months=trend_months)
+
     probes: list[Probe] = [
         Probe(metric=metric, role="baseline", window=target, filters=list(filters),
               label=f"{metric}, target window"),
         Probe(metric=metric, role="comparison", window=comparison, filters=list(filters),
               label=f"{metric}, comparison window"),
+        # Grouped BY MONTH, not aggregated over the whole window. A ratio metric
+        # aggregated across 12 months is not 12x a monthly rate: churn_rate over
+        # 2025-06..2026-05 returned 0.206, because the denominator is a DISTINCT
+        # subscriber count over the whole window. Dividing that by 12 gave 1.72%
+        # against a true monthly average of 2.61%, and the check then declared an
+        # unrepresentative baseline representative. Per-month rows can just be
+        # averaged.
+        Probe(metric=metric, role="trend", window=trend,
+              dimensions=["metric_time__month"], filters=list(filters),
+              label=f"{metric}, trend window"),
     ]
 
     skipped_weights: list[str] = []
@@ -269,8 +307,22 @@ def plan_time_comparison(
     return ProbePlan(
         metric=metric, target=target, comparison=comparison, probes=probes,
         dimensions=dimensions, cautions=graph.cautions(metric),
-        weight_metric=weight, notes=notes,
+        weight_metric=weight, notes=notes, trend=trend,
     )
+
+
+def trailing_window(anchor: Window, months: int = 12) -> Window:
+    """
+    The *months* whole months ending where *anchor* ends.
+
+    Used for the baseline sanity check, so it deliberately INCLUDES the comparison
+    window: the question is whether that window was typical of recent history, and
+    recent history reasonably contains it. It excludes the target, which would
+    otherwise pull the trend toward the very movement being explained.
+    """
+    from core.diagnostics.windows import trailing_months as _trailing
+
+    return _trailing(anchor.end, months, inclusive=True)
 
 
 def previous_window(target: Window) -> Window:

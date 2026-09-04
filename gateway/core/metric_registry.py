@@ -48,6 +48,13 @@ _FANOUT_PAIRS: set[frozenset[str]] = {
 _INTERNAL_METRICS: frozenset[str] = frozenset({
     "monthly_churned_subscribers",
     "monthly_subscriber_base",
+    # Denominator of payment_failure_rate. Nobody asks "how many payment attempts
+    # were there"; exposing it adds a near-duplicate candidate to "payment failures"
+    # alongside failed_payments and payment_failure_rate, which is precisely how
+    # metric choice became unstable for churn. failed_payments STAYS user-facing -
+    # "how many payments failed" is a real question - so the count/rate pair mirrors
+    # churned_subscribers vs churn_rate.
+    "total_payments",
 })
 
 # Allowed cross-metric joins (same grain or safe via bridge)
@@ -229,7 +236,8 @@ class MetricRegistry:
                         "dimension(s) untouched.",
                         m_name, shared_name, native_count,
                     )
-            elif m_name == "total_revenue":
+            elif m_name in ("total_revenue", "payment_failure_rate",
+                            "failed_payments", "total_payments"):
                 sub_sem = sem_models.get("sem_subscribers")
                 if sub_sem:
                     m_def.certified_dimensions.extend(sub_sem.dimensions + sub_sem.time_dimensions)
@@ -541,6 +549,9 @@ class MetricRegistry:
             "mrr": "sem_mrr",
             "expansion_mrr": "sem_mrr",
             "total_revenue": "sem_payments",
+            "failed_payments": "sem_payments",
+            "total_payments": "sem_payments",
+            "payment_failure_rate": "sem_payments",
             "net_mrr_growth": "sem_mrr",
             "ltv": "sem_payments",
             "engagement_rate": "sem_stream_sessions",

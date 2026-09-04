@@ -1370,6 +1370,12 @@ def main() -> None:
         help="Drop any existing rows for the month before generating it (re-runnable)."
     )
     parser.add_argument(
+        "--csv-only", action="store_true",
+        help="Write output/ only and never contact Snowflake. The right flag since "
+             "the warehouse moved to DuckDB; --dry-run also skips the upload but "
+             "reads as though it writes nothing, which it does not."
+    )
+    parser.add_argument(
         "--drop-month", action="store_true",
         help="Delete the month's existing rows and stop. Does not generate anything."
     )
@@ -1420,10 +1426,25 @@ def main() -> None:
 
         append_to_csv(dfs, label)
 
-        if not args.dry_run:
-            upload_to_snowflake(dfs, label)
-        else:
+        # output/ is the AUTHORITATIVE store and has just been written. Snowflake is
+        # dormant (the trial ended 2026-08-03; the warehouse is DuckDB), so failing to
+        # reach it must not present as a failed append. The 2026-08 run raised "Your
+        # free trial has ended" AFTER writing 162,130 correct rows, which reads as
+        # though nothing landed and invites a re-run that would double-append.
+        if args.csv_only:
+            print("\n  [--csv-only] Snowflake upload skipped.")
+        elif args.dry_run:
             print("\n  [dry-run] Snowflake upload skipped.")
+        else:
+            try:
+                upload_to_snowflake(dfs, label)
+            except Exception as exc:
+                detail = str(exc).strip().splitlines()[0][:160]
+                print(f"\n  [warn] Snowflake upload failed: {detail}")
+                print("  The CSVs in output/ ARE written and are the authoritative "
+                      "store. Rebuild the warehouse with "
+                      "`python load_raw_data_to_duckdb.py` then `dbt run`.")
+                print("  Pass --csv-only to skip Snowflake entirely.")
 
     print("\nDone.")
 

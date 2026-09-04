@@ -1,0 +1,38 @@
+metrics:
+  # Building-block metrics for the payment failure rate. A ratio metric must
+  # reference METRICS, not measures, so both halves are wrapped first — the same
+  # shape churn_rate uses.
+  - name: failed_payments
+    description: >
+      Count of payment attempts with status = 'failed'. Useful as a volume figure,
+      but prefer payment_failure_rate when comparing segments of different sizes:
+      a raw count rises with payment volume.
+    label: Failed Payments
+    type: simple
+    type_params:
+      measure: failed_payment_count
+
+  - name: total_payments
+    description: >
+      All payment attempts regardless of status. Denominator for the failure rate.
+    label: Total Payment Attempts
+    type: simple
+    type_params:
+      measure: payment_count
+
+  - name: payment_failure_rate
+    description: >
+      Share of payment attempts that failed. This is the metric that answers "are
+      payments failing more in this segment" — the single most useful probe for a
+      revenue shortfall isolated to one country, and one the semantic layer could
+      not answer before 2026-08-28 because the failed_payment_count MEASURE existed
+      with no metric wrapping it.
+      Measured 2026 rates vary meaningfully by country (DE 5.1%, GB 4.0%), so this
+      discriminates rather than returning noise. Slice by failure_reason to separate
+      a card-quality problem (invalid_card, card_expired) from a bank or risk one
+      (bank_declined, fraud_detected).
+    label: Payment Failure Rate
+    type: ratio
+    type_params:
+      numerator: failed_payments
+      denominator: total_payments

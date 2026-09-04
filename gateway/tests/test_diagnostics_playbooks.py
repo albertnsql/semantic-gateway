@@ -60,6 +60,51 @@ class TestDriverGraphAccessor:
         for metric in ("total_revenue", "churn_rate", "engagement_rate"):
             assert set(graph.ordered_dimensions(metric)) <= set(graph.decompose_by(metric))
 
+    def test_decompose_first_beats_the_global_preference(self, graph: DriverGraph) -> None:
+        """
+        The global order is a business-wide prior; some metrics have a better one.
+        A live payment_failure_rate diagnosis decomposed by plan_type / country /
+        acquisition_channel and never touched failure_reason, which is the axis that
+        decides whether it is a card problem or a bank problem. Listing it first in
+        decompose_by was not enough.
+        """
+        ordered = graph.ordered_dimensions("payment_failure_rate", limit=3)
+        assert ordered[0] == "failure_reason"
+        assert "payment_method" in ordered
+
+    def test_it_does_not_disturb_metrics_without_one(self, graph: DriverGraph) -> None:
+        """Metrics with no decompose_first keep the global preferred order."""
+        for metric in ("total_revenue", "churn_rate", "ltv"):
+            assert not graph.decompose_first(metric)
+            assert graph.ordered_dimensions(metric)[0] == "plan_type"
+
+    def test_mrr_leads_with_the_movement_bridge(self, graph: DriverGraph) -> None:
+        """
+        mrr's own caution says "probe mrr_type FIRST" and the planner did not, because
+        the global order put plan_type ahead of it. Found by audit_diagnoses.py on its
+        first run; with mrr_type leading, that axis returns verdict `explains` where
+        all three previous axes were only `partial`.
+        """
+        assert graph.ordered_dimensions("mrr")[0] == "mrr_type"
+        assert any("mrr_type FIRST" in c for c in graph.cautions("mrr")), (
+            "the caution and the ordering must agree, or one of them is a lie"
+        )
+
+    def test_decompose_first_cannot_smuggle_in_an_unverified_axis(
+        self, graph: DriverGraph
+    ) -> None:
+        """decompose_by stays the only gate on what can be asked."""
+        local = DriverGraph({
+            "defaults": {"preferred_decomposition_order": ["plan_type"]},
+            "metrics": {"m": {
+                "decompose_first": ["not_verified", "country"],
+                "decompose_by": ["plan_type", "country"],
+            }},
+        })
+        ordered = local.ordered_dimensions("m")
+        assert "not_verified" not in ordered
+        assert ordered == ["country", "plan_type"]
+
     def test_limit_truncates(self, graph: DriverGraph) -> None:
         assert len(graph.ordered_dimensions("total_revenue", limit=2)) == 2
 
@@ -95,12 +140,14 @@ class TestPlanShape:
     def test_probe_count_without_weights(self, graph: DriverGraph) -> None:
         plan = plan_time_comparison("total_revenue", TARGET, graph=graph,
                                     max_dimensions=3, include_weights=False)
-        assert len(plan.probes) == 2 + 2 * 3
+        # 2 baseline + 1 trend + 2 per dimension
+        assert len(plan.probes) == 3 + 2 * 3
 
     def test_probe_count_with_weights(self, graph: DriverGraph) -> None:
         """A weighted metric needs its denominator on both sides too."""
         plan = plan_time_comparison("churn_rate", TARGET, graph=graph, max_dimensions=3)
-        assert len(plan.probes) == 2 + 4 * 3
+        # 2 baseline + 1 trend + 4 per dimension (value pair plus weight pair)
+        assert len(plan.probes) == 3 + 4 * 3
         weights = [p for p in plan.probes if p.role.startswith("weight_")]
         assert {p.metric for p in weights} == {"monthly_subscriber_base"}
 
@@ -127,6 +174,31 @@ class TestPlanShape:
         assert not any("churn-only" in c for c in plan.cautions), (
             "window-sensitive traps belong in known_artifacts.yml, not here"
         )
+
+    def test_a_trend_window_is_always_planned(self, graph: DriverGraph) -> None:
+        """
+        One extra probe that answers "was the baseline typical". A live June churn
+        diagnosis reported +163.7% against a May that was itself 41% below the
+        trailing 12-month average; against trend the figure is +55%.
+        """
+        plan = plan_time_comparison("churn_rate", Window.of("2026-06-01", "2026-06-30"),
+                                    graph=graph, max_dimensions=1)
+        assert plan.trend == Window.of("2025-06-01", "2026-05-31")
+        assert plan.trend.months_spanned == 12
+        assert sum(1 for p in plan.probes if p.role == "trend") == 1
+
+    def test_the_trend_window_ends_where_the_comparison_ends(
+        self, graph: DriverGraph
+    ) -> None:
+        """
+        It INCLUDES the comparison window - the question is whether that window was
+        typical of recent history - and EXCLUDES the target, which would otherwise
+        pull the trend toward the very movement being explained.
+        """
+        plan = plan_time_comparison("churn_rate", Window.of("2026-06-01", "2026-06-30"),
+                                    graph=graph, max_dimensions=1)
+        assert plan.trend.end == plan.comparison.end
+        assert not plan.trend.overlaps(plan.target)
 
     def test_labels_are_unique_so_findings_can_be_paired(self, graph: DriverGraph) -> None:
         plan = plan_time_comparison("churn_rate", TARGET, graph=graph, max_dimensions=3)
@@ -156,6 +228,9 @@ class TestComparisonWindow:
         plan = plan_time_comparison("total_revenue", TARGET, graph=graph,
                                     max_dimensions=1, include_weights=False)
         for probe in plan.probes:
+            if probe.role == "trend":
+                assert probe.window == plan.trend
+                continue
             expected = plan.target if probe.role in ("baseline", "target") else plan.comparison
             assert probe.window == expected
 
@@ -226,7 +301,9 @@ class TestPairing:
         plan = plan_time_comparison("total_revenue", TARGET, graph=graph,
                                     max_dimensions=2, include_weights=False)
         grouped = pair_findings(plan, [_finding(p.label) for p in plan.probes])
-        assert "" in grouped and set(grouped[""]) == {"baseline", "comparison"}
+        # The trend probe has no dimension either, so it lands in the "" group
+        # alongside the baseline pair.
+        assert "" in grouped and set(grouped[""]) == {"baseline", "comparison", "trend"}
         for dim in plan.dimensions:
             assert set(grouped[dim]) == {"target", "comparison"}
 
@@ -279,4 +356,11 @@ class TestPlanIsDeterministic:
             plan = plan_time_comparison(metric, TARGET, graph=graph)
             allowed = set(graph.decompose_by(metric))
             for probe in plan.probes:
-                assert set(probe.dimensions) <= allowed, f"{metric}: {probe.dimensions}"
+                # `metric_time__month` is MetricFlow's SYNTHETIC time dimension, used
+                # by the trend probe to get a per-month series. It is not a
+                # decomposition axis and can never be in decompose_by - it is not a
+                # column on any semantic model. The validator treats it as reserved
+                # for the same reason.
+                asked = {d for d in probe.dimensions
+                         if d.split("__", 1)[0] != "metric_time"}
+                assert asked <= allowed, f"{metric}: {probe.dimensions}"

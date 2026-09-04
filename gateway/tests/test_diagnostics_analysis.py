@@ -26,6 +26,7 @@ from core.diagnostics.analysis import (
     concentration,
     decompose,
     explained_share,
+    baseline_representativeness,
     is_broad_based,
     rank_hypotheses,
     rows_to_buckets,
@@ -305,6 +306,85 @@ class TestHypothesisWording:
         assert "residual" in h.statement
 
 
+class TestBaselineRepresentativeness:
+    """
+    A gap is only as meaningful as what it is measured against.
+
+    The case: a live churn diagnosis reported +163.7% for June 2026 against May.
+    Both correct — but May was ~40% below the trailing 12-month average, so the
+    comparison maximised the apparent jump. Against trend June is ~+60%.
+    """
+
+    #: The real monthly churn series, Jun 2025 - May 2026, from the warehouse.
+    TREND = [0.0324, 0.0322, 0.0296, 0.0273, 0.0252, 0.0222,
+             0.0276, 0.0276, 0.0153, 0.0181, 0.0154, 0.0176]
+    MAY = 0.0154
+    JUNE = 0.0406
+
+    def test_it_flags_the_may_baseline(self) -> None:
+        check = baseline_representativeness(self.MAY, self.TREND, target_value=self.JUNE)
+        assert check is not None
+        assert not check.representative
+        assert check.deviation < -0.30, f"May read as only {check.deviation:.0%} off"
+        assert check.direction == "below"
+        assert check.trend_relative_gap == pytest.approx(0.6, abs=0.15), (
+            "the trend-relative figure is the honest headline"
+        )
+        assert check.trend_months == 12
+
+    def test_a_typical_baseline_passes_quietly(self) -> None:
+        typical = sum(self.TREND) / len(self.TREND)
+        check = baseline_representativeness(typical, self.TREND)
+        assert check is not None and check.representative
+        assert abs(check.deviation) < 0.01
+
+    def test_it_averages_monthly_values_rather_than_dividing_an_aggregate(self) -> None:
+        """
+        The first version took the metric aggregated over 12 months and divided by
+        12. For a ratio that is not a rate: churn_rate over 2025-06..2026-05 returns
+        0.206, because the denominator is a DISTINCT subscriber count over the whole
+        window. 0.206/12 = 1.72% against a true monthly mean of 2.61%, and the check
+        then called a 40%-below-average baseline representative.
+        """
+        aggregate_over_window = 0.206   # the real value MetricFlow returned
+        naive = aggregate_over_window / 12
+        correct = sum(self.TREND) / len(self.TREND)
+        # Relative, not absolute: these are rates in the low percents, so an absolute
+        # gap looks tiny while the error is large. 1.72% against 2.42% is ~29% off.
+        assert abs(naive - correct) / correct > 0.20, (
+            f"fixture no longer demonstrates the bug: naive={naive:.4f} "
+            f"correct={correct:.4f}"
+        )
+
+        check = baseline_representativeness(self.MAY, self.TREND)
+        assert check.trend_per_month == pytest.approx(correct, abs=1e-6)
+        assert not check.representative
+
+    def test_a_single_trend_month_yields_no_verdict(self) -> None:
+        """One month is not a trend; a verdict from it would be noise."""
+        assert baseline_representativeness(self.MAY, [0.02]) is None
+
+    def test_an_empty_or_zero_trend_yields_no_verdict(self) -> None:
+        """
+        None, not representative=True. "Could not tell" and "was typical" read
+        identically in an answer and only one is honest.
+        """
+        assert baseline_representativeness(self.MAY, []) is None
+        assert baseline_representativeness(self.MAY, [0.0, 0.0]) is None
+
+    def test_nones_in_the_series_are_dropped(self) -> None:
+        check = baseline_representativeness(self.MAY, [0.03, None, 0.03])
+        assert check is not None and check.trend_months == 2
+
+    def test_it_flags_an_unusually_HIGH_baseline_too(self) -> None:
+        """Comparing against a peak understates a real rise just as badly."""
+        check = baseline_representativeness(0.05, self.TREND)
+        assert not check.representative and check.direction == "above"
+
+    def test_target_is_optional(self) -> None:
+        check = baseline_representativeness(self.MAY, self.TREND)
+        assert check is not None and check.trend_relative_gap is None
+
 class TestBroadBasedVerdict:
     """
     "Spread across every axis" is itself a finding, and saying it beats listing the
@@ -412,6 +492,44 @@ class TestRanking:
         )
         ranked = rank_hypotheses([strong_association, weak_contribution])
         assert ranked[0].confidence == "contribution"
+
+    def test_a_complete_tie_resolves_deterministically(self) -> None:
+        """
+        ltv's three axes tie exactly on (contribution, partial, 100%). Without a final
+        tie-break the order fell through to input order, which depends on raw floats
+        that are not bit-reproducible - DuckDB aggregates in parallel and float
+        addition is not associative. Three consecutive runs of the same live question
+        ranked them three different ways, which a user re-asking would see.
+        """
+        tied = [
+            build_hypothesis(decompose(
+                dim, target=[b("a", 0.0), b("b", 50.0)],
+                comparison=[b("a", 50.0), b("b", 50.0)]))
+            for dim in ("plan_type", "country", "acquisition_channel")
+        ]
+        assert len({h.explained_share for h in tied}) == 1, "fixture is not tied"
+
+        import random
+
+        for _ in range(5):
+            shuffled = tied[:]
+            random.shuffle(shuffled)
+            assert [h.dimension for h in rank_hypotheses(shuffled)] == [
+                "acquisition_channel", "country", "plan_type"
+            ]
+
+    def test_a_near_tie_is_treated_as_tied(self) -> None:
+        """
+        Shares equal to any meaningful precision must not be separated by float noise
+        in the 12th decimal place, or the ordering is unstable again.
+        """
+        from core.diagnostics.state import Hypothesis as H
+
+        a = H(dimension="zzz", statement="", confidence="contribution",
+              verdict="partial", explained_share=1.0)
+        bb = H(dimension="aaa", statement="", confidence="contribution",
+               verdict="partial", explained_share=1.0 + 1e-12)
+        assert [h.dimension for h in rank_hypotheses([a, bb])] == ["aaa", "zzz"]
 
     def test_ruled_out_sorts_last_but_is_not_dropped(self) -> None:
         explains = build_hypothesis(

@@ -155,16 +155,45 @@ class TestDriverGraphNamesAreReal:
         unknown = sorted(set(graph["metrics"]) - user_facing)
         assert not unknown, f"not user-facing metrics: {unknown}"
 
-    def test_every_driver_and_quality_signal_is_a_user_facing_metric(
-        self, graph: dict, user_facing: set[str]
+    def test_every_driver_and_quality_signal_is_a_certified_metric(
+        self, graph: dict, registry_all: set[str]
     ) -> None:
+        """
+        CERTIFIED, not user-facing. The planner reads this file rather than the
+        user-facing metric list, so an internal-but-certified metric is a legitimate
+        driver — the same reasoning that already licenses `weight_metric` pointing at
+        `monthly_subscriber_base`.
+
+        `total_payments` is the case that forced this distinction: it is the
+        denominator of payment_failure_rate and hidden from the LLM (nobody asks "how
+        many payment attempts were there"), but probing it is exactly how you tell a
+        rising failure RATE from falling attempt VOLUME.
+
+        The guard that matters is unchanged: the name must exist in the registry, or
+        the probe is rejected mid-run and the diagnosis loses a slot.
+        """
         offences: list[str] = []
         for name, entry in graph["metrics"].items():
             for field in ("drivers", "quality_signals"):
                 for referenced in entry.get(field) or []:
-                    if referenced not in user_facing:
+                    if referenced not in registry_all:
                         offences.append(f"{name}.{field} -> {referenced}")
-        assert not offences, "unknown metrics referenced: " + "; ".join(offences)
+        assert not offences, "metrics not in the registry: " + "; ".join(offences)
+
+    def test_a_quality_signal_is_never_internal(
+        self, graph: dict, user_facing: set[str]
+    ) -> None:
+        """
+        Drivers may be internal because they are probed for arithmetic. A quality
+        SIGNAL is different: it is reported to a human as an association, so naming
+        one the user can never look up is a dead end in the answer.
+        """
+        for name, entry in graph["metrics"].items():
+            for referenced in entry.get("quality_signals") or []:
+                assert referenced in user_facing, (
+                    f"{name}.quality_signals -> {referenced} is internal; a signal "
+                    "shown to a reader must be a metric they can query"
+                )
 
     def test_every_user_facing_metric_has_an_entry(
         self, graph: dict, user_facing: set[str]

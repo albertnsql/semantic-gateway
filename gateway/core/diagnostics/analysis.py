@@ -39,6 +39,7 @@ lists `total_subscribers` among its drivers.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 from core.diagnostics.state import (
@@ -359,6 +360,90 @@ def build_hypothesis(
 DEFAULT_DOMINANT_SHARE = 0.50
 
 
+#: A comparison window this far from recent trend is not a fair baseline. 20% is a
+#: judgment call, calibrated so the May-2026 case (-41%) is flagged and ordinary
+#: month-to-month wobble is not.
+DEFAULT_BASELINE_TOLERANCE = 0.20
+
+
+@dataclass(frozen=True)
+class BaselineCheck:
+    """
+    Whether the comparison window was typical of recent history.
+
+    A gap is only as meaningful as what it is measured against, and the default
+    previous-period comparison has no idea whether that period was normal.
+
+    The case this exists for: a live churn diagnosis reported **+163.7%** for June
+    2026 against May. Both figures were correct — but May was **41% below** the
+    trailing 12-month average, so the comparison maximised the apparent jump. Against
+    trend, June is **+55%**. The answer was not wrong; it was missing the one fact a
+    reader needed to size it.
+
+    Swapping the default baseline for year-over-year would not fix this — it would
+    just move the arbitrariness, and on a growing business YoY shows growth for
+    everything. Making the baseline's representativeness visible is the honest fix,
+    and it costs one extra probe.
+    """
+
+    comparison_per_month: float
+    trend_per_month: float
+    trend_months: int
+    deviation: float          # signed: comparison vs trend, as a fraction
+    representative: bool
+    trend_relative_gap: float | None = None   # target vs trend, when computable
+
+    @property
+    def direction(self) -> str:
+        return "below" if self.deviation < 0 else "above"
+
+
+def baseline_representativeness(
+    comparison_value: float,
+    trend_monthly: Sequence[float],
+    target_value: float | None = None,
+    tolerance: float = DEFAULT_BASELINE_TOLERANCE,
+) -> BaselineCheck | None:
+    """
+    Judge a SINGLE-MONTH baseline against the mean of a per-month trend series.
+
+    Takes the trend as a list of monthly values rather than one aggregate, because
+    aggregating a ratio over a long window does not give a rate. churn_rate over
+    2025-06..2026-05 returns 0.206 — the share of all subscribers who churned that
+    year, since the denominator is a distinct count over the whole window. Dividing
+    by 12 produced 1.72% against a true monthly mean of 2.61%, and the check called a
+    41%-below-average baseline "representative". Averaging monthly values is right for
+    both a ratio and a sum, so it needs no per-metric special-casing.
+
+    Deliberately scoped to a one-month comparison. That is where the problem bites —
+    a 6-month baseline is already averaged — and it keeps the arithmetic exactly
+    correct instead of approximately correct over an arbitrary span. Returns None
+    otherwise, and None when the series is empty or its mean is zero: "could not tell"
+    must not render as "was typical".
+    """
+    values = [v for v in trend_monthly if v is not None]
+    if len(values) < 2:
+        return None
+
+    trend_per_month = sum(values) / len(values)
+    if not trend_per_month:
+        return None
+
+    deviation = (comparison_value - trend_per_month) / abs(trend_per_month)
+    trend_relative = None
+    if target_value is not None:
+        trend_relative = (target_value - trend_per_month) / abs(trend_per_month)
+
+    return BaselineCheck(
+        comparison_per_month=comparison_value,
+        trend_per_month=trend_per_month,
+        trend_months=len(values),
+        deviation=deviation,
+        representative=abs(deviation) <= tolerance,
+        trend_relative_gap=trend_relative,
+    )
+
+
 def is_broad_based(
     hypotheses: Sequence[Hypothesis],
     *,
@@ -430,7 +515,17 @@ def rank_hypotheses(hypotheses: Iterable[Hypothesis]) -> list[Hypothesis]:
         key=lambda h: (
             tier.get(h.confidence, 9),
             strength.get(h.verdict, 9),
-            -abs(h.explained_share),
+            # Rounded before comparing, so shares that are equal to any meaningful
+            # precision are treated as tied and fall through to the name.
+            -round(abs(h.explained_share), 6),
+            # Final tie-break on the NAME, and it is load-bearing rather than tidy.
+            # ltv's three axes tie exactly on (contribution, partial, 100%), so the
+            # order fell through to input order, which depends on raw floats that are
+            # not bit-reproducible: DuckDB aggregates in parallel and float addition
+            # is not associative. Three consecutive runs of the same question ranked
+            # them three different ways. That is visible to a user re-asking the same
+            # question, not merely to a snapshot test.
+            h.dimension,
         ),
     )
 

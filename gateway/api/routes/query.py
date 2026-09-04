@@ -598,6 +598,28 @@ async def submit_query(
 
     logger.info("[%s] Query type: %s", request_id, intent.query_type)
 
+    # A filter value outside the dimension's actual values matches zero rows and
+    # returns status=success -- the failure `core/dimension_values.py` exists to
+    # prevent. The prompt now lists the allowed values, so this should be rare;
+    # logged rather than rejected until we can see how often the model still slips,
+    # because rejecting on an incomplete value list would break working queries.
+    if intent.filters:
+        try:
+            from core.dimension_values import unknown_filter_values
+
+            _unknown = unknown_filter_values(
+                intent.filters, getattr(request.app.state, "dimension_values", {})
+            )
+            if _unknown:
+                logger.warning(
+                    "[%s] filter value(s) not present in the warehouse: %s "
+                    "- this query will match zero rows",
+                    request_id,
+                    "; ".join(f"{col}={val!r}" for col, val in _unknown),
+                )
+        except Exception:
+            pass
+
     # ── Stage 1.25: Route on query_type (extracted in the same LLM call) ──────
     if intent.query_type == "schema_question":
         message = await anyio.to_thread.run_sync(

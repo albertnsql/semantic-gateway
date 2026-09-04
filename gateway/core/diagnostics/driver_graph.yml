@@ -44,9 +44,12 @@
 #      bridge, 10 in the catalog); only the join between them fails. This is one of
 #      the five known-failing `content_id` relationships tests.
 #
-#      Not worth repairing: only 8.5% of session rows resolve to dim_content at all,
-#      so sourcing genre from the catalog's own populated `genre` column would move
-#      it from 100% null to 91.5% null -- worse, because it would look like it works.
+#      RESOLVED 2026-08-31. That reasoning was half right: dim_content alone reaches
+#      only 8.5% of sessions, but the BRIDGE reaches 91.0%, and the two id spaces are
+#      disjoint -- so coalescing both is lossless. fct_stream_sessions now reads
+#      `coalesce(bridge.genre, catalog.genre, 'unknown')` and content_primary_genre is
+#      100% populated, of which 99.55% is a real genre. It is back in decompose_by for
+#      the six session metrics and verified populated by the audit.
 #
 #      Every other dimension used below came back populated. churn_reason reads
 #      71-78% null, which is correct -- only churned subscribers have one -- and the
@@ -65,6 +68,9 @@
 #
 # FIELDS
 #   decompose_by      slice the metric by these to find where a gap concentrates
+#   decompose_first   this metric's OWN priority axes, ahead of the global
+#                     preferred_decomposition_order. Must also appear in
+#                     decompose_by, which stays the only gate on what can be asked.
 #   drivers           other metrics that MECHANICALLY move this one (contribution)
 #   weight_metric     probe this to WEIGHT a mix-vs-rate decomposition (see below)
 #   numerator_metric  the other half of a ratio, so both sides get probed
@@ -129,25 +135,28 @@ metrics:
     label: Total Revenue
     measures: total_revenue_usd on sem_payments
     decompose_by: [country, plan_type, payment_method, is_renewal, currency, acquisition_channel, age_group, cohort_month, subscription_status]
-    drivers: [total_subscribers, mrr, expansion_mrr, churn_rate]
+    drivers: [payment_failure_rate, total_subscribers, mrr, expansion_mrr, churn_rate]
     identities:
       - "total_revenue ~= paying_subscribers * arpu"
       - "revenue_gap = mix_shift(plan_type) + rate_change_within_plan"
     quality_signals: []
     cautions:
-      # The single most useful probe for a country-shaped revenue gap, and it is
-      # not currently queryable: sem_payments declares a `failed_payment_count`
-      # MEASURE but no metric wraps it, so the semantic layer cannot answer
-      # "are payments failing more in DE". payment_method is the closest proxy
-      # available — a market shifting toward a rail with worse auth rates shows
-      # up there. Promoting failed_payment_count to a metric is the highest-value
-      # item on the phase 5 list.
-      - "No failed-payment metric exists. Use payment_method as a proxy and say so."
+      # Resolved 2026-08-28: payment_failure_rate now exists, so this no longer needs
+      # a payment_method proxy. It is listed first among the drivers because a
+      # revenue shortfall isolated to one country is more often a payments problem
+      # than a demand one, and the rates discriminate (DE 5.1% vs GB 4.0% in 2026).
+      - "Probe payment_failure_rate before demand-side dimensions for a country-shaped gap."
       - "is_renewal separates new business from recurring; a gap in one is a very different story from a gap in the other."
 
   mrr:
     label: Monthly Recurring Revenue
     measures: mrr_usd on sem_mrr
+    # The caution below says "probe mrr_type FIRST" and the planner did not, because
+    # the global preferred order puts plan_type / country / acquisition_channel ahead
+    # of it. Found by audit_diagnoses.py on its first run. mrr_type attributes the
+    # movement to new / expansion / contraction / churned BY CONSTRUCTION, which no
+    # segment breakdown can do.
+    decompose_first: [mrr_type]
     decompose_by: [plan_type, billing_cycle, mrr_type, country, acquisition_channel, age_group, cohort_month, subscription_status]
     drivers: [total_subscribers, expansion_mrr, churn_rate, net_mrr_growth]
     identities:
@@ -206,6 +215,36 @@ metrics:
       # why payment_method and currency are absent here but present on
       # total_revenue. See _CROSS_MODEL_RATIOS in metric_registry.py.
       - "Cannot be sliced by payment-side dimensions. Decompose total_revenue instead when the question is about payments."
+
+  payment_failure_rate:
+    label: Payment Failure Rate
+    measures: ratio, failed_payments / total_payments
+    weight_metric: total_payments
+    numerator_metric: failed_payments
+    # failure_reason leads deliberately: it separates a card-quality problem
+    # (invalid_card, card_expired) from a bank or risk one (bank_declined,
+    # fraud_detected), which is the split that decides who fixes it. Listing it
+    # first in decompose_by is NOT enough - the global preferred order would still
+    # put plan_type ahead of it, which a live run did.
+    decompose_first: [failure_reason, payment_method]
+    decompose_by: [failure_reason, payment_method, country, currency, plan_type, is_renewal, acquisition_channel, cohort_month]
+    drivers: [failed_payments, total_payments]
+    identities:
+      - "payment_failure_rate = failed_payments / total_payments"
+    quality_signals: []
+    cautions:
+      - "A failure rate can rise because attempts FELL. Probe total_payments alongside."
+      - "currency and country move together for most subscribers, so treat them as one finding rather than two."
+
+  failed_payments:
+    label: Failed Payments
+    measures: failed_payment_count on sem_payments
+    decompose_by: [failure_reason, payment_method, country, currency, plan_type, is_renewal, cohort_month]
+    drivers: [total_payments]
+    identities: []
+    quality_signals: []
+    cautions:
+      - "A volume count: it rises with payment volume. Prefer payment_failure_rate when comparing segments of different sizes."
 
   # ── Subscribers and churn ───────────────────────────────────────────────────
 
@@ -269,7 +308,8 @@ metrics:
     label: Engagement Rate
     measures: avg_completion_pct on sem_stream_sessions
     weight_metric: total_sessions
-    decompose_by: [device_type, quality_streamed, referral_source, watch_quality_tier, country, plan_type, is_completed, cohort_month]
+    decompose_first: [device_type, content_primary_genre, quality_streamed]
+    decompose_by: [content_primary_genre, device_type, quality_streamed, referral_source, watch_quality_tier, country, plan_type, is_completed, cohort_month]
     drivers: [avg_watch_time, total_sessions]
     identities: []
     quality_signals: [avg_buffering_events, total_buffering_events]
@@ -281,7 +321,8 @@ metrics:
     measures: avg_watch_time on sem_stream_sessions
     weight_metric: total_sessions
     numerator_metric: total_watch_time
-    decompose_by: [device_type, quality_streamed, referral_source, watch_quality_tier, country, plan_type, cohort_month]
+    decompose_first: [content_primary_genre, device_type, quality_streamed]
+    decompose_by: [content_primary_genre, device_type, quality_streamed, referral_source, watch_quality_tier, country, plan_type, cohort_month]
     drivers: [total_sessions, total_watch_time]
     identities:
       - "avg_watch_time = total_watch_time / total_sessions"
@@ -291,7 +332,8 @@ metrics:
   total_watch_time:
     label: Total Watch Time
     measures: total_watch_minutes on sem_stream_sessions
-    decompose_by: [device_type, quality_streamed, referral_source, country, plan_type, cohort_month]
+    decompose_first: [content_primary_genre, device_type, quality_streamed]
+    decompose_by: [content_primary_genre, device_type, quality_streamed, referral_source, country, plan_type, cohort_month]
     drivers: [total_sessions, avg_watch_time, total_subscribers]
     identities:
       - "total_watch_time = total_sessions * avg_watch_time"
@@ -302,7 +344,8 @@ metrics:
   total_sessions:
     label: Total Sessions
     measures: total_sessions on sem_stream_sessions
-    decompose_by: [device_type, referral_source, quality_streamed, country, plan_type, cohort_month]
+    decompose_first: [content_primary_genre, device_type, referral_source]
+    decompose_by: [content_primary_genre, device_type, referral_source, quality_streamed, country, plan_type, cohort_month]
     drivers: [total_subscribers]
     identities: []
     quality_signals: [avg_buffering_events]
@@ -314,6 +357,7 @@ metrics:
     measures: avg_buffering_events on sem_stream_sessions
     weight_metric: total_sessions
     numerator_metric: total_buffering_events
+    decompose_first: [device_type, quality_streamed]
     decompose_by: [device_type, quality_streamed, watch_quality_tier, country, plan_type]
     drivers: [total_buffering_events, total_sessions]
     identities:
@@ -327,6 +371,7 @@ metrics:
   total_buffering_events:
     label: Total Buffering Events
     measures: total_buffering_events on sem_stream_sessions
+    decompose_first: [device_type, quality_streamed]
     decompose_by: [device_type, quality_streamed, watch_quality_tier, country]
     drivers: [total_sessions, avg_buffering_events]
     identities: []

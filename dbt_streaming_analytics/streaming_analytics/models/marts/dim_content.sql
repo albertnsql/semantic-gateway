@@ -11,18 +11,18 @@ engagement as (
     select * from {{ ref('int_content_engagement') }}
 ),
 
-genres as (
-    select content_id, genre as primary_genre
-    from {{ ref('stg_content_genre_bridge') }}
-    where is_primary = true
-),
-
 final as (
     select
         c.content_id,
         c.title,
         c.content_type,
-        g.primary_genre,
+        -- From the catalog, which is this model's OWN spine. It previously came
+        -- from stg_content_genre_bridge, LEFT JOINed on content_id -- but the bridge
+        -- and the catalog were generated a month apart with fresh uuid4s and share
+        -- ZERO content ids, so the join matched nothing and primary_genre was null
+        -- for all 2,500 rows. stg_content_catalog.genre sits on the same row, is 0%
+        -- null, and carries the identical 10-value vocabulary.
+        c.genre as primary_genre,
         c.subgenre,
         c.is_original,
         c.maturity_rating,
@@ -35,7 +35,6 @@ final as (
         c.date_added_platform
     from content c
     left join engagement e on c.content_id = e.content_id
-    left join genres g on c.content_id = g.content_id
 )
 
 select * from final

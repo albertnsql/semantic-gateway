@@ -40,6 +40,12 @@ class ValidationResult(BaseModel):
     suggested_fix: str | None
 
 
+# MetricFlow's synthetic dimensions. Not columns on any semantic model, so they are
+# never in certified_dimensions, but always resolvable for a metric with an
+# agg_time_dimension. Mirrors _RESERVED_DIM_PREFIXES in sql_generator.
+_RESERVED_DIM_PREFIXES: frozenset[str] = frozenset({"metric_time"})
+
+
 class SemanticValidator:
     """
     Governance core.  Every QueryIntent passes through ``validate()`` before
@@ -181,6 +187,21 @@ class SemanticValidator:
         violations: list[ViolationDetail] = []
 
         for dim in intent.dimensions:
+            # `metric_time` is MetricFlow's SYNTHETIC time dimension, not a column on
+            # any semantic model, so it can never appear in certified_dimensions and
+            # this check rejected it as uncertified. `require_metric_time()` works
+            # around that by injecting it AFTER validation, inside
+            # SQLGenerator.generate() - which is why the gap went unnoticed until a
+            # caller put it in the intent directly (the diagnostic trend probe, which
+            # needs a per-month series).
+            #
+            # It is always valid for a metric whose measure declares an
+            # agg_time_dimension, which every certified metric here does.
+            # sql_generator._RESERVED_DIM_PREFIXES holds the same rule for
+            # correct_dimension_entity().
+            if dim.split("__", 1)[0] in _RESERVED_DIM_PREFIXES:
+                continue
+
             bare_dim = self._get_bare_dimension(dim)
             certified_for_any = False
             

@@ -47,11 +47,17 @@ artifacts:
     relative: current_month_onward
     metrics: [churn_rate, retention_rate, mrr, total_subscribers, expansion_mrr, net_mrr_growth]
     severity: high
+    # Deliberately NOT naming the affected month. It moves: the newest period was
+    # 2026-09 on 2026-08-28 and is 2026-10 on 2026-08-31, because the spine tracks
+    # current_date(). A month named here reads as authoritative and goes stale
+    # silently. `relative: current_month_onward` is what selects the window, so the
+    # prose only has to explain the mechanism.
     summary: >
       This window reaches the end of fct_mrr_monthly, where the date spine runs
-      AHEAD of the calendar: on 2026-08-28 the newest period was 2026-09, holding 531
-      rows of which all 531 were churned - a 100% churn rate against no active
-      subscribers at all.
+      AHEAD of the calendar. Cancellations carry a +1 month offset while the spine
+      is driven by current_date(), so the newest period holds only churn rows -
+      most recently 531 of them, against zero active subscribers, giving a 100%
+      churn rate that describes the spine rather than the business.
     guidance: >
       A churn spike or subscriber collapse in the newest period is an artefact of the
       date spine, not behaviour. Re-run ending at the last complete month.
@@ -115,6 +121,12 @@ artifacts:
     metrics: [total_sessions, total_watch_time, avg_watch_time, engagement_rate,
               avg_buffering_events, total_buffering_events]
     severity: medium
+    # Verified 2026-08-31: fct_stream_sessions now coalesces the bridge and the
+    # catalog, so content_primary_genre is 100% populated (99.55% a real genre,
+    # 0.45% 'unknown'). The underlying id spaces are still disjoint -- title,
+    # content_type and maturity_rating remain reachable for only 8.5% of sessions --
+    # but genre, the only content attribute the semantic layer exposes, is fixed.
+    verified_clean: "2026-08-31"
     summary: >
       Content attributes are unavailable for session metrics: the content catalogue
       and the genre bridge share no content ids, so genre is null for every session
