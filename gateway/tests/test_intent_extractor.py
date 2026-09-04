@@ -498,3 +498,102 @@ class TestBuildSystemPrompt:
         prompt = extractor.build_system_prompt(AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
         assert "churned_subscribers" in prompt
         assert "how many" in prompt.lower()
+
+
+class TestPromptDoesNotShipRegistryInternals:
+    """
+    The prompt used to carry every field of every MetricDefinition, because
+    `metrics_section` was `f"  - {m}"` on the object itself — a pydantic repr, not
+    a chosen serialisation. That shipped each metric's `raw_yaml` (its raw dbt
+    source, 6,010 chars) and `lineage` (its raw->stg->int->mart chain, 5,770) on
+    EVERY request: 11,780 chars, 27% of the prompt, none of it useful for choosing
+    between two metrics. Lineage is Stage 7 response metadata that leaked into the
+    Stage 1 prompt.
+
+    It surfaced as a provider failure, not as a cost problem — Groq's free tier
+    caps a request at 8,000 tokens and the prompt needed ~11,150, so the whole
+    fallback rung was structurally unusable.
+
+    These tests exist because the way those fields got in was an accident of
+    string interpolation, so the same slip would reintroduce all of them at once.
+    """
+
+    def _metric_objects(self):
+        """MetricDefinition-shaped objects, as the route passes them."""
+        return [
+            SimpleNamespace(
+                name=name,
+                label=f"{name.title()} Label",
+                description=f"Description of {name}.",
+                metric_type="ratio",
+                raw_yaml="name: " + name + "\nlabel: should never reach the prompt\n",
+                lineage=["raw.subscribers", "stg_subscribers", "fct_mrr_monthly"],
+                source_model="fct_mrr_monthly",
+                measure_column="mrr_usd",
+                fanout_risk_models=["int_subscription_periods"],
+            )
+            for name in AVAILABLE_METRICS
+        ]
+
+    def test_raw_yaml_and_lineage_never_reach_the_prompt(self) -> None:
+        prompt = _make_extractor().build_system_prompt(
+            self._metric_objects(), AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS
+        )
+        assert "should never reach the prompt" not in prompt, "raw_yaml leaked"
+        assert "raw_yaml=" not in prompt
+        assert "lineage=" not in prompt
+        assert "stg_subscribers" not in prompt, "lineage chain leaked"
+        assert "fanout_risk_models=" not in prompt
+        assert "measure_column=" not in prompt
+
+    def test_what_the_model_needs_is_still_there(self) -> None:
+        """Trimming must not cost the fields that drive metric selection."""
+        prompt = _make_extractor().build_system_prompt(
+            self._metric_objects(), AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS
+        )
+        for name in AVAILABLE_METRICS:
+            assert name in prompt
+            assert f"Description of {name}." in prompt, f"{name} lost its description"
+
+    def test_object_and_string_callers_both_get_dimensions_and_grains(self) -> None:
+        """
+        The keying bug. `available_metrics` arrives as OBJECTS from the route and
+        as NAMES from the eval harness (run_evals.py:176), while the dimension and
+        grain maps are keyed by name. `if k in selected_metrics` therefore matched
+        0 of 23 keys on the route path, and the CERTIFIED DIMENSIONS MAP and TIME
+        GRANULARITIES sections rendered EMPTY in production.
+
+        Nothing failed loudly: the model still saw dimension names as a side
+        effect of the repr above, so it learned BARE names and never the qualified
+        `subscriber__country` form that build_dimension_prefix_map() produces and
+        the compiler resolves. Removing the repr without fixing this would have
+        left the route with no dimension vocabulary at all.
+        """
+        extractor = _make_extractor()
+        for label, metrics in (("objects", self._metric_objects()),
+                               ("strings", AVAILABLE_METRICS)):
+            prompt = extractor.build_system_prompt(
+                metrics, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS
+            )
+            assert "billing_cycle" in prompt, f"{label}: dimensions map is empty"
+            assert "quarter" in prompt, f"{label}: time granularities are empty"
+
+    def test_max_tokens_is_a_reservation_sized_to_the_real_output(self) -> None:
+        """
+        `max_tokens` is an output RESERVATION, and providers gate on it before
+        generating anything: OpenRouter refused a live request for "up to 1024
+        tokens" when it could afford 434, for an answer that needed ~145.
+        Measured completions are 141-148 tokens.
+        """
+        from core.intent_extractor import _INTENT_MAX_TOKENS
+
+        assert _INTENT_MAX_TOKENS >= 250, "too tight — would truncate the intent JSON"
+        assert _INTENT_MAX_TOKENS <= 512, "over-reserving is what triggered the 402"
+
+    def test_a_plain_string_caller_still_renders(self) -> None:
+        """Names-only callers must not crash on the attribute lookups."""
+        prompt = _make_extractor().build_system_prompt(
+            AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS
+        )
+        for name in AVAILABLE_METRICS:
+            assert name in prompt

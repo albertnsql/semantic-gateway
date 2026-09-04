@@ -49,6 +49,62 @@ else:
 logger = logging.getLogger(__name__)
 
 
+# Output ceiling for the intent-extraction call. Measured completions are 141-148
+# tokens, so this is roughly 2x headroom. It is NOT a limit on the question -- it is
+# a reservation the provider gates on before generating anything, which is how a
+# 12-token question ("What is the MRR by plan type for the last 3 months?") got
+# refused by OpenRouter for "requesting up to 1024 tokens".
+_INTENT_MAX_TOKENS: int = 300
+
+# Fields on MetricDefinition that must NEVER reach the prompt. `raw_yaml` is the
+# metric's raw dbt source and `lineage` its raw->stg->int->mart chain; together they
+# were 11,780 chars -- 27% of the whole prompt -- and neither helps a model choose
+# between two metrics. The rest are registry internals for the SQL layer.
+# tests/test_intent_extractor.py pins this, because the way they got in was an
+# accidental f"{metric_definition}" repr rather than a decision, and the same slip
+# would reintroduce all of them at once.
+_PROMPT_EXCLUDED_METRIC_FIELDS: frozenset[str] = frozenset({
+    "raw_yaml", "lineage", "source_model", "grain", "grain_columns",
+    "allowed_joins", "fanout_risk_models", "measure_column", "time_dimension",
+    "filter_expression", "certified_dimensions", "valid_time_grains",
+})
+
+
+def _metric_name(metric: object) -> str:
+    """Name of a metric given either a MetricDefinition or an already-plain string.
+
+    Callers are inconsistent: the route passes objects, tests and the RAG branch
+    pass names. Normalising here is what stops a name/object comparison from
+    silently matching nothing.
+    """
+    if isinstance(metric, str):
+        return metric
+    return str(getattr(metric, "name", metric))
+
+
+def _render_metric_for_prompt(metric: object, name: str) -> str:
+    """One compact line per metric: what is needed to CHOOSE it, nothing else.
+
+    `certified_dimensions` and `valid_time_grains` are deliberately excluded even
+    though the model needs both -- they are rendered by the dedicated DIMENSIONS MAP
+    and TIME GRANULARITIES sections, and the map is where
+    build_dimension_prefix_map() converts a bare `country` into the qualified
+    `subscriber__country` the compiler actually resolves. Duplicating them here
+    would re-teach the bare form and undo that.
+    """
+    if isinstance(metric, str):
+        return f"  - {metric}"
+    label = getattr(metric, "label", None) or ""
+    mtype = getattr(metric, "metric_type", None) or ""
+    desc = getattr(metric, "description", None) or ""
+    head = f"  - {name}"
+    if label and label != name:
+        head += f" ({label})"
+    if mtype:
+        head += f" [{mtype}]"
+    return f"{head}: {desc}".rstrip().rstrip(":")
+
+
 # Physical time columns behind the semantic layer's time dimensions. A filter on any
 # of these duplicates `time_range` — see the guard in :meth:`IntentExtractor.extract`.
 _TIME_DIMENSION_COLUMNS: frozenset[str] = frozenset({
@@ -328,7 +384,12 @@ class IntentExtractor:
                     model=self._primary_model,
                     messages=messages,  # type: ignore[arg-type]
                     temperature=0.0,
-                    max_tokens=1024,
+                    # The intent JSON measures 141-148 tokens in practice; 300 is
+                    # ~2x headroom. 1024 was never a size, it was a RESERVATION, and
+                    # providers gate on it: OpenRouter refused a live request with
+                    # "requested up to 1024 tokens, but can only afford 434" while
+                    # the answer it would have produced needed ~145.
+                    max_tokens=_INTENT_MAX_TOKENS,
                     response_format={"type": "json_object"},
                 )
             except Exception as exc:
@@ -342,7 +403,12 @@ class IntentExtractor:
                     model=self._fallback_model,
                     messages=messages,  # type: ignore[arg-type]
                     temperature=0.0,
-                    max_tokens=1024,
+                    # The intent JSON measures 141-148 tokens in practice; 300 is
+                    # ~2x headroom. 1024 was never a size, it was a RESERVATION, and
+                    # providers gate on it: OpenRouter refused a live request with
+                    # "requested up to 1024 tokens, but can only afford 434" while
+                    # the answer it would have produced needed ~145.
+                    max_tokens=_INTENT_MAX_TOKENS,
                     response_format={"type": "json_object"},
                 )
             except Exception as exc:
@@ -356,7 +422,12 @@ class IntentExtractor:
                     model=self._tertiary_model,
                     messages=messages,  # type: ignore[arg-type]
                     temperature=0.0,
-                    max_tokens=1024,
+                    # The intent JSON measures 141-148 tokens in practice; 300 is
+                    # ~2x headroom. 1024 was never a size, it was a RESERVATION, and
+                    # providers gate on it: OpenRouter refused a live request with
+                    # "requested up to 1024 tokens, but can only afford 434" while
+                    # the answer it would have produced needed ~145.
+                    max_tokens=_INTENT_MAX_TOKENS,
                     response_format={"type": "json_object"},
                 )
             except Exception as exc:
@@ -518,12 +589,33 @@ class IntentExtractor:
         else:
             selected_metrics = available_metrics
 
-        # Build prompt sections from selected (possibly RAG-filtered) metrics
-        filtered_dims = {k: v for k, v in available_dimensions.items() if k in selected_metrics}
-        filtered_grains = {k: v for k, v in available_time_grains.items() if k in selected_metrics}
+        # `available_metrics` arrives as MetricDefinition OBJECTS (the route passes
+        # registry.list_user_facing_metrics()) while `available_dimensions` and
+        # `available_time_grains` are keyed by metric NAME. Comparing the two
+        # directly matched 0 of 23 keys, so filtered_dims and filtered_grains were
+        # both silently EMPTY and the "CERTIFIED DIMENSIONS MAP" and "TIME
+        # GRANULARITIES CONSTRAINTS" sections rendered blank. Nothing failed: the
+        # model still saw dimension names, but only as a side effect of the
+        # full-object repr below -- which taught it BARE names and never the
+        # prefixed ones dims_section builds via build_dimension_prefix_map(). That
+        # is the likely origin of invented prefixes such as `session__country`.
+        # Normalise to names so both shapes work and neither section can silently
+        # empty again.
+        selected_names = [_metric_name(m) for m in selected_metrics]
+        metric_objects = {_metric_name(m): m for m in selected_metrics}
 
+        filtered_dims = {k: v for k, v in available_dimensions.items() if k in selected_names}
+        filtered_grains = {k: v for k, v in available_time_grains.items() if k in selected_names}
+
+        # Render only what CHOOSING a metric requires. This used to be f"  - {m}"
+        # on the MetricDefinition itself, i.e. a pydantic repr, so every request
+        # shipped each metric's `raw_yaml` (6,010 chars) and `lineage` (5,770) --
+        # the raw dbt source and the raw->stg->int->mart chain. Neither helps pick
+        # between `mrr` and `net_mrr_growth`, and lineage is Stage 7 response
+        # metadata that leaked into the Stage 1 prompt. Nobody chose to send them;
+        # the object was simply interpolated into a string.
         metrics_section = "\n".join(
-            f"  - {m}" for m in selected_metrics
+            _render_metric_for_prompt(metric_objects[n], n) for n in selected_names
         )
 
         from core.dimension_values import format_for_prompt
@@ -535,6 +627,19 @@ class IntentExtractor:
         from core.sql_generator import build_dimension_prefix_map
         dim_map_dynamic = build_dimension_prefix_map()
 
+        # QUALIFIED names via dim_map_dynamic (`country` -> `subscriber__country`),
+        # exactly as the original code did. I changed this to bare names on the
+        # theory that qualified names caused `multi-metric-001` to hedge with
+        # needs_clarification, then measured it properly: the real cause was my
+        # rewording of grains_section, and bare names cost BOTH `clarification`
+        # cases (0/2 bare vs 2/2 qualified, three runs each -- consistent, not
+        # noise). So the prefix rewrite CLAUDE.md describes as "the LLM's
+        # vocabulary" is correct and stays.
+        #
+        # Note this section was live for the eval harness all along (it passes
+        # metric NAMES) and dead for the route (which passes MetricDefinition
+        # OBJECTS -- see the keying fix above). So production has been running
+        # without it, and fixing the keying is what finally applies it there.
         dims_section = "\n".join(
             f"  {metric}:\n" + "\n".join(f"    - {dim_map_dynamic.get(metric, {}).get(d, d)}" for d in dims)
             for metric, dims in filtered_dims.items()
@@ -561,6 +666,19 @@ class IntentExtractor:
 }
 """
 
+        # Wording left EXACTLY as it was, deliberately. I rewrote this into a
+        # compact form (state the rule once, then one line per metric) and it cost
+        # `multi-metric-001` -- the model began setting needs_clarification=true on
+        # "MRR and churn rate by country for last quarter" even though `quarter` is
+        # a valid grain for both metrics. Reverting the wording fixed it.
+        #
+        # Worth knowing WHY that was measurable at all: callers disagree about this
+        # argument's type. The eval harness passes metric NAMES (run_evals.py:176,
+        # matching this method's `list[str]` annotation) so it always reached this
+        # loop, while the route passes MetricDefinition OBJECTS and so never did.
+        # The route path was therefore running with no granularity constraints at
+        # all, and the evals were the only thing exercising this text. Compacting
+        # it looked free and was not.
         grains_instructions = []
         for metric, time_dims in filtered_grains.items():
             for d, grains in time_dims.items():
