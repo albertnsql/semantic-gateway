@@ -233,7 +233,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         os.path.isdir(_chroma_dir)
         and any(True for _ in os.scandir(_chroma_dir))
     )
-    if os.getenv("DISABLE_RAG", "false").lower() == "true":
+    if settings.disable_rag:
         logger.info("✓ RAG disabled via environment variable. Falling back to full metric injection (uses less RAM).")
     elif _chroma_populated:
         try:

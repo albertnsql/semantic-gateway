@@ -710,3 +710,41 @@ class TestPrimaryRungSurvivesATransientFailure:
         assert extractor._primary_client.chat.completions.create.call_count == 1, (
             "a 404 was retried — that wastes the timeout budget for an identical result"
         )
+
+
+class TestOneObjectNotAnArray:
+    """
+    `multi-metric-001` ("Show me MRR and churn rate by country for last quarter")
+    failed persistently, and the reported error was a red herring:
+
+        LLM returned non-JSON response: Unterminated string ... (char 750)
+
+    That reads like a truncation / max_tokens problem. It was not. The model was
+    answering a two-metric question with a JSON ARRAY of two objects, one per
+    metric, which is ~2x the length of the real schema and so ran into the output
+    ceiling. Gemini returns a steady 154 tokens for this query in the correct
+    single-object shape, measured five times.
+
+    The truncation was the visible symptom of a WRONG SHAPE, and the shape is the
+    dangerous half: an array that fits under the ceiling parses fine, and reading
+    the first element silently drops `churn_rate` — a confident wrong answer
+    instead of an error. Raising max_tokens would have hidden that.
+    """
+
+    def test_the_prompt_forbids_an_array_of_objects(self) -> None:
+        prompt = _make_extractor().build_system_prompt(
+            AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS
+        )
+        assert "never a JSON array" in prompt
+        assert "ONE JSON object" in prompt
+
+    def test_it_shows_the_multi_metric_shape_both_ways(self) -> None:
+        """
+        A bare prohibition is weaker than a contrasting pair: the model has to see
+        that two metrics go in one `metrics` list, not into two objects.
+        """
+        prompt = _make_extractor().build_system_prompt(
+            AVAILABLE_METRICS, AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS
+        )
+        assert '"metrics": ["mrr", "churn_rate"]' in prompt, "no correct example"
+        assert "one object per metric" in prompt, "no counter-example"

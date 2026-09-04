@@ -929,6 +929,15 @@ Never put a duration (e.g. "6 months") in aggregation_level.
 ## OUTPUT JSON SCHEMA:
 {schema}
 
+Return exactly ONE JSON object, never a JSON array and never several objects.
+A question naming SEVERAL metrics is still ONE object: put every metric in the
+`metrics` list and share the same dimensions, filters and time_range.
+
+CORRECT   for "MRR and churn rate by country for last quarter":
+  {{"metrics": ["mrr", "churn_rate"], "dimensions": ["country"], ...}}
+WRONG - never split one question into one object per metric:
+  [{{"metrics": ["mrr"], ...}}, {{"metrics": ["churn_rate"], ...}}]
+
 ## EXAMPLES:
 
 User: "What is the MRR by plan type for the last 3 months?"

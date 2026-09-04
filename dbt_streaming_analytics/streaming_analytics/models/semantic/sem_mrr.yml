@@ -54,9 +54,27 @@ semantic_models:
         agg: count_distinct
         agg_time_dimension: period_month
       - name: active_subscribers_count
+        # It previously claimed "This perfectly matches the dashboard subs_kpi."
+        # The FORMULA matches; the WINDOW does not, so the numbers do not either.
+        # Both compute COUNT(DISTINCT subscriber_id) WHERE is_active, but:
+        #   * this measure is a SNAPSHOT. fct_mrr_monthly holds one row per
+        #     subscriber per month, so it is only meaningful WITHIN a month.
+        #     `_SNAPSHOT_METRICS` in sql_generator.py defaults it to the latest
+        #     period when the caller gives no time range -- without that, a
+        #     rangeless query unions every period and counts everyone ever active.
+        #   * subs_kpi is a FLOW figure by design (its own docstring says so):
+        #     distinct subscribers active at ANY point from January through the
+        #     data anchor.
+        # Measured 2026-09-04: 11,934 point-in-time (2026-09) vs 13,709 flow
+        # (Jan-Aug 2026) vs 16,960 if every period is unioned. All three move with
+        # each monthly load, so treat them as illustration, not as fixtures.
+        # They answer different questions and are not expected to reconcile.
         description: >
-          Distinct subscribers who are currently active (is_active = TRUE). 
-          This perfectly matches the dashboard subs_kpi.
+          Distinct subscribers active (is_active = TRUE) within a period. A
+          point-in-time SNAPSHOT, not a cumulative total: meaningful within one
+          month and not additive across months. The dashboard subs_kpi uses the
+          same formula over a whole-year range and so reports a higher, flow-style
+          figure; the two are not interchangeable.
         expr: case when is_active = true then subscriber_id end
         agg: count_distinct
         agg_time_dimension: period_month

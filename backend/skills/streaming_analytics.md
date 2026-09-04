@@ -50,7 +50,11 @@ Only fall back to raw SQL if the requested metric is not in this list or if Metr
 ### fct_stream_sessions
 - **Grain:** One session per row
 - **Key dimensions:** `content_type`, `country`
-- **Important:** Use `AVG(watch_time_minutes)` — never SUM
+- **Important:** The duration column is `duration_minutes`. There is no
+  `watch_time_minutes` column — that name appears nowhere in the warehouse.
+  Use `AVG(duration_minutes)` for average watch time per session and
+  `SUM(duration_minutes)` for total watch time; both are legitimate, and the
+  question decides which.
 
 
 ### dim_content
@@ -64,7 +68,14 @@ Only fall back to raw SQL if the requested metric is not in this list or if Metr
 
 - **MRR fan-out:** Never join `fct_mrr_monthly` to `fct_stream_sessions` directly — they are at different grains and will produce row multiplication.
 - **MRR Aggregation:** MRR (Monthly Recurring Revenue) is a monthly snapshot metric. NEVER aggregate or sum it across multiple months. If a user asks for MRR over a multi-month period (e.g. "for the year 2026"), you MUST set `aggregation_level` to `"month"` so the semantic layer returns the trend, rather than summing it into a meaningless annual total.
-- **Watch time:** Always use `AVG(watch_time_minutes)` not `SUM(watch_time_minutes)` — summing sessions gives meaningless totals.
+- **Watch time — match the aggregation to the question, and mind the column name:**
+  the column is `duration_minutes` (`watch_time_minutes` does not exist). BOTH
+  aggregations are certified, so neither is banned:
+  `avg_watch_time` = `AVG(duration_minutes)` (average per session) and
+  `total_watch_time` = `SUM(duration_minutes)` (total minutes watched, the
+  `total_watch_minutes` measure on `sem_stream_sessions`). The trap is picking
+  the wrong one for the question, not SUM itself — an earlier version of this
+  file banned SUM outright, which contradicts a certified metric.
 - **Churn:** `churned_mrr` is already a signed negative value; do not negate it again or the sign will flip to positive.
 - **"Churn" means `churn_rate` — rate beats count:** A bare mention of churn ("show churn by plan type") ALWAYS resolves to `churn_rate`, never `churned_subscribers`. Use `churned_subscribers` only when the wording explicitly asks for a count ("how many churned", "number of churned subscribers"). The two live on different grains — `churn_rate` on `fct_mrr_monthly` filtered by `period_month`, `churned_subscribers` on the `dim_subscribers` snapshot filtered by `churn_date` — so their numbers do not reconcile, and a count-based breakdown ranks plans by population size rather than by churn severity (standard is the largest plan, so it wins on count while basic is worst on rate). The same rule applies to `retention_rate` vs any retained-subscriber count.
 - **Ratio building blocks are not answers:** `monthly_churned_subscribers` and `monthly_subscriber_base` exist only because MetricFlow requires a ratio's numerator and denominator to be metrics. Never select them for a user question — they are hidden from the certified list the extractor sees.
@@ -108,7 +119,7 @@ Join `fct_stream_sessions` to `dim_content` on `content_id`, then group by `cont
 ```sql
 SELECT
     dc.content_type,
-    AVG(fs.watch_time_minutes) AS avg_watch_time
+    AVG(fs.duration_minutes) AS avg_watch_time
 FROM fct_stream_sessions fs
 JOIN dim_content dc
     ON fs.content_id = dc.content_id

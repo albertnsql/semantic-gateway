@@ -181,7 +181,13 @@ Check that the following filters are present **only where they can be applied us
 - **DO NOT** apply `is_deleted = FALSE` to any table — no table in this schema has an `is_deleted` column
 
 ### 4. Wrong Aggregation
-- Check every aggregation function applied to `watch_time_minutes` or `duration_minutes` — it must be `AVG`, never `SUM`.
+- `watch_time_minutes` is NOT a column in this schema — the duration column is
+  `duration_minutes`. Flag any reference to `watch_time_minutes` as invalid SQL.
+- Do NOT flag `SUM(duration_minutes)`. Both aggregations are certified:
+  `avg_watch_time` averages it, `total_watch_time` sums it (via the
+  `total_watch_minutes` measure). An earlier version of this rule demanded `AVG`
+  and `never SUM`, which would reject correct SQL for `total_watch_time`. Judge
+  whether the aggregation matches the metric being asked for, not the column.
 - Check `churned_mrr` — it is already negative; if it is negated with a leading `-` sign or multiplied by `-1`, flag it.
 - For any metric that represents a rate, verify the denominator is protected with `NULLIF(..., 0)`.
 

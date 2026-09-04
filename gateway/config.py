@@ -162,6 +162,22 @@ class Settings(BaseSettings):
     )
 
     # ----------------------------------------------------------------- Runtime
+    # Skip the ChromaDB retrieval path and inject the full user-facing metric list
+    # into the prompt instead. True in production and effectively the only mode
+    # that runs: `chroma_store/` is gitignored so the index is never deployed, and
+    # even locally MetricEmbedder raises because the persisted collection was built
+    # with a different embedding function. With only ~20 metrics the full list fits
+    # comfortably, and RAG is the wrong lever for latency now that the warehouse is
+    # local — see CLAUDE.md.
+    #
+    # The field name IS the contract: pydantic-settings has no env_prefix here and
+    # `case_sensitive=False`, so `disable_rag` reads the existing DISABLE_RAG
+    # environment variable. Do not rename it or invert its polarity — a field named
+    # e.g. `rag_enabled` would silently ignore DISABLE_RAG=true and turn retrieval
+    # back on in production. Read here rather than via os.getenv so the value is
+    # typed, defaulted and visible in one place, per the repo's config convention.
+    disable_rag: bool = False
+
     gateway_env: str = "development"
     log_level: str = "INFO"
     gateway_version: str = "1.0.0"
