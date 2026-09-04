@@ -70,6 +70,47 @@ _PROMPT_EXCLUDED_METRIC_FIELDS: frozenset[str] = frozenset({
 })
 
 
+# HTTP status codes and error shapes worth a second attempt on the primary rung.
+# Deliberately a CLOSED list: an unrecognised error is NOT retried, because the
+# failures actually seen on the dead rungs are deterministic (404 model retired,
+# 402 no credit, 400 bad request) and retrying those burns the timeout budget to
+# reach a byte-identical verdict. Compare `is_deterministic_mf_error()` in
+# sql_generator.py, which takes the opposite default -- there an unrecognised
+# error might be a genuine engine fault worth a retry; here it is almost always a
+# provider saying no.
+_TRANSIENT_LLM_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+_TRANSIENT_LLM_MARKERS = (
+    "timed out",
+    "timeout",
+    "high demand",          # Google 503: "currently experiencing high demand"
+    "overloaded",
+    "temporarily unavailable",
+    "connection error",
+    "connection reset",
+    "resource_exhausted",   # Google 429 quota
+)
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """True when re-issuing the SAME request could plausibly succeed.
+
+    Both production failures were the primary timing out at exactly the 15 s
+    ceiling — the request was still in flight, not refused — and the same key
+    intermittently returns 503 "experiencing high demand". Those are worth one
+    more attempt. A 404 for a retired model or a 402 for an empty balance is not.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return status in _TRANSIENT_LLM_STATUS
+
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_LLM_MARKERS)
+
+
 def _metric_name(metric: object) -> str:
     """Name of a metric given either a MetricDefinition or an already-plain string.
 
@@ -262,12 +303,19 @@ class IntentExtractor:
         Args:
             settings: Gateway settings object.
         """
-        # Fail-fast client config: without these, the openai SDK defaults to a
-        # 600 s timeout and 2 internal retries with backoff — a rate-limited
-        # primary blocks for minutes before the fallback chain ever runs.
-        # The chain itself IS the retry policy, so each attempt gets one shot.
-        _LLM_TIMEOUT_S = 15.0
+        # SDK-level retries stay OFF: the SDK retries every error class including
+        # deterministic 4xx, which is what made a rate-limited primary block for
+        # minutes before the fallback chain ran.
+        #
+        # The TIMEOUT is now configurable (config.llm_timeout_seconds, default 40 s)
+        # and no longer 15 s. 15 s existed to reach the fallback chain quickly, and
+        # that chain is currently one working provider -- Groq retired
+        # `llama-3.1-8b-instant` and OpenRouter is out of credit -- so a tight
+        # ceiling turns a slow success into a 400 with nothing to fall back to.
+        # Measured median for the real prompt is 4.55 s; production hit 15 s twice.
+        _LLM_TIMEOUT_S = float(getattr(settings, "llm_timeout_seconds", 40.0))
         _LLM_MAX_RETRIES = 0
+        self._primary_retries = int(getattr(settings, "llm_primary_retries", 1))
 
         # Allowed filter VALUES per dimension, injected by main.py's lifespan once
         # the warehouse is open. Empty until then, which reproduces the old prompt
@@ -378,22 +426,42 @@ class IntentExtractor:
         response = None
         # Try Primary Client (OpenRouter)
         if self._primary_client:
-            try:
-                logger.debug("Calling primary model '%s' for intent extraction.", self._primary_model)
-                response = self._primary_client.chat.completions.create(
-                    model=self._primary_model,
-                    messages=messages,  # type: ignore[arg-type]
-                    temperature=0.0,
-                    # The intent JSON measures 141-148 tokens in practice; 300 is
-                    # ~2x headroom. 1024 was never a size, it was a RESERVATION, and
-                    # providers gate on it: OpenRouter refused a live request with
-                    # "requested up to 1024 tokens, but can only afford 434" while
-                    # the answer it would have produced needed ~145.
-                    max_tokens=_INTENT_MAX_TOKENS,
-                    response_format={"type": "json_object"},
-                )
-            except Exception as exc:
-                logger.warning("Primary LLM (%s) failed: %s. Falling back to secondary...", self._primary_model, exc)
+            # Gemini is the intended path and the only rung that currently works, so
+            # a TRANSIENT failure gets one more shot here rather than falling through
+            # to two dead providers. Deterministic errors (bad model, malformed
+            # request, auth) are not retried -- they would fail identically.
+            for _attempt in range(1 + max(self._primary_retries, 0)):
+                if response:
+                    break
+                try:
+                    logger.debug("Calling primary model '%s' for intent extraction.", self._primary_model)
+                    response = self._primary_client.chat.completions.create(
+                        model=self._primary_model,
+                        messages=messages,  # type: ignore[arg-type]
+                        temperature=0.0,
+                        # The intent JSON measures 128-174 tokens against the real
+                        # prompt; 300 is ~1.7x headroom. 1024 was never a size, it
+                        # was a RESERVATION, and providers gate on it: OpenRouter
+                        # refused a live request for "up to 1024 tokens" when it
+                        # could afford 434, for an answer needing ~145.
+                        max_tokens=_INTENT_MAX_TOKENS,
+                        response_format={"type": "json_object"},
+                    )
+                except Exception as exc:
+                    retryable = _is_transient_llm_error(exc)
+                    more = _attempt < max(self._primary_retries, 0)
+                    if retryable and more:
+                        logger.warning(
+                            "Primary LLM (%s) failed transiently: %s. Retrying (%d/%d)...",
+                            self._primary_model, exc, _attempt + 1,
+                            max(self._primary_retries, 0),
+                        )
+                        continue
+                    logger.warning(
+                        "Primary LLM (%s) failed: %s. Falling back to secondary...",
+                        self._primary_model, exc,
+                    )
+                    break
 
         # Try Fallback Client (Groq) if primary failed or wasn't configured
         if not response:

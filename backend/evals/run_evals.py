@@ -92,7 +92,21 @@ _CERTIFIED_METRICS = [
 ]
 
 _CERTIFIED_DIMENSIONS: dict[str, list[str]] = {
-    "mrr":                   ["plan_type", "billing_cycle", "mrr_type", "period_month"],
+    # `country` added 2026-09-04. sem_mrr has always declared `subscriber` as a
+    # FOREIGN entity, so mrr reaches dim_subscribers and MetricFlow compiles the
+    # join unaided -- dimension_coverage.csv records
+    # `mrr,country,subscriber__country,true,ok,15,15`, i.e. it compiles and returns
+    # 15 distinct countries. The registry gained this on 2026-08-25; this fixture
+    # did not, so `hallucination-002` ("MRR by continent") was UNPASSABLE: it
+    # expects the model to map continent -> country, and country was not on offer
+    # for mrr in this universe. The model was right to decline and flag
+    # clarification; the fixture was wrong.
+    #
+    # `--check-drift` did not catch it because it only reports the fixture
+    # claiming dimensions the registry LACKS, never the reverse. A fixture that is
+    # a deliberate subset is fine until a golden case depends on the missing part.
+    "mrr":                   ["plan_type", "billing_cycle", "mrr_type", "period_month",
+                              "country"],
     "expansion_mrr":         ["plan_type", "billing_cycle", "mrr_type"],
     # Corrected 2026-08-26: ltv is a ratio spanning sem_payments and sem_mrr, so it
     # can only be grouped by dimensions reachable from BOTH — the subscriber ones.
@@ -246,6 +260,31 @@ _universe = (_CERTIFIED_METRICS, _CERTIFIED_DIMENSIONS, _CERTIFIED_TIME_GRAINS)
 # Scoring helpers
 # ---------------------------------------------------------------------------
 
+def _bare_dim(dim: str) -> str:
+    """Strip a MetricFlow entity prefix / time granularity from a dimension name.
+
+    Mirrors `SemanticValidator._get_bare_dimension()` deliberately, because that
+    is the gateway's own definition of dimension IDENTITY: certification is
+    checked on the bare name, and `format_mf_query()` passes anything containing
+    `__` straight through. So `subscriber__country` and `country` are the same
+    dimension everywhere downstream.
+
+    Scoring them as different marked a CORRECT answer wrong. `hallucination-002`
+    ("Show me MRR by continent for last month") expects `country`; the model
+    returns `subscriber__country`, because `dims_section` teaches the qualified
+    form via `build_dimension_prefix_map()`. The mapping the case exists to test
+    -- continent -> country, without asking for clarification -- was working.
+
+    This is not loosening the assertion to fit the output. The fixture stores
+    bare names while the live prefix map yields qualified ones (see
+    `_load_live_registry`, which documents the same split), so a raw string
+    comparison tests which vocabulary the prompt happened to use rather than
+    whether the model resolved the dimension.
+    """
+    parts = dim.split("__")
+    return parts[1] if len(parts) >= 2 else dim
+
+
 def _score_case(case: dict, intent) -> dict:
     """
     Compare one extracted intent against its golden expected values.
@@ -280,7 +319,11 @@ def _score_case(case: dict, intent) -> dict:
     if "dimensions" in expected:
         exp_dims = set(expected["dimensions"])
         got_dims = set(intent.dimensions)
-        dims_ok = exp_dims.issubset(got_dims)   # subset: extra dims are OK
+        # Compare on BARE names — see _bare_dim(). The reported values stay
+        # verbatim so a failure still shows exactly what the model emitted.
+        dims_ok = {_bare_dim(d) for d in exp_dims}.issubset(
+            {_bare_dim(d) for d in got_dims}
+        )   # subset: extra dims are OK
         if not dims_ok and exp_dims:
             if not partial_ok:
                 hard_fail = True

@@ -597,3 +597,116 @@ class TestPromptDoesNotShipRegistryInternals:
         )
         for name in AVAILABLE_METRICS:
             assert name in prompt
+
+
+class TestPrimaryRungSurvivesATransientFailure:
+    """
+    Both production outages were the SAME shape: the primary timed out at exactly
+    the 15 s ceiling, then Groq 404'd (retired model) and OpenRouter 402'd (no
+    credit), and the user got a 400 after ~15.9 s.
+
+    The 15 s ceiling was chosen so a struggling primary reached the fallback chain
+    quickly. That reasoning inverted when the chain stopped working: with two dead
+    rungs below it, failing fast converts a slow SUCCESS into a hard failure and
+    gains nothing. Measured median for the real 9,912-token prompt is 4.55 s
+    (range 2.81-5.16), so 40 s is generous without being reckless — a healthy call
+    still returns in ~5 s.
+    """
+
+    def test_the_timeout_comes_from_settings_and_is_generous(self) -> None:
+        from config import settings
+
+        assert settings.llm_timeout_seconds >= 30, (
+            "measured p50 is 4.55s but production hit 15s twice; a tight ceiling "
+            "only helps if there is a working fallback to reach"
+        )
+
+    @pytest.mark.parametrize("message,status", [
+        ("Request timed out.", None),
+        ("503 This model is currently experiencing high demand", None),
+        ("quota exceeded RESOURCE_EXHAUSTED", None),
+        ("Rate limit reached for model", 429),
+        ("internal server error", 500),
+    ])
+    def test_transient_failures_are_retried(self, message, status) -> None:
+        from core.intent_extractor import _is_transient_llm_error
+
+        exc = Exception(message)
+        if status is not None:
+            exc.status_code = status
+        assert _is_transient_llm_error(exc), f"{message!r} should be retried"
+
+    @pytest.mark.parametrize("message,status", [
+        ("The model `llama-3.1-8b-instant` does not exist", 404),
+        ("This request requires more credits, or fewer max_tokens", 402),
+        ("Prompt tokens limit exceeded: 9678 > 3621", 402),
+        ("Failed to validate JSON. Please adjust your prompt.", 400),
+        ("Incorrect API key provided", 401),
+    ])
+    def test_deterministic_failures_are_not_retried(self, message, status) -> None:
+        """
+        Every one of these is a real error from the logs. Retrying them reaches a
+        byte-identical verdict while spending the timeout budget, which is why the
+        transient list is CLOSED rather than allow-by-default.
+        """
+        from core.intent_extractor import _is_transient_llm_error
+
+        exc = Exception(message)
+        exc.status_code = status
+        assert not _is_transient_llm_error(exc), f"{message!r} must not be retried"
+
+    @staticmethod
+    def _distinct_rungs(extractor):
+        """Give each rung its OWN mock.
+
+        `patch("core.intent_extractor.OpenAI")` hands back the same
+        `MagicMock.return_value` for every construction, so `_primary_client` and
+        `_fallback_client` are literally the same object — a side_effect set on one
+        silently overwrites the other, and call_count cannot tell which rung ran.
+        """
+        extractor._primary_client = MagicMock()
+        extractor._fallback_client = MagicMock()
+        extractor._tertiary_client = None
+        return extractor
+
+    @staticmethod
+    def _ok(metric: str):
+        response = MagicMock()
+        response.choices = [MagicMock(message=MagicMock(content=(
+            '{"query_type":"metric_query","metrics":["' + metric + '"],'
+            '"dimensions":[],"filters":[],"time_range":null,'
+            '"needs_clarification":false}'
+        )))]
+        return response
+
+    def test_a_transient_primary_failure_does_not_reach_the_fallbacks(self) -> None:
+        """The whole point: one retry on the rung that works, before giving up."""
+        extractor = self._distinct_rungs(_make_extractor())
+        extractor._primary_client.chat.completions.create.side_effect = [
+            Exception("Request timed out."), self._ok("mrr"),
+        ]
+
+        intent = extractor.extract("what is mrr", AVAILABLE_METRICS,
+                                   AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
+
+        assert intent.metrics == ["mrr"]
+        assert extractor._primary_client.chat.completions.create.call_count == 2
+        assert extractor._fallback_client.chat.completions.create.call_count == 0, (
+            "the primary's retry succeeded — the dead rungs must not be touched"
+        )
+
+    def test_a_deterministic_primary_failure_falls_through_immediately(self) -> None:
+        """A retired model or a bad key must not cost a second timeout."""
+        extractor = self._distinct_rungs(_make_extractor())
+        exc = Exception("The model does not exist or you do not have access to it")
+        exc.status_code = 404
+        extractor._primary_client.chat.completions.create.side_effect = exc
+        extractor._fallback_client.chat.completions.create.return_value = self._ok("ltv")
+
+        intent = extractor.extract("what is ltv", AVAILABLE_METRICS,
+                                   AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
+
+        assert intent.metrics == ["ltv"]
+        assert extractor._primary_client.chat.completions.create.call_count == 1, (
+            "a 404 was retried — that wastes the timeout budget for an identical result"
+        )

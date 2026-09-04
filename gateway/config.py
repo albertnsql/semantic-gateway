@@ -42,6 +42,28 @@ class Settings(BaseSettings):
     openai_temperature: float = 0.0  # deterministic for analytics
     llm_base_url: str = "https://api.groq.com/openai/v1"
 
+    # Per-attempt LLM timeout. Was a hardcoded 15.0 in IntentExtractor, chosen so a
+    # struggling primary reached the fallback chain quickly. That reasoning inverted
+    # once the chain stopped working: Groq retired `llama-3.1-8b-instant` (404) and
+    # OpenRouter is out of credit (402), so failing fast now buys nothing and just
+    # converts a slow success into a 400.
+    #
+    # Measured against the real 9,912-token prompt: 2.81 / 3.58 / 3.97 / 4.55 / 5.00
+    # / 5.16 s, median 4.55 s. So 15 s was ~3x the median and production STILL hit it
+    # twice (15.16 s and 15.28 s -- both exactly at the ceiling, meaning the request
+    # was still in flight when we gave up, not that Google had gone silent). Google
+    # also returns intermittent 503 "experiencing high demand" on this key.
+    #
+    # A slow answer beats no answer, and when Gemini is healthy this costs nothing --
+    # it returns in ~5 s either way.
+    llm_timeout_seconds: float = 40.0
+
+    # Retries for the PRIMARY only, on transient errors (timeout / 429 / 503).
+    # SDK-level retries stay off (max_retries=0): those retry every error including
+    # deterministic 4xx, which is what made a rate-limited primary block for minutes.
+    # This is narrower -- a transient class, on the one rung that works.
+    llm_primary_retries: int = 1
+
     # Tertiary: Google Gemini (via OpenAI compat)
     google_api_key: str = ""
     google_model: str = "gemini-3.1-flash-lite"
