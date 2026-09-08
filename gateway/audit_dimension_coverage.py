@@ -27,12 +27,43 @@ So: push all of them through the real compiler and write down which ones work.
 
 What it tests
 -------------
-Two axes, because there are three ways a pair can be unusable and the registry
+Three axes, because there are three ways a pair can be unusable and the registry
 only ever claimed the first:
 
 1. **Compiles** — can MetricFlow resolve this metric grouped by this dimension.
 2. **Populated** — does the dimension actually carry data. On by default; pass
    ``--no-execute`` to skip.
+3. **Attributed** — does the MEASURE actually land in those buckets, or drain
+   into a NULL / 'unknown' one. Runs with the population check.
+
+The third exists because the second is not enough either. A dimension can have
+fifteen healthy country buckets and still leave a quarter of revenue
+unattributed: during the June-2026 orphan append, 16,602 payment rows lost their
+country to a LEFT JOIN that no longer matched, putting **24.6% of 2026 revenue**
+($336,095 of $1,366,490) in an Unknown bucket — and ``population`` scored that
+pair ``ok``, because the fifteen real buckets were still there. A breakdown like
+that is not empty, which is the problem: it looks like an answer.
+
+It is measured only where the arithmetic holds. ``sum`` and ``count`` measures
+are summable across buckets; ``average`` is not (a mean of means needs weights),
+and ``count_distinct`` is not (an entity in two buckets inflates a bucket-sum
+denominator, which UNDERSTATES the unattributed share — the dangerous direction).
+Ratio and derived metrics return only the ratio, so the volume behind it is not
+in the result set at all. Those are reported ``n/a`` rather than guessed at; see
+``_additive_metrics()``. 11 of 23 metrics qualify, including ``total_revenue``,
+which is both the motivating case and ``ltv``'s numerator.
+
+'unknown' counts as unattributed alongside NULL, and that is not cosmetic:
+``fct_stream_sessions`` deliberately coalesces a missing genre to ``'unknown'``,
+so a NULL-only check reports 0.00% for ``total_sessions x
+content_primary_genre`` while the true figure is 0.45%. The coalesce would have
+hidden precisely what this axis looks for.
+
+A high share is frequently CORRECT — ``mrr x churn_reason`` is 80.7%
+unattributed because most MRR belongs to active subscribers who have no churn
+reason — so ``--fail-on-new`` keys on the verdict *changing*, never on the level.
+A by-construction null is stable; a broken join is a change. Failing on the level
+would report 19 permanent "problems" and be ignored within a week.
 
 The second exists because the first is not enough, and a live query proved it:
 "average engagement by content type over the last 3 months" compiled, executed,
@@ -66,7 +97,7 @@ Stop the gateway first — DuckDB's writer lock is process-exclusive.
 Usage
 -----
     cd gateway
-    python audit_dimension_coverage.py                     # compile + population
+    python audit_dimension_coverage.py                     # compile + population + attribution
     python audit_dimension_coverage.py --metric total_revenue --metric mrr
     python audit_dimension_coverage.py --no-execute        # compile only, no warehouse
     python audit_dimension_coverage.py --fail-on-new       # CI gate; see below
@@ -82,6 +113,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import sys
@@ -132,6 +164,14 @@ class PairResult:
     population: str = ""
     rows: int | None = None
     dim_distinct: int | None = None
+    # ── Attribution: what SHARE of the measure lands in an unattributed bucket ─
+    # Distinct from `population`, which only asks whether real buckets exist. A
+    # dimension can have 15 healthy countries AND still leave a quarter of revenue
+    # in a NULL bucket — that is what the June-2026 orphan append did ($336,095,
+    # 24.6% of 2026 revenue), and `population` scored it `ok`.
+    # "" when not computed; otherwise one of _ATTR_*.
+    attribution: str = ""
+    unattributed_pct: float | None = None
 
 
 # A compiling pair can still be useless. Verdicts, in order of severity.
@@ -144,6 +184,24 @@ _POP_ERROR = "exec_error"    # compiled but would not run
 # all_null is the one that silently produces a confident wrong answer, so it is
 # the only verdict treated as a hard failure by --fail-on-new.
 _POP_FAILURES = frozenset({_POP_ALL_NULL, _POP_ERROR})
+
+# ── Attribution verdicts ────────────────────────────────────────────────────
+_ATTR_OK = "attributed"        # unattributed share below the threshold
+_ATTR_SKEWED = "unattributed"  # at or above it — a breakdown here hides real volume
+_ATTR_NA = "n/a"               # not computable; see _additive_metrics()
+
+# 5% is a judgement, not a discovered constant. A dimension sourced from a clean
+# join should sit near zero, and the case this check exists for was 24.6%. Set it
+# lower and `churn_reason` (legitimately null for non-churned subscribers) would
+# dominate the report; higher and a fifth of revenue could go missing quietly.
+_ATTR_THRESHOLD_PCT = 5.0
+
+# Values that mean "we do not know", not "this is a category". `fct_stream_sessions`
+# deliberately coalesces a missing genre to 'unknown', so a NULL-only check would
+# report 0.00% for the one dimension we KNOW is 0.45% unattributed — the coalesce
+# would hide exactly what this check is looking for. Kept deliberately short: a
+# longer list starts swallowing legitimate categories.
+_UNATTRIBUTED_VALUES = frozenset({"unknown"})
 
 
 @dataclass
@@ -275,11 +333,120 @@ def _open_warehouse(settings):
         return None, f"{type(exc).__name__}: {exc}"
 
 
-def _check_population(con, sql: str, probed: str) -> tuple[str, int | None, int | None]:
+def _additive_metrics(manifest_path: str) -> dict[str, str]:
+    """metric -> aggregation, for metrics whose measure can be SUMMED across buckets.
+
+    Only `sum` and `count` qualify, and the exclusions are the whole point:
+
+    * `average` (avg_watch_time, engagement_rate, avg_buffering_events) — the mean
+      of a set of means is not the overall mean without weights, so a bucket-sum
+      denominator is arithmetically wrong, not merely imprecise.
+    * `count_distinct` (total_subscribers, monthly_subscriber_base) — an entity
+      appearing in two buckets is counted twice by a bucket-sum, which INFLATES the
+      denominator and therefore UNDERSTATES the unattributed share. Understating is
+      the dangerous direction for a safety check, so it is skipped rather than
+      approximated.
+    * `ratio` / `derived` (churn_rate, ltv, recommendation_ctr, retention_rate,
+      net_mrr_growth, payment_failure_rate) — MetricFlow returns only the ratio, so
+      the volume behind it is not in the result set at all. Getting these right
+      needs a second probe for the denominator; deliberately not done here.
+
+    `total_revenue` IS additive, which matters: it is the metric whose null-country
+    bucket motivated this check, and `ltv`'s numerator, so the signal is reachable
+    for the case that prompted it.
+
+    Two-hop resolution (metric -> measure -> agg) rather than name matching, for the
+    same reason `test_metric_time_columns_match_the_semantic_layer` does it: metric
+    and measure names diverge (`total_subscribers` uses `active_subscribers_count`).
+    """
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except Exception:
+        return {}
+
+    aggs = {
+        measure["name"]: measure.get("agg")
+        for model in manifest.get("semantic_models", [])
+        for measure in model.get("measures", [])
+        if measure.get("name")
+    }
+
+    out: dict[str, str] = {}
+    for metric in manifest.get("metrics", []):
+        if metric.get("type") != "simple":
+            continue
+        measure = (metric.get("type_params") or {}).get("measure") or {}
+        name = measure.get("name") if isinstance(measure, dict) else measure
+        agg = aggs.get(name)
+        if agg in ("sum", "count"):
+            out[metric["name"]] = agg
+    return out
+
+
+def _check_attribution(
+    columns: list[str], rows: list, dim_idx: int, metric: str, agg: str | None
+) -> tuple[str, float | None]:
+    """Share of the measure sitting in an unattributed bucket.
+
+    Returns (verdict, percent). `_ATTR_NA` with None when the measure cannot be
+    summed across buckets — see _additive_metrics(). Inventing a number for an
+    average would be worse than reporting nothing.
+
+    The measure column is found BY NAME, like the dimension column, and for the
+    same reason: an offset metric gets `metric_time__month` prepended, so position
+    is not reliable.
+    """
+    if not agg:
+        return _ATTR_NA, None
+
+    try:
+        measure_idx = columns.index(metric)
+    except ValueError:
+        # MetricFlow normally names the column after the metric. If it did not,
+        # say so rather than summing whichever column looks numeric.
+        return _ATTR_NA, None
+
+    total = 0.0
+    unattributed = 0.0
+    for row in rows:
+        value = row[measure_idx]
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return _ATTR_NA, None
+        total += value
+        label = row[dim_idx]
+        if label is None or (
+            isinstance(label, str) and label.strip().lower() in _UNATTRIBUTED_VALUES
+        ):
+            unattributed += value
+
+    if total <= 0:
+        # No volume at all: a percentage would be a division artefact, and
+        # `population` already reports the emptiness.
+        return _ATTR_NA, None
+
+    pct = 100.0 * unattributed / total
+    verdict = _ATTR_SKEWED if pct >= _ATTR_THRESHOLD_PCT else _ATTR_OK
+    return verdict, pct
+
+
+def _check_population(
+    con, sql: str, probed: str, metric: str = "", agg: str | None = None
+) -> tuple[str, int | None, int | None, str, float | None]:
     """
     Execute *sql* and judge whether the dimension actually carries data.
 
-    Returns (verdict, row_count, distinct_non_null_dimension_values).
+    Returns (verdict, row_count, distinct_non_null_dimension_values,
+    attribution_verdict, unattributed_percent).
+
+    The result set is fetched ONCE and both checks read it. They answer different
+    questions — population asks "are there real buckets", attribution asks "does
+    the volume actually land in them" — and a dimension can pass the first and fail
+    the second, which is the case this was extended for.
 
     The signal is the number of distinct non-null dimension values, NOT a row-level
     null percentage — the compiled query is already aggregated, so it returns one
@@ -305,25 +472,27 @@ def _check_population(con, sql: str, probed: str) -> tuple[str, int | None, int 
     rows = cursor.fetchall()
 
     if not rows:
-        return _POP_ZERO_ROWS, 0, 0
+        return _POP_ZERO_ROWS, 0, 0, _ATTR_NA, None
 
     try:
         idx = columns.index(probed)
     except ValueError:
         # Should not happen — but guessing a column would silently judge the wrong
         # one, so say so instead.
-        return _POP_ERROR, len(rows), None
+        return _POP_ERROR, len(rows), None, _ATTR_NA, None
+
+    attribution, pct = _check_attribution(columns, rows, idx, metric, agg)
 
     distinct_non_null = len({r[idx] for r in rows if r[idx] is not None})
     if distinct_non_null == 0:
-        return _POP_ALL_NULL, len(rows), 0
+        return _POP_ALL_NULL, len(rows), 0, attribution, pct
     if distinct_non_null == 1:
-        return _POP_SINGLE, len(rows), 1
-    return _POP_OK, len(rows), distinct_non_null
+        return _POP_SINGLE, len(rows), 1, attribution, pct
+    return _POP_OK, len(rows), distinct_non_null, attribution, pct
 
 
 def _probe(engine, metric: str, bare: str, prefix_map: dict,
-           metric_type: str = "", con=None) -> PairResult:
+           metric_type: str = "", con=None, additive: dict | None = None) -> PairResult:
     """Normalise one pair the way the route would, then compile it."""
     from core.sql_generator import correct_dimension_entity, require_metric_time
 
@@ -360,8 +529,11 @@ def _probe(engine, metric: str, bare: str, prefix_map: dict,
     # compiled — there is nothing to execute otherwise.
     if con is not None:
         try:
-            result.population, result.rows, result.dim_distinct = _check_population(
-                con, sql, probed
+            (
+                result.population, result.rows, result.dim_distinct,
+                result.attribution, result.unattributed_pct,
+            ) = _check_population(
+                con, sql, probed, metric, (additive or {}).get(metric)
             )
         except Exception as exc:
             result.population = _POP_ERROR
@@ -370,7 +542,7 @@ def _probe(engine, metric: str, bare: str, prefix_map: dict,
     return result
 
 
-def _read_previous(path: str) -> dict[tuple[str, str], tuple[bool, str]]:
+def _read_previous(path: str) -> dict[tuple[str, str], tuple[bool, str, str]]:
     """
     Load a prior run's verdicts, keyed (metric, bare) -> (compiled, population).
 
@@ -381,12 +553,13 @@ def _read_previous(path: str) -> dict[tuple[str, str], tuple[bool, str]]:
     """
     if not os.path.exists(path):
         return {}
-    previous: dict[tuple[str, str], tuple[bool, str]] = {}
+    previous: dict[tuple[str, str], tuple[bool, str, str]] = {}
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             previous[(row["metric"], row["bare_dimension"])] = (
                 row["ok"] == "true",
                 row.get("population", "") or "",
+                row.get("attribution", "") or "",
             )
     return previous
 
@@ -397,6 +570,7 @@ def _write_csv(path: str, results: list[PairResult]) -> None:
         writer.writerow([
             "metric", "bare_dimension", "probed_dimension", "group_by",
             "ok", "reason", "population", "rows", "dim_distinct",
+            "attribution", "unattributed_pct",
             "entity_corrected", "time_injected",
             "ms", "sql_chars", "detail",
         ])
@@ -407,13 +581,15 @@ def _write_csv(path: str, results: list[PairResult]) -> None:
                 r.population,
                 "" if r.rows is None else r.rows,
                 "" if r.dim_distinct is None else r.dim_distinct,
+                r.attribution,
+                "" if r.unattributed_pct is None else f"{r.unattributed_pct:.2f}",
                 "true" if r.entity_corrected else "false",
                 "true" if r.time_injected else "false",
                 f"{r.ms:.1f}", r.sql_chars, r.detail,
             ])
 
 
-def _report(summary: Summary, previous: dict[tuple[str, str], tuple[bool, str]]) -> int:
+def _report(summary: Summary, previous: dict[tuple[str, str], tuple[bool, str, str]]) -> int:
     """Print the human-readable summary. Returns the count of regressions."""
     results = summary.results
     executed = any(r.population for r in results)
@@ -478,13 +654,36 @@ def _report(summary: Summary, previous: dict[tuple[str, str], tuple[bool, str]])
             print(f"  {len(injected):4d}  metric_time injected for an offset window")
 
     regressions: list[PairResult] = []
+    # ── Attribution ─────────────────────────────────────────────────────────
+    # Reported as information, not as a pass/fail tally. A high share is often
+    # correct (see the note in the regression arm below), so the value of this
+    # section is the LEVEL being visible and stable between runs, not a count of
+    # things to fix.
+    scored = [r for r in results if r.attribution in (_ATTR_OK, _ATTR_SKEWED)]
+    if scored:
+        skewed = sorted(
+            (r for r in scored if r.attribution == _ATTR_SKEWED),
+            key=lambda r: -(r.unattributed_pct or 0.0),
+        )
+        na = sum(1 for r in results if r.attribution == _ATTR_NA)
+        print("\nAttribution (what share of the MEASURE lands in an unattributed bucket)")
+        print(f"  {len(scored) - len(skewed):>4}  below {_ATTR_THRESHOLD_PCT:.0f}%")
+        print(f"  {len(skewed):>4}  at or above {_ATTR_THRESHOLD_PCT:.0f}%")
+        print(f"  {na:>4}  not measurable (ratio, average or count_distinct)")
+        if skewed:
+            print("  highest shares - check each is BY CONSTRUCTION, not a broken join:")
+            for r in skewed[:10]:
+                print(f"      {r.unattributed_pct:6.2f}%  {r.metric} x {r.bare}")
+            if len(skewed) > 10:
+                print(f"      ... and {len(skewed) - 10} more (see the CSV)")
+
     if previous:
         gained: list[PairResult] = []
         for r in results:
             was = previous.get((r.metric, r.bare))
             if was is None:
                 continue
-            was_ok, was_population = was
+            was_ok, was_population, was_attribution = was
             if r.ok and not was_ok:
                 gained.append(r)
             elif was_ok and not r.ok:
@@ -500,10 +699,30 @@ def _report(summary: Summary, previous: dict[tuple[str, str], tuple[bool, str]])
                 and r.population in _POP_FAILURES
             ):
                 regressions.append(r)
+            # And a pair whose measure DRAINS into the unattributed bucket. This is
+            # the quietest of the three: it compiles, returns real buckets, and only
+            # the volume behind them has gone missing. `total_revenue x country` sat
+            # at 24.6% during the June-2026 orphan append while `population` scored
+            # it `ok`.
+            #
+            # Keyed on the verdict CHANGING, not on the standing value, and that is
+            # the whole design. Plenty of dimensions are legitimately sparse --
+            # `mrr x churn_reason` is 80.7% unattributed because most MRR belongs to
+            # active subscribers who have no churn reason -- so failing on the level
+            # would report 19 permanent "problems" and be ignored within a week. A
+            # by-construction null is STABLE; a broken join is a CHANGE.
+            elif (
+                was_attribution == _ATTR_OK
+                and r.attribution == _ATTR_SKEWED
+            ):
+                regressions.append(r)
         print(f"\nAgainst the previous run: {len(gained)} newly passing, "
               f"{len(regressions)} regressed")
         for r in regressions:
             detail = r.reason or r.population
+            if r.attribution == _ATTR_SKEWED and r.population not in _POP_FAILURES:
+                detail = (f"{r.unattributed_pct:.1f}% of the measure is now "
+                          f"unattributed")
             print(f"  [REGRESSED] {r.metric} x {r.bare} -> {detail}")
 
     return len(regressions)
@@ -572,10 +791,23 @@ def main() -> int:
         else:
             print("  population check enabled")
 
+    # Resolved once from semantic_manifest.json — the same artifact the compile
+    # pass already needs, so this adds no new dependency.
+    # There is no settings field for the semantic manifest — MetricFlow is given
+    # `dbt_project_dir` and finds target/ itself — so derive it the same way, rather
+    # than adding a config field that would then have two sources of truth.
+    additive = _additive_metrics(
+        os.path.join(getattr(settings, "dbt_project_dir", ""),
+                     "target", "semantic_manifest.json")
+    ) if con else {}
+    if con:
+        print(f"  attribution check enabled for {len(additive)} additive metric(s)")
+
     summary = Summary()
     started = time.perf_counter()
     for i, (metric, bare, metric_type) in enumerate(pairs, 1):
-        result = _probe(engine, metric, bare, prefix_map, metric_type, con=con)
+        result = _probe(engine, metric, bare, prefix_map, metric_type,
+                        con=con, additive=additive)
         summary.results.append(result)
         flagged = (not result.ok) or result.population in _POP_FAILURES
         if args.verbose or flagged:
