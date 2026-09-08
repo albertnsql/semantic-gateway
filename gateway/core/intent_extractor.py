@@ -304,7 +304,15 @@ class QueryIntent(BaseModel):
     filters: list[FilterClause] = []
     time_range: TimeRange | None = None
     aggregation_level: str | None = None  # monthly | weekly | daily
+    # `order_by` names the metric or dimension to rank by; `order_direction`
+    # carries the direction, because a bare column name cannot express one.
+    # BOTH are required for `limit` to be honoured -- see resolve_mf_order() in
+    # sql_generator.py. A LIMIT with no ORDER BY selects an ARBITRARY row, and
+    # "which country has the highest MRR" then answered with whichever row the
+    # engine emitted first: Canada at $8,937.76, below the mean of a $192,078
+    # total, reported to the user as the maximum.
     order_by: str | None = None
+    order_direction: str | None = None  # "asc" | "desc" | None (treated as desc)
     limit: int | None = None
     raw_llm_response: str = ""
     needs_clarification: bool = False
@@ -772,6 +780,7 @@ class IntentExtractor:
   },
   "aggregation_level": "<valid_granularity_or_null>",
   "order_by": "<metric_or_dimension_name|null>",
+  "order_direction": "<asc|desc|null>",
   "limit": <integer_or_null>,
   "needs_clarification": false,
   "clarification_reason": null
@@ -940,6 +949,24 @@ it matches the dashboard. `churned_subscribers` is a dim_subscribers snapshot co
 different grain, so the two are NOT interchangeable and their numbers will not reconcile —
 which is exactly why the rule above is mandatory rather than advisory.
 
+## RANKING -- superlatives and top-N
+
+A superlative or top-N question needs THREE fields set TOGETHER. `limit` is
+IGNORED unless "order_by" and "order_direction" are both set, because a limit
+without a sort returns an arbitrary row rather than the best one:
+
+- "order_by": the metric or dimension to rank by (normally the metric asked about)
+- "order_direction": "desc" for highest / top / most / best / largest,
+                     "asc"  for lowest / bottom / least / worst / smallest
+- "limit": how many rows to return ("which country" -> 1, "top 5 plans" -> 5)
+
+The dimension being ranked STILL belongs in "dimensions". "Which country has the
+highest MRR" is grouped by country and limited to 1. It is NOT a filter, and you
+must never invent a specific country value for it.
+
+A plain breakdown ("MRR by country", "churn rate by plan type") is NOT a ranking:
+leave all three null so every row is returned.
+
 ## TIME GRANULARITIES CONSTRAINTS
 {grains_section}
 
@@ -986,41 +1013,51 @@ WRONG - never split one question into one object per metric:
 
 User: "What is the MRR by plan type for the last 3 months?"
 Output:
-{{"query_type": "metric_query", "metrics": ["mrr"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2024-02-27", "end_date": "2024-05-27", "relative": "last_3_months"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["mrr"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2024-02-27", "end_date": "2024-05-27", "relative": "last_3_months"}}, "aggregation_level": "month", "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Show me churn rate by country this year"
 Output:
-{{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["country"], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-05-27", "relative": "this_year"}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["country"], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-05-27", "relative": "this_year"}}, "aggregation_level": "month", "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Show churn by plan type for 2025"
 (A bare "churn" with no count wording → churn_rate, never churned_subscribers.)
 Output:
-{{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2025-01-01", "end_date": "2025-12-31", "relative": null}}, "aggregation_level": "month", "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["churn_rate"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2025-01-01", "end_date": "2025-12-31", "relative": null}}, "aggregation_level": "month", "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "How many subscribers churned in 2025, by plan type?"
 (Explicit count wording → churned_subscribers.)
 Output:
-{{"query_type": "metric_query", "metrics": ["churned_subscribers"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2025-01-01", "end_date": "2025-12-31", "relative": null}}, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["churned_subscribers"], "dimensions": ["plan_type"], "filters": [], "time_range": {{"start_date": "2025-01-01", "end_date": "2025-12-31", "relative": null}}, "aggregation_level": null, "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "What is the LTV by acquisition channel?"
 Output:
-{{"query_type": "metric_query", "metrics": ["ltv"], "dimensions": ["acquisition_channel"], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "metric_query", "metrics": ["ltv"], "dimensions": ["acquisition_channel"], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+
+User: "Which country has the highest MRR for the month of August 2026?"
+(Superlative -> group by the dimension, rank by the metric, limit 1. NOT a filter.)
+Output:
+{{"query_type": "metric_query", "metrics": ["mrr"], "dimensions": ["country"], "filters": [], "time_range": {{"start_date": "2026-08-01", "end_date": "2026-08-31", "relative": null}}, "aggregation_level": "month", "order_by": "mrr", "order_direction": "desc", "limit": 1, "needs_clarification": false, "clarification_reason": null}}
+
+User: "Show me the 5 plan types with the lowest retention rate"
+(Explicitly "lowest" -> order_direction is "asc", never the desc default.)
+Output:
+{{"query_type": "metric_query", "metrics": ["retention_rate"], "dimensions": ["plan_type"], "filters": [], "time_range": null, "aggregation_level": null, "order_by": "retention_rate", "order_direction": "asc", "limit": 5, "needs_clarification": false, "clarification_reason": null}}
 
 User: "What metrics can I ask about?"
 Output:
-{{"query_type": "schema_question", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "schema_question", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Why did churn increase last quarter?"
 Output:
-{{"query_type": "diagnostic_query", "metrics": ["churn_rate"], "dimensions": [], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-03-31", "relative": null}}, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "diagnostic_query", "metrics": ["churn_rate"], "dimensions": [], "filters": [], "time_range": {{"start_date": "2024-01-01", "end_date": "2024-03-31", "relative": null}}, "aggregation_level": null, "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Why is revenue lower in Germany?"
 Output:
-{{"query_type": "diagnostic_query", "metrics": ["total_revenue"], "dimensions": [], "filters": [{{"column": "country", "operator": "eq", "value": "DE"}}], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "diagnostic_query", "metrics": ["total_revenue"], "dimensions": [], "filters": [{{"column": "country", "operator": "eq", "value": "DE"}}], "time_range": null, "aggregation_level": null, "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 
 User: "Why are our competitors growing faster than us?"
 Output:
-{{"query_type": "out_of_scope", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
+{{"query_type": "out_of_scope", "metrics": [], "dimensions": [], "filters": [], "time_range": null, "aggregation_level": null, "order_by": null, "order_direction": null, "limit": null, "needs_clarification": false, "clarification_reason": null}}
 """
 
     def _resolve_time_range(self, parsed: dict, today_str: str) -> dict:

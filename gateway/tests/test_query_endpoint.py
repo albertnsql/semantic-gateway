@@ -30,7 +30,7 @@ from models.responses import (
     ViolationDetail,
 )
 from models.semantic import MetricDefinition
-from api.routes.query import _raw_query_cache_key
+from api.routes.query import _generate_narrative, _raw_query_cache_key
 
 
 # ──────────────────────────────────────────────── Helpers
@@ -615,3 +615,150 @@ class TestRawQueryCacheKey:
 
     def test_empty_query_does_not_raise(self) -> None:
         assert _raw_query_cache_key(_Body(""))["q"] == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The narrative must not describe a ranked SLICE as a distribution.
+#
+# `_generate_narrative` computed min/max/sum over `results`, which is already
+# post-LIMIT. With limit=1 the min and max are the SAME row, and the model was
+# handed `metric_value (sum of rows)` as though it were a total — so a top-1
+# query produced "Canada generated the highest MRR at $8,937.76, while the
+# lowest performing country was Canada with $8,937.76 … the entire recorded
+# revenue for this period is concentrated within a single geographic market".
+# Three claims, none of them supported by one row.
+#
+# This module had ZERO coverage before these tests.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRankedSubsetNarrative:
+    """A limited result set is presented as a ranked slice, not a population."""
+
+    AUG = TimeRange(start_date="2026-08-01", end_date="2026-08-31", relative=None)
+
+    @staticmethod
+    def _prompts(question, rows, intent):
+        """Return (system_prompt, user_prompt) without calling any provider."""
+        with patch("api.routes.query._chat_with_fallback") as chat:
+            chat.return_value = "stub"
+            _generate_narrative(question, rows, intent, object())
+        assert chat.called, "narrative did not reach the provider call"
+        _, system_prompt, user_prompt = chat.call_args.args[:3]
+        return system_prompt, user_prompt
+
+    def _ranked_prompts(self):
+        intent = QueryIntent(
+            original_query="Which country has the highest MRR in August 2026",
+            metrics=["mrr"],
+            dimensions=["subscriber__country"],
+            time_range=self.AUG,
+            order_by="mrr",
+            order_direction="desc",
+            limit=1,
+        )
+        return self._prompts(
+            "Which country has the highest MRR in August 2026",
+            [{"subscriber__country": "Canada", "mrr": 8937.76}],
+            intent,
+        )
+
+    def test_ranked_result_is_labelled_a_subset(self):
+        _, user = self._ranked_prompts()
+        assert "Ranked Subset" in user
+        assert "NOT the full breakdown" in user
+        assert "total_segments: UNKNOWN" in user
+
+    def test_ranked_result_hides_the_misleading_extremes_and_total(self):
+        _, user = self._ranked_prompts()
+        assert "Pre-computed Stats" not in user
+        for leaked in ("max_value", "min_value", "metric_value"):
+            assert leaked not in user, (
+                f"{leaked} over a post-LIMIT slice describes the slice, not the "
+                "population, and the model cannot tell the difference"
+            )
+
+    def test_ranked_result_states_its_direction(self):
+        # Must assert against the Ranked Subset block, NOT a substring that the
+        # echoed question ("…the highest MRR…") already satisfies — the looser
+        # version passed against the pre-fix code and pinned nothing.
+        _, user = self._ranked_prompts()
+        assert "ranked_by: mrr (highest first)" in user
+        assert "with the highest mrr" in user.lower()
+
+    def test_ascending_rank_is_not_described_as_highest(self):
+        intent = QueryIntent(
+            original_query="5 plan types with the lowest retention rate",
+            metrics=["retention_rate"],
+            dimensions=["subscription__plan_type"],
+            order_by="retention_rate",
+            order_direction="asc",
+            limit=5,
+        )
+        _, user = self._prompts(
+            "5 plan types with the lowest retention rate",
+            [{"subscription__plan_type": "basic", "retention_rate": 0.81}],
+            intent,
+        )
+        assert "lowest retention_rate" in user
+        assert "highest" not in user
+
+    def test_the_three_false_claims_are_explicitly_forbidden(self):
+        system, _ = self._ranked_prompts()
+        assert "8. If a 'Ranked Subset' block" in system
+        assert "Do NOT name a lowest or bottom segment" in system   # "lowest was Canada"
+        assert "call any figure a total" in system                  # summed one row
+        assert "concentrated, uniform" in system                    # "single market"
+
+    def test_rule_one_no_longer_mandates_naming_a_bottom_segment(self):
+        # Rule 1 used to demand a top AND a bottom unconditionally, which is what
+        # made the model name the same row twice.
+        system, _ = self._ranked_prompts()
+        assert "1. If a 'Pre-computed Stats' block is present" in system
+
+    def test_an_unapplied_limit_does_not_get_the_ranked_framing(self):
+        """The governed fallback builder ignores limit/order_by and returns everything.
+
+        intent.limit is still set on that path, so branching on it alone would
+        label a full 15-row breakdown "the 1 row with the highest mrr".
+        """
+        intent = QueryIntent(
+            original_query="Which country has the highest MRR in August 2026",
+            metrics=["mrr"],
+            dimensions=["subscriber__country"],
+            time_range=self.AUG,
+            order_by="mrr",
+            order_direction="desc",
+            limit=1,
+        )
+        _, user = self._prompts(
+            "Which country has the highest MRR in August 2026",
+            [
+                {"subscriber__country": "US", "mrr": 73681.33},
+                {"subscriber__country": "IN", "mrr": 23073.35},
+                {"subscriber__country": "CA", "mrr": 8937.76},
+            ],
+            intent,
+        )
+        assert "Ranked Subset" not in user
+        assert "Pre-computed Stats" in user
+
+    def test_an_unranked_breakdown_keeps_the_full_distribution_stats(self):
+        intent = QueryIntent(
+            original_query="MRR by country for August 2026",
+            metrics=["mrr"],
+            dimensions=["subscriber__country"],
+            time_range=self.AUG,
+        )
+        _, user = self._prompts(
+            "MRR by country for August 2026",
+            [
+                {"subscriber__country": "Canada", "mrr": 8937.76},
+                {"subscriber__country": "US", "mrr": 41022.10},
+                {"subscriber__country": "DE", "mrr": 15003.44},
+            ],
+            intent,
+        )
+        assert "Ranked Subset" not in user
+        assert "Pre-computed Stats" in user
+        assert "max_value: 41022.1" in user and "max_label: US" in user
+        assert "min_label: Canada" in user
+        assert "metric_value (sum of rows): 64963.3" in user

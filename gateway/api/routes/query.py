@@ -196,7 +196,34 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
         row_count = len(results)
         precomputed_stats = ""
         
-        if len(dims) > 0 and row_count > 0:
+        # A ranked/limited result is a SLICE, not a distribution. Computing
+        # min/max/sum over it and labelling them extremes and a total is how
+        # "which country has the highest MRR" (limit 1) produced "highest
+        # Canada, lowest Canada, the entire recorded revenue is concentrated
+        # within a single geographic market" -- three claims, none checkable
+        # from one row, and the third refuted by the $192,078 total the same
+        # conversation had already returned.
+        _limit = getattr(intent, "limit", None)
+        _order_by = getattr(intent, "order_by", None)
+        _direction = (getattr(intent, "order_direction", None) or "desc").strip().lower()
+
+        # row_count <= _limit is what proves the ordering was actually APPLIED.
+        # The governed fallback builder ignores both order_by and limit (it sorts
+        # by the group-by column), so on that degraded path intent.limit is set
+        # while every row comes back -- and framing 15 rows as "the 1 with the
+        # highest mrr" would be a fresh false claim rather than a fixed one.
+        if _limit and 0 < row_count <= _limit:
+            _rank_word = "lowest" if _direction.startswith("asc") else "highest"
+            precomputed_stats = (
+                f"\nRanked Subset - the {row_count} row(s) with the {_rank_word} "
+                f"{_order_by or 'value'}. This is NOT the full breakdown:\n"
+                f"- rows_returned: {row_count}\n"
+                f"- ranked_by: {_order_by or 'unknown'} ({_rank_word} first)\n"
+                f"- total_segments: UNKNOWN - the query returned only the top "
+                f"{row_count}, so these rows cannot be summed and their spread "
+                f"says nothing about the segments not shown.\n"
+            )
+        elif len(dims) > 0 and row_count > 0:
             try:
                 numeric_keys = [k for k, v in results[0].items() if isinstance(v, (int, float))]
                 str_keys = [k for k, v in results[0].items() if isinstance(v, str)]
@@ -231,8 +258,8 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "You are a data analyst assistant for a streaming analytics platform. "
             "When given query results, produce a conversational summary. "
             "CRITICAL RULES: "
-            "1. If this is a dimensional breakdown, name the top and bottom segments explicitly using the values provided. Do not summarize without referencing specific dimension values. "
-            "2. Always use the provided metric_value, max_value, and min_value — never estimate numbers from the preview rows. "
+            "1. If a 'Pre-computed Stats' block is present, name the top and bottom segments explicitly using the values provided. Do not summarize without referencing specific dimension values. "
+            "2. Always use the numbers given in the stats block — never estimate numbers from the preview rows. "
             "3. Produce exactly 2 sentences. First sentence: the breakdown with specific names and numbers. Second sentence: the business interpretation. "
             "4. Format all revenue and monetary values with a '$' sign, commas, and 2 decimal places (e.g., $1,234.56). Format percentages with a '%' sign and up to 2 decimal places (e.g., 25.4%). "
             "5. Wrap all numbers, percentages, and monetary values in double asterisks so they can be highlighted (e.g., **$1,234.56**, **25.4%**, or **1,234**). Do NOT use any other markdown formatting (no headers, no bullet points). "
@@ -248,7 +275,19 @@ def _generate_narrative(query: str, results: list[dict], intent, settings) -> st
             "cannot see why they are what they are. "
             "7. Describe ONLY the scope you were given. If a filter is listed, say so "
             "explicitly ('among premium subscribers…'); if none is listed, do not imply "
-            "one."
+            "one. "
+            # Rule 1 mandates naming a top AND a bottom, which is exactly wrong
+            # for a top-N slice: with limit=1 the min and max ARE the same row,
+            # and a model told to name both duly wrote "the highest was Canada,
+            # while the lowest performing country was Canada".
+            "8. If a 'Ranked Subset' block is present INSTEAD of 'Pre-computed "
+            "Stats', the rows are the top N by the stated ranking and NOT the "
+            "whole population. Name them with their values and state the ranking "
+            "('the highest MRR'). Do NOT name a lowest or bottom segment, do NOT "
+            "add the rows up or call any figure a total, and do NOT claim the "
+            "population is concentrated, uniform, or limited to what is shown - "
+            "you do not know how many segments exist. For rule 3's second "
+            "sentence, interpret only the segment(s) named."
         )
         user_prompt = (
             f"The analyst asked: \"{query}\"\n\n"

@@ -540,6 +540,80 @@ def _latest_period_with_data(pool, metric: str) -> str | None:
     return str(raw)[:10] if raw else None
 
 
+def resolve_mf_order(intent, mapped_dims: list[str]) -> str | None:
+    """
+    Resolve ``intent.order_by`` / ``intent.order_direction`` into a single
+    MetricFlow ``--order`` token, or ``None`` when no valid ordering exists.
+
+    MetricFlow's convention (verified against ``dbt_metricflow/cli/utils.py`` and
+    ``metricflow_semantics/query/query_parser.py::_parse_order_by_names``) is a
+    bare name for ASC and a ``-`` prefix for DESC.
+
+    Returning ``None`` is what makes ``format_mf_query`` DROP the limit, and that
+    is deliberate. A ``LIMIT`` with no ``ORDER BY`` returns an arbitrary row, so
+    "which country has the highest MRR" answered with whichever row the engine
+    emitted first and the narrative reported it as the maximum. Over-returning
+    every row is broad but correct; returning one unordered row is confidently
+    wrong.
+
+    The order target MUST already be in the query -- MetricFlow rejects an
+    ``--order`` naming something that is neither a selected metric nor a
+    group-by -- so it is validated against ``intent.metrics`` and the ALREADY
+    entity-mapped ``mapped_dims``, never the raw names off the LLM.
+
+    Args:
+        intent:      QueryIntent carrying order_by / order_direction / metrics.
+        mapped_dims: Group-by names as they will be sent to MetricFlow, i.e.
+                     after entity-prefix mapping.
+
+    Returns:
+        e.g. ``"-mrr"`` (descending), ``"subscriber__country"`` (ascending), or
+        ``None`` if there is nothing valid to order by.
+    """
+    raw = (getattr(intent, "order_by", None) or "").strip()
+    if not raw:
+        return None
+
+    # A model that ignores order_direction sometimes inlines MetricFlow's own
+    # "-" convention instead. Accept it rather than reading "-mrr" as a column.
+    descending = raw.startswith("-")
+    if descending:
+        raw = raw[1:].strip()
+
+    direction = (getattr(intent, "order_direction", None) or "").strip().lower()
+    if direction in ("desc", "descending"):
+        descending = True
+    elif direction in ("asc", "ascending"):
+        descending = False
+    elif not direction and not descending:
+        # No direction anywhere. Default DESC: order_by is only ever emitted for
+        # ranking questions and "highest/top/most" is overwhelmingly the common
+        # one -- "lowest" is the marked case the prompt calls out explicitly.
+        # The narrative now states the direction it was given, so a wrong default
+        # reads as a visibly odd claim rather than as a silent arbitrary row.
+        descending = True
+
+    target: str | None = None
+    if raw in (intent.metrics or []):
+        target = raw
+    else:
+        bare_raw = _bare_dimension_name(raw)
+        for dim in mapped_dims:
+            if dim == raw or _bare_dimension_name(dim) == bare_raw:
+                target = dim
+                break
+
+    if target is None:
+        logger.warning(
+            "order_by=%r matches no selected metric %r or group-by %r -- dropping "
+            "the ordering (and therefore any limit).",
+            raw, intent.metrics, mapped_dims,
+        )
+        return None
+
+    return "-" + target if descending else target
+
+
 def default_snapshot_time_range(metric: str, time_range, pool):
     """
     Give a snapshot metric its latest period when the caller supplied no range.
@@ -774,6 +848,13 @@ class SQLGenerator:
                 _primary, intent.time_range, self._pool
             )
 
+        # A ranked query compiles to SQL carrying ORDER BY / LIMIT, and the L1
+        # key is metric x dimensions ONLY (SQLTemplateCache.make_key) -- so
+        # caching it would serve a 1-row top-N template to every later
+        # "MRR by country". Skipped in BOTH directions: a HIT would also
+        # silently discard the limit, because the cached template has none.
+        _is_ranked = bool(intent.limit) or bool(getattr(intent, "order_by", None))
+
         # ── SQL Template Cache check ──────────────────────────────────────────
         # If we have a cached compiled SQL template for this metric+dimension
         # combination, skip the MetricFlow subprocess entirely and inject the
@@ -860,7 +941,13 @@ class SQLGenerator:
         # Filtered queries are NOT eligible for the template cache — the compiled SQL
         # contains hard-coded WHERE predicates (e.g., country = 'US') that cannot be
         # reused for a different filter value or an unfiltered version of the same query.
-        if compiled_sql is None and self._template_cache is not None and intent.metrics and not effective_filters:
+        if (
+            compiled_sql is None
+            and self._template_cache is not None
+            and intent.metrics
+            and not effective_filters
+            and not _is_ranked
+        ):
             cached_tpl = self._template_cache.get(intent.metrics, intent.dimensions)
             if cached_tpl is not None:
                 tpl_sql = cached_tpl["sql_template"]
@@ -992,7 +1079,13 @@ class SQLGenerator:
             # fallback SQL to avoid poisoning the cache with LLM hallucinations.
             # CRITICAL: We ONLY cache if mf_success is True AND the query has no
             # filters. Filtered SQL is query-specific and must not be reused.
-            if self._template_cache is not None and intent.metrics and mf_success and not intent.filters:
+            if (
+                self._template_cache is not None
+                and intent.metrics
+                and mf_success
+                and not intent.filters
+                and not _is_ranked
+            ):
                 try:
                     sql_template = compiled_sql
                     has_placeholder = False
@@ -1283,6 +1376,11 @@ class SQLGenerator:
         """
         parts: list[str] = ["mf", "query"]
 
+        # Hoisted out of the `if intent.dimensions:` block below: the ranking
+        # resolution has to validate order_by against the SAME entity-mapped
+        # names MetricFlow will group by, not the raw ones off the LLM.
+        mapped_dims: list[str] = []
+
         if intent.metrics:
             parts.extend(["--metrics", ",".join(intent.metrics)])
 
@@ -1293,7 +1391,6 @@ class SQLGenerator:
             primary_metric = intent.metrics[0] if intent.metrics else ""
             dim_map = global_dim_map.get(primary_metric, {})
             
-            mapped_dims = []
             for dim in intent.dimensions:
                 # If the dimension is already entity-prefixed (e.g. "payment__payment_method",
                 # "subscriber__plan_type") trust it as-is and skip the mapper.
@@ -1390,8 +1487,26 @@ class SQLGenerator:
                 parts.extend(["--where", where_clause])
                 logger.info("MetricFlow --where clause: %s", where_clause)
 
+        # -- Ranking: --limit is meaningless without --order -----------------
+        # intent.order_by was extracted by the LLM and read by NOTHING for the
+        # life of this file, while intent.limit WAS applied -- so every
+        # superlative question compiled to a LIMIT with no ORDER BY and
+        # returned an arbitrary row. See resolve_mf_order() for why dropping
+        # the limit is the safe direction to fail.
+        order_name = resolve_mf_order(intent, mapped_dims)
+        if order_name:
+            parts.extend(["--order", order_name])
+
         if intent.limit:
-            parts.extend(["--limit", str(intent.limit)])
+            if order_name:
+                parts.extend(["--limit", str(intent.limit)])
+            else:
+                logger.warning(
+                    "Dropping limit=%s: no usable ORDER BY (order_by=%r). "
+                    "Returning every row is broad but correct; one unordered "
+                    "row would be reported to the user as the ranked answer.",
+                    intent.limit, getattr(intent, "order_by", None),
+                )
 
         # Always use --explain so we get SQL without running it in the warehouse
         parts.append("--explain")

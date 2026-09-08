@@ -19,6 +19,7 @@ from core.sql_generator import (
     metric_entities,
     offset_window_grain,
     require_metric_time,
+    resolve_mf_order,
 )
 
 
@@ -1348,3 +1349,122 @@ class TestSnapshotMetricTimeDefault:
                 raise RuntimeError("warehouse down")
 
         assert default_snapshot_time_range("total_subscribers", None, pool=_Pool()) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ranking: order_by must reach MetricFlow, and a limit must never be applied
+# without it.
+#
+# `intent.order_by` was extracted by the LLM and read by NOTHING, while
+# `intent.limit` WAS applied — so "which country has the highest MRR for August
+# 2026" compiled to `--limit 1` with no ORDER BY, returned whichever row the
+# engine emitted first (Canada, $8,937.76) and the UI labelled it the maximum.
+# It cannot have been: the same conversation had already returned $192,078 for
+# the month, and 15 countries cannot sum to that with a maximum below the mean.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRankingRequiresAnOrderBy:
+    """`--limit` is only emitted alongside a resolved `--order`."""
+
+    @staticmethod
+    def _gen() -> SQLGenerator:
+        # format_mf_query needs no manifest, pool or cache.
+        return SQLGenerator.__new__(SQLGenerator)
+
+    @staticmethod
+    def _flag(argv: list[str], name: str) -> str | None:
+        return argv[argv.index(name) + 1] if name in argv else None
+
+    def _argv(self, **kwargs) -> list[str]:
+        kwargs.setdefault("original_query", "q")
+        return self._gen().format_mf_query(QueryIntent(**kwargs))
+
+    def test_superlative_emits_descending_order_and_limit(self):
+        argv = self._argv(
+            metrics=["mrr"],
+            dimensions=["country"],
+            time_range=TimeRange(
+                start_date="2026-08-01", end_date="2026-08-31", relative=None
+            ),
+            order_by="mrr",
+            order_direction="desc",
+            limit=1,
+        )
+        assert self._flag(argv, "--order") == "-mrr"
+        assert self._flag(argv, "--limit") == "1"
+
+    def test_ascending_is_not_silently_flipped_to_descending(self):
+        argv = self._argv(
+            metrics=["retention_rate"],
+            dimensions=["plan_type"],
+            order_by="retention_rate",
+            order_direction="asc",
+            limit=5,
+        )
+        # MetricFlow: bare name = ASC, "-" prefix = DESC.
+        assert self._flag(argv, "--order") == "retention_rate"
+        assert self._flag(argv, "--limit") == "5"
+
+    def test_limit_without_order_by_is_dropped(self):
+        """THE BUG. Over-returning is broad but correct; one unordered row is not."""
+        argv = self._argv(metrics=["mrr"], dimensions=["country"], limit=1)
+        assert "--order" not in argv
+        assert "--limit" not in argv, (
+            "a LIMIT with no ORDER BY returns an arbitrary row, which a superlative "
+            "question then reports to the user as the maximum"
+        )
+
+    def test_order_by_naming_nothing_in_the_query_takes_the_limit_with_it(self):
+        # MetricFlow rejects an --order naming neither a selected metric nor a
+        # group-by, so an unresolvable order_by must not leave the limit behind.
+        argv = self._argv(
+            metrics=["mrr"], dimensions=["country"], order_by="nonsense", limit=1
+        )
+        assert "--order" not in argv
+        assert "--limit" not in argv
+
+    def test_dimension_order_by_resolves_through_the_entity_prefix_map(self):
+        argv = self._argv(
+            metrics=["mrr"],
+            dimensions=["country"],
+            order_by="country",
+            order_direction="asc",
+            limit=3,
+        )
+        # Must match the MAPPED group-by name, not the bare one off the LLM.
+        assert self._flag(argv, "--order") == self._flag(argv, "--group-by")
+        assert self._flag(argv, "--limit") == "3"
+
+    def test_a_plain_breakdown_is_untouched(self):
+        argv = self._argv(metrics=["mrr"], dimensions=["country"])
+        assert "--order" not in argv
+        assert "--limit" not in argv
+
+    def test_an_inlined_minus_prefix_is_accepted_not_read_as_a_column(self):
+        intent = QueryIntent(original_query="q", metrics=["mrr"], order_by="-mrr")
+        assert resolve_mf_order(intent, []) == "-mrr"
+
+    def test_missing_direction_defaults_to_descending(self):
+        intent = QueryIntent(original_query="q", metrics=["mrr"], order_by="mrr")
+        assert resolve_mf_order(intent, []) == "-mrr"
+
+    def test_explicit_direction_beats_an_inlined_prefix(self):
+        intent = QueryIntent(
+            original_query="q", metrics=["mrr"], order_by="-mrr", order_direction="asc"
+        )
+        assert resolve_mf_order(intent, []) == "mrr"
+
+    def test_warm_engine_parses_the_same_argv_the_subprocess_gets(self):
+        """Parity. Without it the PRIMARY path would drop the ordering silently."""
+        from core.metricflow_engine import WarmMetricFlowEngine
+
+        argv = self._argv(
+            metrics=["mrr"],
+            dimensions=["country"],
+            order_by="mrr",
+            order_direction="desc",
+            limit=1,
+        )
+        kwargs = WarmMetricFlowEngine._parse_argv(argv)
+        assert kwargs["order_by_names"] == ["-mrr"]
+        assert kwargs["limit"] == 1
+        assert kwargs["metric_names"] == ["mrr"]

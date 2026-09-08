@@ -142,6 +142,12 @@ class WarmMetricFlowEngine:
                 kwargs["time_constraint_end"] = datetime.datetime.fromisoformat(value)
             elif token == "--where":
                 kwargs["where_constraints"] = [value]
+            elif token == "--order":
+                # Parity with format_mf_query's --order. Without this the WARM
+                # engine -- the PRIMARY path -- would silently drop the ordering
+                # while the subprocess honoured it, so a superlative answer
+                # would depend on which rung happened to compile it.
+                kwargs["order_by_names"] = [o for o in value.split(",") if o]
             elif token == "--limit":
                 try:
                     kwargs["limit"] = int(value)
