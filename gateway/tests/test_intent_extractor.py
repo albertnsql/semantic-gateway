@@ -56,8 +56,34 @@ def _make_settings(**overrides) -> MagicMock:
     settings.openrouter_api_key = ""   # no tertiary by default
     settings.openrouter_model = ""
     settings.openrouter_base_url = ""
+    settings.llm_provider_order = "google,groq,openrouter"
     for k, v in overrides.items():
         setattr(settings, k, v)
+
+    # A REAL provider_chain, mirroring Settings.provider_chain(). A MagicMock
+    # returns a MagicMock, and `for label, key, url, model in chain` raises on it.
+    # Derived from the fields above so an override still takes effect, and it
+    # honours llm_provider_order so ordering itself is testable.
+    def _chain():
+        available = {
+            "google": (settings.google_api_key, settings.google_base_url,
+                       settings.google_model),
+            "groq": (settings.openai_api_key, settings.llm_base_url,
+                     settings.openai_model),
+            "openrouter": (settings.openrouter_api_key,
+                           settings.openrouter_base_url,
+                           settings.openrouter_model),
+        }
+        chain = []
+        for label in (part.strip().lower()
+                      for part in settings.llm_provider_order.split(",")):
+            spec = available.get(label)
+            if spec is None or not spec[0]:
+                continue
+            chain.append((label, spec[0], spec[1], spec[2]))
+        return chain
+
+    settings.provider_chain = _chain
     return settings
 
 
@@ -613,16 +639,25 @@ class TestPrimaryRungSurvivesATransientFailure:
     still returns in ~5 s.
     """
 
-    def test_the_timeout_comes_from_settings_and_is_generous(self) -> None:
+    def test_the_timeout_is_generous_but_bounded(self) -> None:
+        """
+        Two-sided on purpose, because both directions have bitten.
+
+        Too tight (15 s) failed queries that answer in 17 s. Too loose (40 s) made
+        the failure itself the problem: with no working fallback the worst case is
+        timeout + ~1 s, so 40 s produced a 81,154 ms 400 on a host where Gemini was
+        unreachable. Measured latencies: p50 ~4.5 s, max observed 17.2 s.
+        """
         from config import settings
 
-        assert settings.llm_timeout_seconds >= 30, (
-            "measured p50 is 4.55s but production hit 15s twice; a tight ceiling "
-            "only helps if there is a working fallback to reach"
+        assert settings.llm_timeout_seconds >= 20, (
+            "below ~20s this drops requests that were observed succeeding at 17.2s"
+        )
+        assert settings.llm_timeout_seconds <= 30, (
+            "with a dead fallback chain this value IS the user's wait on a bad day"
         )
 
     @pytest.mark.parametrize("message,status", [
-        ("Request timed out.", None),
         ("503 This model is currently experiencing high demand", None),
         ("quota exceeded RESOURCE_EXHAUSTED", None),
         ("Rate limit reached for model", 429),
@@ -637,6 +672,14 @@ class TestPrimaryRungSurvivesATransientFailure:
         assert _is_transient_llm_error(exc), f"{message!r} should be retried"
 
     @pytest.mark.parametrize("message,status", [
+        # A timeout is transient but EXPENSIVE: it has already spent the whole
+        # per-attempt budget, so retrying doubles the wait for the same outcome.
+        # Production proved it — two 40 s timeouts plus the dead rungs made an
+        # 81,154 ms failure out of what had been a 16 s one.
+        ("Request timed out.", None),
+        ("Read timeout", None),
+        ("gateway timeout", 504),
+        ("request timeout", 408),
         ("The model `llama-3.1-8b-instant` does not exist", 404),
         ("This request requires more credits, or fewer max_tokens", 402),
         ("Prompt tokens limit exceeded: 9678 > 3621", 402),
@@ -682,8 +725,11 @@ class TestPrimaryRungSurvivesATransientFailure:
     def test_a_transient_primary_failure_does_not_reach_the_fallbacks(self) -> None:
         """The whole point: one retry on the rung that works, before giving up."""
         extractor = self._distinct_rungs(_make_extractor())
+        # A 503 — fails in about a second, so a second attempt is nearly free.
+        # Deliberately not a timeout: those are no longer retried.
+        overloaded = Exception("503 currently experiencing high demand")
         extractor._primary_client.chat.completions.create.side_effect = [
-            Exception("Request timed out."), self._ok("mrr"),
+            overloaded, self._ok("mrr"),
         ]
 
         intent = extractor.extract("what is mrr", AVAILABLE_METRICS,
@@ -693,6 +739,24 @@ class TestPrimaryRungSurvivesATransientFailure:
         assert extractor._primary_client.chat.completions.create.call_count == 2
         assert extractor._fallback_client.chat.completions.create.call_count == 0, (
             "the primary's retry succeeded — the dead rungs must not be touched"
+        )
+
+    def test_a_timeout_is_not_retried(self) -> None:
+        """
+        The 81-second regression, pinned. Retrying a timeout cannot help — the
+        request got no answer within the full budget — and it doubles the wait.
+        """
+        extractor = self._distinct_rungs(_make_extractor())
+        extractor._primary_client.chat.completions.create.side_effect = Exception(
+            "Request timed out."
+        )
+        extractor._fallback_client.chat.completions.create.return_value = self._ok("mrr")
+
+        intent = extractor.extract("what is mrr", AVAILABLE_METRICS,
+                                   AVAILABLE_DIMENSIONS, AVAILABLE_TIME_GRAINS)
+        assert intent.metrics == ["mrr"]
+        assert extractor._primary_client.chat.completions.create.call_count == 1, (
+            "the timeout was retried — that is the 40s-becomes-80s regression"
         )
 
     def test_a_deterministic_primary_failure_falls_through_immediately(self) -> None:
@@ -748,3 +812,86 @@ class TestOneObjectNotAnArray:
         )
         assert '"metrics": ["mrr", "churn_rate"]' in prompt, "no correct example"
         assert "one object per metric" in prompt, "no counter-example"
+
+
+class TestProviderOrderIsConfiguration:
+    """
+    Which provider is primary depends on the HOST, not on the code.
+
+    On 2026-09-08 Render reached api.groq.com (404 in ~200 ms) and openrouter.ai
+    (402 in ~400 ms) with the identical 38 KB request body, while
+    generativelanguage.googleapis.com returned nothing for 40 s — twice. Not a
+    rejection: a quota breach is a fast 429 and overload a fast 503, both of which
+    reproduce locally. Silence is a dropped packet, the known hazard of a shared
+    free-tier egress IP.
+
+    Locally the same call answers in 1.1-7.5 s, so neither order is right
+    everywhere and the choice has to be deployable without a code change.
+    """
+
+    def test_the_default_order_is_unchanged(self) -> None:
+        """A new field must not silently re-point production at another provider."""
+        extractor = _make_extractor()
+        assert extractor._primary_model == "gemini-2.5-flash"
+
+    def test_the_order_can_be_inverted_for_render(self) -> None:
+        extractor = _make_extractor(
+            llm_provider_order="openrouter,google,groq",
+            openrouter_api_key="fake-or-key",
+            openrouter_model="google/gemini-3.1-flash-lite",
+            openrouter_base_url="https://openrouter.ai/api/v1",
+        )
+        assert extractor._primary_model == "google/gemini-3.1-flash-lite"
+        assert extractor._fallback_model == "gemini-2.5-flash"
+
+    def test_a_provider_with_no_key_is_skipped_not_left_as_a_hole(self) -> None:
+        """
+        A rung with no credentials must not occupy a slot. Leaving it in place
+        would spend an attempt on a client that cannot succeed.
+        """
+        extractor = _make_extractor(llm_provider_order="openrouter,google,groq")
+        # openrouter has no key in the default fixture
+        assert extractor._primary_model == "gemini-2.5-flash"
+        assert extractor._tertiary_client is None
+
+    def test_an_unknown_provider_name_is_ignored(self) -> None:
+        """A typo in the env var must degrade, not crash at startup."""
+        extractor = _make_extractor(llm_provider_order="gogle,google,groq")
+        assert extractor._primary_model == "gemini-2.5-flash"
+
+    def test_both_consumers_share_one_chain(self) -> None:
+        """
+        `_chat_with_fallback()` (narrative and schema answers) used to build its own
+        hardcoded google -> groq -> openrouter list. A reordering would then have
+        applied to intent extraction and silently not to the prose, leaving the two
+        paths disagreeing about which provider is primary.
+        """
+        import inspect
+
+        import api.routes.query as route
+
+        source = inspect.getsource(route._chat_with_fallback)
+        assert "settings.provider_chain()" in source
+
+        # Strip the docstring before checking: it legitimately quotes the old
+        # `if google_api_key:` shape as history, so a naive substring test passes
+        # or fails on prose rather than on code.
+        body = source.replace(route._chat_with_fallback.__doc__ or "", "")
+        assert "google_api_key" not in body, (
+            "the hardcoded provider list is back in the code"
+        )
+
+    def test_openrouter_serves_the_same_model_as_the_google_rung(self) -> None:
+        """
+        The point of the reorder. OpenRouter's catalogue includes
+        google/gemini-3.1-flash-lite, so routing through it is a different PATH to
+        the same model rather than a downgrade to a weaker one.
+        """
+        from config import Settings
+
+        settings = Settings(openai_api_key="x", _env_file=None)
+        assert settings.openrouter_model == "google/gemini-3.1-flash-lite"
+        assert settings.openrouter_model.endswith(settings.google_model), (
+            f"{settings.openrouter_model} is not the same model as "
+            f"{settings.google_model}"
+        )

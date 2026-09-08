@@ -33,7 +33,16 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ LLM Providers
     # Primary: OpenRouter
     openrouter_api_key: str = ""
-    openrouter_model: str = "google/gemini-2.5-flash"
+    # The SAME model as the Google rung, deliberately. OpenRouter's catalogue
+    # includes google/gemini-3.1-flash-lite, so this is not a downgrade to a
+    # different model — it is a second ROUTE to the same one, which is the whole
+    # point: on 2026-09-08 Render reached api.groq.com (404 in ~200 ms) and
+    # openrouter.ai (402 in ~400 ms) with the identical 38 KB body while
+    # generativelanguage.googleapis.com returned nothing for 40 s, twice. Google is
+    # not rejecting those requests (a quota breach is a fast 429, overload a fast
+    # 503) — it is dropping them, which is the known hazard of a shared free-tier
+    # egress IP. Was google/gemini-2.5-flash.
+    openrouter_model: str = "google/gemini-3.1-flash-lite"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # Fallback: Groq (via OpenAI compat)
@@ -56,7 +65,18 @@ class Settings(BaseSettings):
     #
     # A slow answer beats no answer, and when Gemini is healthy this costs nothing --
     # it returns in ~5 s either way.
-    llm_timeout_seconds: float = 40.0
+    # 40.0 -> 25.0 on 2026-09-08. 40 was chosen when the failure mode looked like
+    # "Gemini is sometimes slower than 15 s"; production then showed it is sometimes
+    # UNREACHABLE from that host, returning nothing at all. Two 40 s black holes
+    # plus the dead rungs produced a 81,154 ms 400 for a query that answers in
+    # 1.1-7.5 s locally on the identical 10,213-token prompt.
+    #
+    # With no working fallback the worst case is timeout + ~1 s, so this number IS
+    # the user's wait on a bad day. 25 s still covers every latency actually
+    # observed (max 17.2 s, p50 ~4.5 s) while bounding the failure at ~26 s.
+    # Retrying no longer compounds it: see _is_transient_llm_error, which excludes
+    # timeouts precisely because they are transient but expensive.
+    llm_timeout_seconds: float = 25.0
 
     # Retries for the PRIMARY only, on transient errors (timeout / 429 / 503).
     # SDK-level retries stay off (max_retries=0): those retry every error including
@@ -68,6 +88,57 @@ class Settings(BaseSettings):
     google_api_key: str = ""
     google_model: str = "gemini-3.1-flash-lite"
     google_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+    # Order the provider chain is walked, first entry is the primary. Comma
+    # separated; unknown names are ignored and a provider with no API key is
+    # skipped, so a partial list degrades rather than breaking.
+    #
+    # The default keeps today's behaviour. Set it to
+    # "openrouter,google,groq" on a host where Google's endpoint is unreachable —
+    # which is the situation on Render, where the direct Gemini call times out at
+    # whatever ceiling is configured (15.16 s under a 15 s limit, 40.36 s under 40 s:
+    # always exactly at the ceiling, i.e. no response rather than a slow one) while
+    # the same instance reaches OpenRouter in ~400 ms.
+    #
+    # Deliberately config and not code: CLAUDE.md's rule is that swapping or
+    # reordering providers touches config.py and the client construction, never the
+    # call sites.
+    llm_provider_order: str = "google,groq,openrouter"
+
+    def provider_chain(self) -> list[tuple[str, str, str, str]]:
+        """Ordered [(label, api_key, base_url, model)], skipping unconfigured ones.
+
+        One source of truth for BOTH consumers — IntentExtractor's three rungs and
+        `_chat_with_fallback()` for the narrative and schema answers. They each had
+        their own hardcoded google->groq->openrouter list, so a reordering would
+        have silently applied to one path and not the other.
+
+        Note the field names are historically misleading and left alone:
+        `openai_api_key` / `openai_model` are the GROQ credentials.
+        """
+        # getattr with defaults throughout, so this also works when called UNBOUND
+        # against a duck-typed stand-in: `Settings.provider_chain(fake_settings)`.
+        # Test doubles are SimpleNamespace or MagicMock and rarely carry every
+        # field, and the alternative was a second copy of this logic living in
+        # intent_extractor.py as a fallback — which is exactly the duplication this
+        # method exists to remove.
+        get = lambda name, default="": getattr(self, name, default)  # noqa: E731
+        available = {
+            "google": (get("google_api_key"), get("google_base_url"),
+                       get("google_model")),
+            "groq": (get("openai_api_key"), get("llm_base_url"),
+                     get("openai_model")),
+            "openrouter": (get("openrouter_api_key"), get("openrouter_base_url"),
+                           get("openrouter_model")),
+        }
+        order = get("llm_provider_order", "google,groq,openrouter") or ""
+        chain: list[tuple[str, str, str, str]] = []
+        for label in (part.strip().lower() for part in order.split(",")):
+            spec = available.get(label)
+            if spec is None or not spec[0]:
+                continue
+            chain.append((label, spec[0], spec[1], spec[2]))
+        return chain
 
     # ----------------------------------------------------------------- Warehouse
     # Which engine serves queries. Switched to duckdb on 2026-08-03: the Snowflake

@@ -96,20 +96,11 @@ def _chat_with_fallback(
     """
     from openai import OpenAI as _OpenAI
 
-    providers: list[tuple[str, str, str, str]] = []
-    if getattr(settings, "google_api_key", ""):
-        providers.append(
-            ("google", settings.google_api_key, settings.google_base_url, settings.google_model)
-        )
-    if getattr(settings, "openai_api_key", ""):
-        providers.append(
-            ("groq", settings.openai_api_key, settings.llm_base_url, settings.openai_model)
-        )
-    if getattr(settings, "openrouter_api_key", ""):
-        providers.append(
-            ("openrouter", settings.openrouter_api_key,
-             settings.openrouter_base_url, settings.openrouter_model)
-        )
+    # Same ordered chain the IntentExtractor uses. This function used to build its
+    # own hardcoded google -> groq -> openrouter list, so reordering would have
+    # applied to intent extraction and silently NOT to the narrative and schema
+    # answers — the two paths would have disagreed about which provider is primary.
+    providers: list[tuple[str, str, str, str]] = settings.provider_chain()
 
     if not providers:
         logger.warning("%s: no LLM provider is configured.", purpose)

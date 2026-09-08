@@ -66,10 +66,9 @@ else:
         RunnableConfig = dict
 
 from core.diagnostics.analysis import (
-    DEFAULT_DOMINANT_SHARE,
     DEFAULT_MIN_ABSOLUTE,
     baseline_representativeness,
-    concentration,
+    leading_driver,
     build_hypothesis,
     decompose,
     is_broad_based,
@@ -506,10 +505,12 @@ def should_reflect(state: GraphState) -> str:
         h for h in hypotheses
         if h.decomposition is not None and h.verdict != "inconclusive"
     ]
-    if any(
-        concentration(h.decomposition)[0] >= DEFAULT_DOMINANT_SHARE
-        for h in graded
-    ):
+    # An over-contributing driver, not merely a large share. Gating on share alone
+    # made the loop keep probing until it reached a two-bucket axis and then declare
+    # it the cause: `billing_cycle = monthly` at 76.1% of the gap is 72.2% of the
+    # base, a lift of 1.05, i.e. proportional. Four of nine snapshot scenarios
+    # flipped to "found the cause" on exactly that artifact.
+    if any(leading_driver(h.decomposition) is not None for h in graded):
         return "synthesize"
 
     budget = state.get("budget") or Budget()
@@ -642,9 +643,14 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
             )
     else:
         checked = ", ".join(h.dimension for h in hypotheses) or "no dimension"
+        # Wording matches what is actually tested. It used to say "none accounts for
+        # a material share of the gap", which described the old share-only rule; the
+        # test is now share AND lift, so a large-but-proportional bucket lands here
+        # and "no material share" would be false of it.
         lines.append(
-            f"No single factor explains it. I checked {checked} and none accounts "
-            "for a material share of the gap."
+            f"No single factor explains it. I checked {checked}, and no value on "
+            "any of them carries meaningfully more of the movement than its own "
+            "size implies."
         )
 
     # Stating what was ruled out is often the most useful line in the answer, and

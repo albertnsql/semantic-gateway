@@ -20,6 +20,9 @@ import math
 import pytest
 
 from core.diagnostics.analysis import (
+    bucket_lift,
+    DEFAULT_MIN_LIFT,
+    leading_driver,
     DEFAULT_MIN_SHARE,
     build_hypothesis,
     clears_floor,
@@ -31,7 +34,13 @@ from core.diagnostics.analysis import (
     rank_hypotheses,
     rows_to_buckets,
 )
-from core.diagnostics.state import Bucket, Budget, Finding, next_finding_id
+from core.diagnostics.state import (
+    Bucket,
+    Budget,
+    Contribution,
+    Finding,
+    next_finding_id,
+)
 
 
 def b(label, value, weight=None):
@@ -435,37 +444,91 @@ class TestBroadBasedVerdict:
 
         The first attempt gated on buckets-to-80% and failed here, because two of
         three plan types is proportionally the same as ten of fifteen countries.
+
+        The BASE distribution is load-bearing and was not, originally. The first
+        version of this fixture gave every bucket an identical base of 100,000,
+        which reproduced the top shares and invented the weights. That was harmless
+        while the verdict was share-only, and wrong once lift entered: a uniform
+        base turns `country0` into 11.1% of the base carrying 39.3% of the gap — a
+        3.54x lift, i.e. strongly concentrated — and the fixture then contradicted
+        the very verdict it exists to pin.
+
+        The weights below are MEASURED from the warehouse for total_revenue,
+        H1-2026 vs H2-2025, so the case is grounded in both dimensions::
+
+            plan_type    premium 42.1% base / 50.7% gap = 1.20x
+            country      US      37.8% base / 40.3% gap = 1.06x
+            payment      card    24.8% base / 26.6% gap = 1.08x
+
+        Growth really was proportional to size on every axis — which is what
+        "broad-based" means, and what a share-only test got right by luck here.
         """
-        def axis(name, top_delta, other_deltas):
-            base = 100_000.0
-            deltas = [top_delta] + list(other_deltas)
-            return build_hypothesis(decompose(
-                name,
-                target=[b(f"{name}{i}", base + d) for i, d in enumerate(deltas)],
-                comparison=[b(f"{name}{i}", base) for i in range(len(deltas))],
-            ))
+        def axis(name, base_shares, gap_shares):
+            """Buckets with the real base weights and the real gap shares."""
+            total_base = 300_000.0
+            gap = 165_534.0
+            target, comparison = [], []
+            for i, (bs, gs) in enumerate(zip(base_shares, gap_shares)):
+                base = total_base * bs
+                comparison.append(b(f"{name}{i}", base))
+                target.append(b(f"{name}{i}", base + gap * gs))
+            return build_hypothesis(decompose(name, target=target,
+                                              comparison=comparison))
 
-        plans = axis("plan", 72_243.0, [50_000.0, 43_291.0])          # 43.6%
-        countries = axis("country", 65_079.0, [12_557.0] * 8)          # 39.3%
-        channels = axis("channel", 45_209.0, [24_065.0] * 5)          # 27.3%
+        plans = axis("plan", [0.421, 0.445, 0.134], [0.507, 0.371, 0.122])
+        countries = axis(
+            "country",
+            [0.378, 0.120, 0.082, 0.057] + [0.0726] * 5,
+            [0.403, 0.137, 0.056, 0.075] + [0.0658] * 5,
+        )
+        channels = axis("channel", [0.248, 0.249, 0.250, 0.253],
+                        [0.266, 0.250, 0.243, 0.240])
 
-        for h, expected in ((plans, 0.436), (countries, 0.393), (channels, 0.273)):
+        for h in (plans, countries, channels):
             top_share, _ = concentration(h.decomposition)
-            assert top_share == pytest.approx(expected, abs=0.01), (
-                f"{h.dimension} fixture drifted from the live case: {top_share:.1%}"
+            assert top_share < 0.60, (
+                f"{h.dimension} fixture is no longer a spread case: {top_share:.1%}"
             )
-        assert is_broad_based([plans, countries, channels])
+        assert is_broad_based([plans, countries, channels]), (
+            "measured revenue growth is proportional to size on every axis"
+        )
 
     def test_a_dominant_axis_leads_instead(self) -> None:
         """
-        The live churn case: plan_type at 57.6% is the story, so the answer must name
-        it rather than dissolving it into "broad-based".
+        The live churn case — rebuilt, because the original fixture encoded the bug.
+
+        It asserted that `standard` at 57.6% of the gap was "the story". In that
+        fixture standard was 46.5% of the base, so 57.6% is a lift of 1.08 —
+        proportional, and every other bucket sat at ~0.94. Nothing over-contributed,
+        so "broad-based" was the correct reading and the test was pinning the very
+        failure mode lift exists to remove: naming the largest bucket.
+
+        The MEASURED June-2026 numbers tell a different and sharper story::
+
+            bucket      base    gap    lift
+            standard   45.5%  47.2%   1.04x   <- merely the biggest
+            basic      22.2%  37.6%   1.69x   <- the driver
+            premium    32.3%  15.2%   0.47x
+
+        which is exactly what CLAUDE.md records: "standard is the largest plan, so
+        it wins on count while basic is worst on rate."
         """
-        dominant = build_hypothesis(decompose(
-            "plan_type", target=[b("standard", 42.4), b("premium", 30.0), b("basic", 27.6)],
-            comparison=[b("standard", 100.0), b("premium", 60.0), b("basic", 55.0)]))
-        top_share, _ = concentration(dominant.decomposition)
-        assert top_share >= 0.50, f"fixture is not dominant enough: {top_share:.1%}"
+        base_total = 1000.0
+        gap = -324.0
+        weights = {"standard": 0.455, "basic": 0.222, "premium": 0.323}
+        gap_shares = {"standard": 0.472, "basic": 0.376, "premium": 0.152}
+        comparison = [b(k, base_total * w) for k, w in weights.items()]
+        target = [b(k, base_total * weights[k] + gap * gap_shares[k])
+                  for k in weights]
+        dominant = build_hypothesis(decompose("plan_type", target=target,
+                                              comparison=comparison))
+
+        driver = leading_driver(dominant.decomposition)
+        assert driver is not None, "fixture has no over-contributing bucket"
+        assert driver.label == "basic", (
+            f"named {driver.label!r} — the largest bucket is `standard`, but it "
+            "carries the gap in proportion to its size"
+        )
         assert not is_broad_based([dominant, self._spread("d2", 6)])
 
     def test_hypotheses_without_a_decomposition_are_ignored(self) -> None:
@@ -660,3 +723,147 @@ class TestFindingIds:
         bad = Finding(id="F1", label="x", metric="mrr", dimensions=[], rows=[],
                       error="boom")
         assert not bad.ok and bad.row_count == 0
+
+
+class TestLift:
+    """
+    A bucket drives a movement when it carries MORE of it than its size implies —
+    not when it is merely large.
+
+    Without this the largest bucket wins by construction, because
+    `Decomposition.top` is `contributions[0]` sorted by absolute delta. A live
+    churn diagnosis named `plan_type = standard` (45.5% of the base, 47.2% of the
+    gap, lift 1.04) and `billing_cycle = monthly` (72.2% base, 76.1% gap, lift
+    1.05) as causes. Both are arithmetic restatements of "the metric moved".
+
+    Low-cardinality axes are where it bites hardest: with two buckets one MUST
+    hold >= 50% of the gap unless they are near-balanced, so a share-only test
+    grades a binary dimension as explaining almost any movement. That is exactly
+    how four of nine snapshot scenarios flipped to "found the cause".
+    """
+
+    @staticmethod
+    def _axis(name, weights, gap_shares, *, base_total=1000.0, gap=-324.0):
+        """Buckets with explicit base weights and gap shares."""
+        comparison = [b(k, base_total * w) for k, w in weights.items()]
+        target = [b(k, base_total * weights[k] + gap * gap_shares[k])
+                  for k in weights]
+        return decompose(name, target=target, comparison=comparison)
+
+    def test_a_proportional_bucket_is_not_a_driver(self) -> None:
+        """The June churn case, measured. `standard` is biggest and proportional."""
+        d = self._axis(
+            "plan_type",
+            {"standard": 0.455, "basic": 0.222, "premium": 0.323},
+            {"standard": 0.472, "basic": 0.376, "premium": 0.152},
+        )
+        top = d.top
+        assert top is not None and top.label == "standard", (
+            "fixture assumption: standard carries the largest absolute delta"
+        )
+        assert bucket_lift(top, d.comparison_total) == pytest.approx(1.04, abs=0.03)
+
+        driver = leading_driver(d)
+        assert driver is not None and driver.label == "basic", (
+            "the driver is the over-contributing bucket, not the biggest one"
+        )
+        assert bucket_lift(driver, d.comparison_total) == pytest.approx(1.69, abs=0.05)
+
+    def test_a_binary_axis_needs_more_than_a_big_share(self) -> None:
+        """
+        `billing_cycle` has two buckets, so one always holds most of the gap.
+        Monthly carried 76.1% of the June churn gap off 72.2% of the base.
+        """
+        d = self._axis("billing_cycle", {"monthly": 0.722, "annual": 0.278},
+                       {"monthly": 0.761, "annual": 0.239})
+        top = d.top
+        assert abs(top.delta / d.gap) > 0.60, "fixture: monthly dominates on share"
+        assert bucket_lift(top, d.comparison_total) == pytest.approx(1.05, abs=0.03)
+        assert leading_driver(d) is None, (
+            "a 76% share at 1.05x lift is proportional, not a cause"
+        )
+
+    def test_a_small_bucket_with_high_lift_is_not_the_driver(self) -> None:
+        """
+        Measured revenue growth: `country = DE` is 5.7% of the base and carries
+        7.5% of a +181,599 gap — a lift of 1.31, and a fourteenth of the movement.
+        Lift alone, at the 5% reporting floor, would report DE as the cause.
+        """
+        d = self._axis(
+            "country",
+            {"US": 0.378, "IN": 0.120, "GB": 0.082, "DE": 0.057, "other": 0.363},
+            {"US": 0.403, "IN": 0.137, "GB": 0.056, "DE": 0.075, "other": 0.329},
+            gap=181_599.0,
+        )
+        de = next(c for c in d.contributions if c.label == "DE")
+        assert bucket_lift(de, d.comparison_total) >= DEFAULT_MIN_LIFT, (
+            "fixture: DE does over-contribute"
+        )
+        assert leading_driver(d) is None or leading_driver(d).label != "DE", (
+            "DE clears the lift floor but carries too little of the gap"
+        )
+
+    def test_measured_revenue_growth_has_no_driver_on_any_axis(self) -> None:
+        """Growth proportional to size on every axis is the definition of broad."""
+        plans = self._axis("plan_type",
+                           {"premium": 0.421, "standard": 0.445, "basic": 0.134},
+                           {"premium": 0.507, "standard": 0.371, "basic": 0.122},
+                           gap=181_599.0)
+        methods = self._axis(
+            "payment_method",
+            {"card": 0.248, "paypal": 0.249, "gp": 0.250, "app": 0.253},
+            {"card": 0.266, "paypal": 0.250, "gp": 0.243, "app": 0.240},
+            gap=181_599.0,
+        )
+        for d in (plans, methods):
+            assert leading_driver(d) is None, f"{d.dimension} should have no driver"
+
+    def test_a_segment_with_no_baseline_counts_as_over_contributing(self) -> None:
+        """
+        A bucket absent from the comparison window has no lift to compute — and is
+        a categorically different finding, a segment that did not exist before.
+        Treated as over-contributing rather than given an invented ratio.
+        """
+        d = decompose("plan_type",
+                      target=[b("new_tier", 400.0), b("standard", 600.0)],
+                      comparison=[b("standard", 600.0)])
+        new = next(c for c in d.contributions if c.label == "new_tier")
+        assert bucket_lift(new, d.comparison_total) is None
+        driver = leading_driver(d)
+        assert driver is not None and driver.label == "new_tier"
+
+    def test_lift_is_none_when_there_is_no_comparison_volume(self) -> None:
+        """Guards a division by zero on an empty comparison window."""
+        contribution = Contribution(label="a", target=10.0, comparison=0.0,
+                                    delta=10.0, share=1.0)
+        assert bucket_lift(contribution, 0.0) is None
+
+    def test_no_driver_means_the_axis_is_ruled_out(self) -> None:
+        """
+        The verdict must follow: a proportional axis is `not_it`, and its statement
+        must not name a bucket as though it were a cause.
+        """
+        d = self._axis("billing_cycle", {"monthly": 0.722, "annual": 0.278},
+                       {"monthly": 0.761, "annual": 0.239})
+        hypothesis = build_hypothesis(d)
+        assert hypothesis.verdict == "not_it"
+        assert "monthly" not in hypothesis.statement, (
+            "a ruled-out axis must not name its largest bucket as a driver"
+        )
+
+    def test_the_statement_reports_the_lift(self) -> None:
+        """
+        "47% of the gap" and "47% of the gap while being 45% of the base" are
+        different claims, and only the second lets the reader check it.
+        """
+        d = self._axis(
+            "plan_type",
+            {"standard": 0.455, "basic": 0.222, "premium": 0.323},
+            {"standard": 0.472, "basic": 0.376, "premium": 0.152},
+        )
+        statement = build_hypothesis(d).statement
+        assert "basic" in statement
+        assert "its share of the base" in statement
+        assert "1.6" in statement or "1.7" in statement, (
+            f"the lift multiple is not stated: {statement}"
+        )

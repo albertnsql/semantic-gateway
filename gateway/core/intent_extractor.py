@@ -78,11 +78,14 @@ _PROMPT_EXCLUDED_METRIC_FIELDS: frozenset[str] = frozenset({
 # sql_generator.py, which takes the opposite default -- there an unrecognised
 # error might be a genuine engine fault worth a retry; here it is almost always a
 # provider saying no.
-_TRANSIENT_LLM_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+# 408 and 504 are excluded: like a client-side timeout they mean the request
+# already consumed its budget without an answer.
+_TRANSIENT_LLM_STATUS = frozenset({409, 429, 500, 502, 503})
 
 _TRANSIENT_LLM_MARKERS = (
-    "timed out",
-    "timeout",
+    # "timed out" / "timeout" are deliberately ABSENT — see _is_transient_llm_error.
+    # A timeout is transient but expensive, and retrying one doubled a production
+    # failure from 16 s to 81 s.
     "high demand",          # Google 503: "currently experiencing high demand"
     "overloaded",
     "temporarily unavailable",
@@ -92,19 +95,52 @@ _TRANSIENT_LLM_MARKERS = (
 )
 
 
-def _is_transient_llm_error(exc: BaseException) -> bool:
-    """True when re-issuing the SAME request could plausibly succeed.
+def _is_timeout_error(exc: BaseException) -> bool:
+    """A request that got no response at all before the client gave up."""
+    status = _status_of(exc)
+    if status == 408 or status == 504:
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
 
-    Both production failures were the primary timing out at exactly the 15 s
-    ceiling — the request was still in flight, not refused — and the same key
-    intermittently returns 503 "experiencing high demand". Those are worth one
-    more attempt. A 404 for a retired model or a 402 for an empty balance is not.
-    """
+
+def _status_of(exc: BaseException) -> int | None:
     status = getattr(exc, "status_code", None)
     if status is None:
         response = getattr(exc, "response", None)
         status = getattr(response, "status_code", None)
-    if isinstance(status, int):
+    return status if isinstance(status, int) else None
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """True when re-issuing the SAME request could plausibly succeed CHEAPLY.
+
+    Transience is not the only thing that matters — the COST of being wrong does,
+    and it differs by a factor of 40 between the two shapes:
+
+    * 429 / 503 / 5xx come back in about a second, so a second attempt is nearly
+      free and often succeeds. Google returns intermittent 503 "experiencing high
+      demand" on this key.
+    * a TIMEOUT has already spent the entire per-attempt budget. Retrying it
+      doubles the user's wait for the same outcome.
+
+    That second case is not hypothetical. It is what production did on 2026-09-08:
+    `Show me total subscribers by plan type` timed out at 40 s, retried, timed out
+    at 40 s again, then hit the two dead rungs — a **81,154 ms** 400. The identical
+    query and prompt answer in 1.1-7.5 s locally, so Gemini was not slow, it was
+    unreachable from that host, and no number of retries was going to change that.
+    Before the retry existed the same failure took 16 s.
+
+    So timeouts are deliberately NOT retried. Everything else keeps the closed-list
+    treatment: an unrecognised error is not retried, because the failures actually
+    seen on the dead rungs are deterministic (404 retired model, 402 no credit, 400
+    bad request) and retrying those burns the budget to reach an identical verdict.
+    """
+    if _is_timeout_error(exc):
+        return False
+
+    status = _status_of(exc)
+    if status is not None:
         return status in _TRANSIENT_LLM_STATUS
 
     text = str(exc).lower()
@@ -322,40 +358,48 @@ class IntentExtractor:
         # exactly -- so a warehouse that never opens degrades rather than breaks.
         self._dimension_values: dict[str, list[str]] = {}
 
-        # Primary Client (Google Gemini)
-        self._primary_model = settings.google_model
-        if settings.google_api_key:
-            self._primary_client = OpenAI(
-                api_key=settings.google_api_key,
-                base_url=settings.google_base_url,
-                timeout=_LLM_TIMEOUT_S,
-                max_retries=_LLM_MAX_RETRIES,
-            )
+        # Rungs come from `settings.provider_chain()`, so the ORDER is config, not
+        # code. The slot names are kept — tests and the retry logic below address
+        # `_primary_*` — but which provider lands in each slot is now
+        # `llm_provider_order`. That matters because the right order depends on the
+        # HOST: Render cannot reach generativelanguage.googleapis.com at all, while
+        # the same instance reaches openrouter.ai in ~400 ms, and OpenRouter serves
+        # the identical google/gemini-3.1-flash-lite.
+        # `settings` is a real Settings object in production and a stand-in in
+        # tests. Calling the ONE implementation unbound covers both without a
+        # second copy of the ordering logic here.
+        chain_fn = getattr(settings, "provider_chain", None)
+        if callable(chain_fn):
+            chain = chain_fn()
         else:
-            self._primary_client = None
+            from config import Settings as _Settings
+            chain = _Settings.provider_chain(settings)
+        clients: list[tuple[str, object, str]] = []
+        for label, api_key, base_url, model in chain:
+            clients.append((
+                label,
+                OpenAI(
+                    api_key=api_key,
+                    base_url=base_url,
+                    timeout=_LLM_TIMEOUT_S,
+                    max_retries=_LLM_MAX_RETRIES,
+                ),
+                model,
+            ))
 
-        # Fallback Client (Groq)
-        self._fallback_model = settings.openai_model
-        self._fallback_client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.llm_base_url,
-            timeout=_LLM_TIMEOUT_S,
-            max_retries=_LLM_MAX_RETRIES,
+        def _slot(index: int):
+            return clients[index] if index < len(clients) else (None, None, "")
+
+        (_, self._primary_client, self._primary_model) = _slot(0)
+        (_, self._fallback_client, self._fallback_model) = _slot(1)
+        (_, self._tertiary_client, self._tertiary_model) = _slot(2)
+
+        logger.info(
+            "IntentExtractor initialised (order=%s): primary=%s fallback=%s tertiary=%s",
+            getattr(settings, "llm_provider_order", "(default)"),
+            self._primary_model or "(none)",
+            self._fallback_model or "(none)", self._tertiary_model or "(none)",
         )
-
-        # Tertiary Client (OpenRouter)
-        self._tertiary_model = settings.openrouter_model
-        if settings.openrouter_api_key:
-            self._tertiary_client = OpenAI(
-                api_key=settings.openrouter_api_key,
-                base_url=settings.openrouter_base_url,
-                timeout=_LLM_TIMEOUT_S,
-                max_retries=_LLM_MAX_RETRIES,
-            )
-        else:
-            self._tertiary_client = None
-
-        logger.info("IntentExtractor initialised: primary=%s fallback=%s tertiary=%s", self._primary_model, self._fallback_model, self._tertiary_model)
 
     def extract(
         self,

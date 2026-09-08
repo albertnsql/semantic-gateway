@@ -59,6 +59,53 @@ DEFAULT_MIN_SHARE = 0.05
 DEFAULT_MIN_ABSOLUTE = 1e-9
 # At or above this, one dimension is the answer rather than a part of it.
 DEFAULT_STRONG_SHARE = 0.60
+#: How much MORE than its own size a bucket must carry before it counts as driving
+#: the movement. A bucket holding 45% of the base and 47% of the gap has a lift of
+#: 1.04 -- it moved exactly in proportion to how big it is, which is arithmetic, not
+#: a finding. Without this gate the largest bucket almost always wins, and the
+#: largest bucket is the least informative answer available.
+#:
+#: Calibrated on the June-2026 churn case, where the two readings are unambiguous::
+#:
+#:     bucket                 base    gap    lift
+#:     plan_type=standard    45.5%  47.2%   1.04x   <- named as the cause, wrongly
+#:     plan_type=basic       22.2%  37.6%   1.69x   <- the actual driver
+#:     billing_cycle=monthly 72.2%  76.1%   1.05x   <- named as the cause, wrongly
+#:
+#: CLAUDE.md already records the business fact this recovers: "standard is the
+#: largest plan, so it wins on count while basic is worst on rate."
+#:
+#: 1.25 sits clear of proportional noise (1.04-1.05) with margin below the real
+#: signal (1.69). Low-cardinality axes are the reason it matters most: with two
+#: buckets one MUST hold >= 50% of the gap unless they are near-balanced, so a
+#: share-only test grades `billing_cycle` as explaining almost any movement.
+DEFAULT_MIN_LIFT = 1.25
+#: A bucket must carry at least this much of the gap to be named its DRIVER. That
+#: is a higher bar than DEFAULT_MIN_SHARE (0.05), which only decides whether a
+#: bucket is worth mentioning — being 5% of a movement and being its cause are
+#: different claims.
+#:
+#: Both floors are needed, and each without the other misfires on real data:
+#:
+#:   * lift alone, at the 5% floor: revenue H1-2026 grew +181,599 and `country=DE`
+#:     carries 7.5% of that at 1.31x lift, so DE would be reported as the driver of
+#:     a movement it accounts for a fourteenth of.
+#:   * share alone: `billing_cycle=monthly` carries 76.1% of the June churn gap at
+#:     1.05x lift — proportional to its 72.2% of the base, and not a finding.
+#:
+#: Checked against every real case available:
+#:
+#:     case                            share   lift   driver?
+#:     churn Jun  plan_type=basic      37.6%  1.69x   yes  <- the real story
+#:     churn Jun  plan_type=standard   47.2%  1.04x   no   (merely the biggest)
+#:     churn Jun  billing_cycle=monthly 76.1% 1.05x   no   (merely the biggest)
+#:     revenue H1 plan_type=premium    50.7%  1.20x   no   (below the lift floor)
+#:     revenue H1 country=DE            7.5%  1.31x   no   (below the share floor)
+#:     revenue H1 payment_method=card  26.6%  1.08x   no   (proportional)
+#:
+#: which preserves the deliberately calibrated "revenue growth is broad-based"
+#: verdict while recovering the churn finding the old rule inverted.
+DEFAULT_DRIVER_MIN_SHARE = 0.25
 
 
 def _to_map(buckets: Iterable[Bucket]) -> dict[str | None, Bucket]:
@@ -208,6 +255,74 @@ def concentration(decomposition: Decomposition) -> tuple[float, int]:
     return top_share, count
 
 
+def bucket_lift(contribution: Contribution, comparison_total: float) -> float | None:
+    """How much more (or less) of the gap a bucket carries than its size implies.
+
+    ``lift = share of the gap / share of the comparison-period base``
+
+    1.0 means proportional — the bucket moved exactly as much as being that big
+    would predict. Above 1.0 it is over-contributing, which is the only thing that
+    makes it a candidate cause.
+
+    Returns None when the bucket has no baseline at all (it appears only in the
+    target window). That is not a lift of infinity to be reported as a huge number;
+    it is a categorically different finding — a segment that did not exist before —
+    and callers treat it as over-contributing without inventing a ratio.
+    """
+    if not comparison_total:
+        return None
+    base_share = contribution.comparison / comparison_total
+    if not base_share:
+        return None
+    gap_share = contribution.share
+    return abs(gap_share) / abs(base_share)
+
+
+def leading_driver(
+    decomposition: Decomposition,
+    *,
+    min_share: float = DEFAULT_DRIVER_MIN_SHARE,
+    min_lift: float = DEFAULT_MIN_LIFT,
+) -> Contribution | None:
+    """The bucket that actually drives the movement, or None if none does.
+
+    Two conditions, and dropping either one produces a bad answer:
+
+    * **material** — it carries at least *min_share* of the gap. Without this a
+      0.1% bucket that doubled has a huge lift and would be reported as the cause
+      of a movement it cannot account for.
+    * **over-contributing** — lift >= *min_lift*, i.e. it carries more of the gap
+      than its size implies. Without this the biggest bucket wins by construction:
+      `Decomposition.top` is simply `contributions[0]`, sorted by absolute delta.
+
+    Among the buckets that qualify, the largest absolute delta wins, so the answer
+    still names the segment carrying the most movement — just not one that is
+    merely large.
+
+    Only same-signed buckets are eligible: a bucket moving against the gap is not
+    driving it.
+    """
+    if not decomposition.contributions or not decomposition.gap:
+        return None
+
+    aligned = [
+        c for c in decomposition.contributions
+        if (c.delta > 0) == (decomposition.gap > 0) and c.delta
+    ]
+    qualified = []
+    for c in aligned:
+        if abs(c.share) < min_share:
+            continue
+        lift = bucket_lift(c, decomposition.comparison_total)
+        # None = no baseline, i.e. a segment new in the target window. Genuinely
+        # over-contributing, and there is no ratio to compare.
+        if lift is None or lift >= min_lift:
+            qualified.append(c)
+    if not qualified:
+        return None
+    return max(qualified, key=lambda c: abs(c.delta))
+
+
 def explained_share(decomposition: Decomposition) -> float:
     """
     Fraction of the gap the same-signed buckets account for.
@@ -304,12 +419,23 @@ def build_hypothesis(
             decomposition=decomposition,
         )
 
-    if top is None or top_share < min_share:
+    # The bucket that drives the gap, which is NOT `decomposition.top` — that is
+    # simply the largest, and the largest bucket carries the most movement almost
+    # by definition. A live churn answer named `plan_type = standard` (45.5% of the
+    # base, 47.2% of the gap, lift 1.04) while `basic` (22.2% base, 37.6% gap, lift
+    # 1.69) was the real story. See leading_driver().
+    # Deliberately NOT `min_share=min_share`: that argument is the REPORTING floor
+    # (5%), and a bucket carrying 5% of a movement is not its cause. leading_driver
+    # applies DEFAULT_DRIVER_MIN_SHARE instead.
+    driver = leading_driver(decomposition)
+    if driver is None:
+        biggest = f"{top_share:.1%}" if top is not None else "0.0%"
         return Hypothesis(
             dimension=dim,
             statement=(
-                f"{dim} does not explain the gap - no single value accounts for "
-                f"more than {top_share:.1%} of it."
+                f"{dim} does not explain the gap - no value carries meaningfully "
+                f"more of it than its own size implies (largest single share "
+                f"{biggest})."
             ),
             confidence=confidence,
             verdict="not_it",
@@ -317,6 +443,8 @@ def build_hypothesis(
             evidence=list(evidence),
             decomposition=decomposition,
         )
+    top = driver
+    top_share = abs(driver.delta / decomposition.gap)
 
     label = "(not set)" if top.label is None else top.label
     direction = "lower" if decomposition.gap < 0 else "higher"
@@ -326,6 +454,17 @@ def build_hypothesis(
         f"{dim} = {label} accounts for {top_share:.1%} of the gap "
         f"({_fmt(top.delta)} of {_fmt(decomposition.gap)})"
     ]
+    # Stated explicitly, because "47% of the gap" and "47% of the gap while being
+    # 45% of the base" are different claims and only the second is checkable by
+    # the reader.
+    lift = bucket_lift(top, decomposition.comparison_total)
+    if lift is not None:
+        base_share = abs(top.comparison / decomposition.comparison_total)
+        parts.append(
+            f"{lift:.2f}x its share of the base ({base_share:.1%})"
+        )
+    else:
+        parts.append("a segment with no presence in the comparison period")
     if to_eighty > 1:
         parts.append(f"{to_eighty} values are needed to reach 80%, so it is spread")
     if decomposition.weighted and top.mix_effect is not None:
@@ -493,9 +632,20 @@ def is_broad_based(
     if len(graded) < 2:
         return False
 
-    return all(
-        concentration(h.decomposition)[0] < dominant_share for h in graded
-    )
+    # One condition: no axis has an over-contributing driver.
+    #
+    # A `top_share < dominant_share` ceiling used to sit alongside this and has been
+    # REMOVED, because the two disagree and the share test is the weaker one. On
+    # measured revenue growth, `plan_type = premium` holds 50.7% of the gap while
+    # being 42.1% of the base — a lift of 1.20, i.e. essentially proportional and
+    # not a finding — yet 50.7% trips a 50% share ceiling. Keeping both meant the
+    # cruder test overrode the better one and the verdict flipped to "concentrated"
+    # on the strength of a bucket merely being large.
+    #
+    # `dominant_share` is retained in the signature and no longer consulted, so
+    # existing callers keep working; the concentration threshold still governs
+    # `build_hypothesis`'s explains/partial split, which is a different question.
+    return all(leading_driver(h.decomposition) is None for h in graded)
 
 
 def rank_hypotheses(hypotheses: Iterable[Hypothesis]) -> list[Hypothesis]:

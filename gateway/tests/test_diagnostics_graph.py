@@ -215,12 +215,18 @@ class TestSynthesizeNode:
         Three weak partials is honest and useless. Reproduces the live revenue shape:
         every axis moves, none by as much as half.
         """
+        # The BASE shares match the gap shares, so every bucket carries the movement
+        # exactly in proportion to its size — lift 1.0 across the board, which is
+        # what "broad-based" means. The original fixture gave all three buckets an
+        # identical base of 100, which made the 43.6% leader a 1.31x
+        # over-contributor and so genuinely concentrated: it reproduced the live top
+        # SHARES while inventing weights the live case did not have.
         values = {}
         for dim in ("plan_type", "country", "payment_method", "is_renewal"):
             values[("total_revenue", dim, "2026-01-01")] = {
-                "a": 143.6, "b": 130.0, "c": 126.4}
+                "a": 174.4, "b": 120.0, "c": 105.6}
             values[("total_revenue", dim, "2025-07-01")] = {
-                "a": 100.0, "b": 100.0, "c": 100.0}
+                "a": 130.8, "b": 90.0, "c": 79.2}
         values[("total_revenue", "", "2026-01-01")] = {"t": 400.0}
         values[("total_revenue", "", "2025-07-01")] = {"t": 300.0}
         state = initial_state("why is revenue up", "total_revenue", TARGET,
@@ -440,13 +446,30 @@ class TestReflectLoop:
     """
 
     @staticmethod
-    def _hyp(verdict: str, gap: float, top_share: float, dimension: str = "d"):
+    def _hyp(verdict: str, gap: float, top_share: float, dimension: str = "d",
+             base_share: float | None = None):
+        """A decomposition with a REAL baseline, so lift is defined.
+
+        `base_share` defaults to `top_share`, i.e. the leading bucket carried the
+        movement exactly in proportion to its size — lift 1.0, no driver. Pass a
+        smaller value to make it over-contribute.
+
+        The original version left `comparison=0.0`, which made every bucket look
+        like a segment with no baseline. `bucket_lift()` returns None for those and
+        callers treat them as over-contributing, so every fixture accidentally had
+        a driver and the loop tests asserted the opposite of what they set up.
+        """
         from core.diagnostics.state import Contribution, Decomposition, Hypothesis
 
+        if base_share is None:
+            base_share = top_share
+        comparison_total = 100.0
         contributions = [
-            Contribution(label="a", target=0.0, comparison=0.0,
+            Contribution(label="a", target=0.0,
+                         comparison=comparison_total * base_share,
                          delta=gap * top_share, share=top_share),
-            Contribution(label="b", target=0.0, comparison=0.0,
+            Contribution(label="b", target=0.0,
+                         comparison=comparison_total * (1 - base_share),
                          delta=gap * (1 - top_share), share=1 - top_share),
         ]
         return Hypothesis(
@@ -501,7 +524,9 @@ class TestReflectLoop:
         from core.diagnostics.analysis import DEFAULT_MIN_ABSOLUTE
         from core.diagnostics.graph import should_reflect
 
-        strong = [self._hyp("explains", DEFAULT_MIN_ABSOLUTE * 100, 0.80)]
+        # 80% of the gap off 40% of the base — a lift of 2.0, a genuine driver.
+        strong = [self._hyp("explains", DEFAULT_MIN_ABSOLUTE * 100, 0.80,
+                            base_share=0.40)]
         assert should_reflect(self._state(hypotheses=strong)) == "synthesize"
 
     def test_an_immaterial_gap_stops_the_loop(self) -> None:
