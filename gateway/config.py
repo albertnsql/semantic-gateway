@@ -127,7 +127,21 @@ class Settings(BaseSettings):
     # Decomposition axes per diagnosis. Each costs 2 probes, or 4 for a metric with
     # a weight_metric. Three is 14 probes for a weighted metric, ~60ms each warm.
     diagnostics_max_dimensions: int = 3
-    diagnostics_max_probes: int = 16
+    # Raised from 16 when the reflect loop landed. 16 fitted ONE round: churn_rate
+    # plans 15 probes (3 baseline/comparison/trend + 4 per weighted axis x 3 axes),
+    # so a second round had one probe of headroom and could not afford the pair any
+    # axis needs. The loop would have fired, planned nothing, and looked like it
+    # simply found no cause.
+    #
+    # 40 is the measured worst case across the driver graph, not a guess:
+    # engagement_rate has 9 usable axes, all reachable within 3 rounds x 3
+    # dimensions, and weighted, giving 3 + 9*4 = 39. Every other metric is lower.
+    #
+    # This is a runaway guard, not a performance one. At ~60 ms per warm probe, 39
+    # probes is ~2.4 s of warehouse time against a 25 s deadline — so
+    # `diagnostics_deadline_seconds` is what actually bounds a slow run, and this
+    # bounds a planner bug.
+    diagnostics_max_probes: int = 40
     # A diagnosis is bounded by wall clock as well as probe count, because the
     # characteristic failure of this kind of agent is not stopping.
     diagnostics_deadline_seconds: float = 25.0

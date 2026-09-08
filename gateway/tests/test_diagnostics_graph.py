@@ -422,3 +422,220 @@ class TestCompiledGraph:
             _config(_SqlGenerator(_values_for_revenue_drop()), graph),
         )
         assert final["answer"]
+
+
+class TestReflectLoop:
+    """
+    The conditional edge from `analyze` back to `plan`.
+
+    Before it, a diagnosis that found nothing answered "I cannot tell" while the
+    driver graph still held dimensions it had never asked about. `Budget.max_rounds`
+    and `rounds_used` were modelled in state.py and referenced nowhere.
+
+    The gate is `concentration()` against `DEFAULT_DOMINANT_SHARE`, NOT the verdict.
+    Gating on `verdict in ("explains", "partial")` — the obvious reading of "clears
+    the effect-size floor" — meant the loop could never fire: all nine snapshot
+    scenarios return `partial` on every axis, because `partial` means "this axis
+    leads a bit", not "this is the cause".
+    """
+
+    @staticmethod
+    def _hyp(verdict: str, gap: float, top_share: float, dimension: str = "d"):
+        from core.diagnostics.state import Contribution, Decomposition, Hypothesis
+
+        contributions = [
+            Contribution(label="a", target=0.0, comparison=0.0,
+                         delta=gap * top_share, share=top_share),
+            Contribution(label="b", target=0.0, comparison=0.0,
+                         delta=gap * (1 - top_share), share=1 - top_share),
+        ]
+        return Hypothesis(
+            dimension=dimension, statement="s", confidence="contribution",
+            verdict=verdict, explained_share=1.0, evidence=[],
+            decomposition=Decomposition(
+                dimension=dimension, target_total=100.0 + gap,
+                comparison_total=100.0, gap=gap, contributions=contributions,
+            ),
+        )
+
+    def _state(self, **overrides):
+        from core.diagnostics.analysis import DEFAULT_MIN_ABSOLUTE
+        from core.diagnostics.playbooks import ProbePlan
+
+        big = DEFAULT_MIN_ABSOLUTE * 100
+        state = {
+            "plan": ProbePlan(metric="churn_rate", target=TARGET,
+                              comparison=TARGET, probes=[]),
+            "budget": Budget(rounds_used=1),
+            "dimensions_remaining": 3,
+            "hypotheses": [
+                self._hyp("partial", big, 0.30, "plan_type"),
+                self._hyp("partial", big, 0.28, "country"),
+                self._hyp("partial", big, 0.25, "acquisition_channel"),
+            ],
+        }
+        state.update(overrides)
+        return state
+
+    def test_it_reflects_when_nothing_leads_the_movement(self) -> None:
+        """Three weak partials with axes left is the case the loop exists for."""
+        from core.diagnostics.graph import should_reflect
+
+        assert should_reflect(self._state()) == "plan"
+
+    def test_it_reflects_after_a_single_inconclusive_axis(self) -> None:
+        """
+        `is_broad_based()` returns False for one axis ("one slice says nothing
+        about breadth"), which is right for deciding what to REPORT and wrong for
+        deciding whether to continue. Reusing it here would stop the loop on
+        exactly the diagnosis most worth extending.
+        """
+        from core.diagnostics.analysis import DEFAULT_MIN_ABSOLUTE, is_broad_based
+        from core.diagnostics.graph import should_reflect
+
+        one = [self._hyp("partial", DEFAULT_MIN_ABSOLUTE * 100, 0.30)]
+        assert not is_broad_based(one), "fixture assumption changed"
+        assert should_reflect(self._state(hypotheses=one)) == "plan"
+
+    def test_a_dominant_axis_stops_the_loop(self) -> None:
+        from core.diagnostics.analysis import DEFAULT_MIN_ABSOLUTE
+        from core.diagnostics.graph import should_reflect
+
+        strong = [self._hyp("explains", DEFAULT_MIN_ABSOLUTE * 100, 0.80)]
+        assert should_reflect(self._state(hypotheses=strong)) == "synthesize"
+
+    def test_an_immaterial_gap_stops_the_loop(self) -> None:
+        """
+        The gate easiest to get wrong. `build_hypothesis()` returns `inconclusive`
+        both for an untrustworthy residual AND for "the metric barely moved". No
+        axis can decompose a gap that is not there, so looping on the second would
+        spend every round to reconclude the same nothing.
+        """
+        from core.diagnostics.graph import should_reflect
+
+        flat = [self._hyp("inconclusive", 0.0, 0.30)]
+        assert should_reflect(self._state(hypotheses=flat)) == "synthesize"
+
+    @pytest.mark.parametrize("budget", [
+        Budget(rounds_used=3), Budget(probes_used=40), Budget(seconds_used=99.0),
+    ])
+    def test_every_budget_arm_stops_the_loop(self, budget) -> None:
+        from core.diagnostics.graph import should_reflect
+
+        assert should_reflect(self._state(budget=budget)) == "synthesize"
+
+    def test_no_axes_left_stops_the_loop(self) -> None:
+        """
+        The termination guarantee, and it must not depend on the budget: each round
+        consumes axes from a finite list and the planner excludes what was already
+        asked, so the loop cannot spin even with max_rounds misconfigured.
+        """
+        from core.diagnostics.graph import should_reflect
+
+        assert should_reflect(self._state(dimensions_remaining=0)) == "synthesize"
+
+    def test_no_plan_stops_the_loop(self) -> None:
+        from core.diagnostics.graph import should_reflect
+
+        assert should_reflect(self._state(plan=None)) == "synthesize"
+
+
+class TestReflectRoundPlanning:
+    def test_a_second_round_asks_for_different_axes(self, graph) -> None:
+        first = plan_node(
+            initial_state("why", "churn_rate", TARGET),
+            _config(_SqlGenerator({}), graph),
+        )
+        state = initial_state("why", "churn_rate", TARGET)
+        state.update(first)
+        second = plan_node(state, _config(_SqlGenerator({}), graph))
+
+        new = [d for d in second["plan"].dimensions
+               if d not in first["plan"].dimensions]
+        assert new, "the second round re-selected the same axes"
+        assert second["budget"].rounds_used == 2
+
+    def test_the_plan_stays_cumulative(self, graph) -> None:
+        """
+        `pair_findings()` iterates plan.probes, so a plan holding only the NEW
+        dimensions would drop round one's pairs and lose its hypotheses.
+        """
+        first = plan_node(
+            initial_state("why", "churn_rate", TARGET),
+            _config(_SqlGenerator({}), graph),
+        )
+        state = initial_state("why", "churn_rate", TARGET)
+        state.update(first)
+        second = plan_node(state, _config(_SqlGenerator({}), graph))
+
+        for dimension in first["plan"].dimensions:
+            assert dimension in second["plan"].dimensions
+        assert len(second["plan"].probes) > len(first["plan"].probes)
+
+    def test_the_baseline_probes_are_not_planned_twice(self, graph) -> None:
+        """Re-adding them would spend slots re-deriving the same totals."""
+        first = plan_node(
+            initial_state("why", "churn_rate", TARGET),
+            _config(_SqlGenerator({}), graph),
+        )
+        state = initial_state("why", "churn_rate", TARGET)
+        state.update(first)
+        second = plan_node(state, _config(_SqlGenerator({}), graph))
+
+        labels = [p.label for p in second["plan"].probes]
+        assert len(labels) == len(set(labels)), "a probe was planned twice"
+        baselines = [p for p in second["plan"].probes if not p.dimension]
+        assert len(baselines) == 3, "baseline/comparison/trend duplicated"
+
+    def test_the_budget_trims_only_unanswered_probes(self, graph) -> None:
+        """
+        The bug this guards. churn_rate plans 15 probes; comparing the CUMULATIVE
+        length against `probes_remaining` trimmed round one's probes away, and the
+        single survivor carries no dimension, so the round added no axis either --
+        silently, looking exactly like "the loop found nothing".
+        """
+        first = plan_node(
+            initial_state("why", "churn_rate", TARGET, budget=Budget(max_probes=40)),
+            _config(_SqlGenerator({}), graph),
+        )
+        answered = [
+            Finding(id=f"F{i}", label=p.label, metric=p.metric,
+                    dimensions=p.dimensions, rows=[{"x": 1}])
+            for i, p in enumerate(first["plan"].probes, 1)
+        ]
+        state = initial_state("why", "churn_rate", TARGET,
+                              budget=Budget(max_probes=40))
+        state.update(first)
+        state["findings"] = answered
+        state["budget"] = Budget(max_probes=40,
+                                 probes_used=len(first["plan"].probes))
+
+        second = plan_node(state, _config(_SqlGenerator({}), graph))
+        kept = {p.label for p in second["plan"].probes}
+        for probe in first["plan"].probes:
+            assert probe.label in kept, (
+                "an already-answered probe was trimmed out of the cumulative plan"
+            )
+
+
+class TestAnswerOrdering:
+    def test_the_strongest_finding_is_reported_first(self) -> None:
+        """
+        `rank_hypotheses()` orders by `explained_share`, which is ~1.0 for almost
+        every additive decomposition, so among partials the order carried no
+        strength information: a live answer put `country = AU at 10.1%` two lines
+        above `plan_type = standard at 47.8%` while every statement quotes its own
+        top share.
+        """
+        from core.diagnostics.graph import _top_share
+
+        weak = TestReflectLoop._hyp("partial", 100.0, 0.101, "country")
+        strong = TestReflectLoop._hyp("partial", 100.0, 0.478, "plan_type")
+        assert _top_share(strong) > _top_share(weak)
+        assert sorted([weak, strong], key=lambda h: -_top_share(h))[0] is strong
+
+    def test_top_share_is_zero_when_there_is_no_gap(self) -> None:
+        """Guards a ZeroDivisionError on a metric that did not move."""
+        from core.diagnostics.graph import _top_share
+
+        assert _top_share(TestReflectLoop._hyp("inconclusive", 0.0, 0.5)) == 0.0

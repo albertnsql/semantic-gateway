@@ -172,7 +172,13 @@ class Budget:
     """
 
     max_rounds: int = 3
-    max_probes: int = 12
+    # Matches config.diagnostics_max_probes, which the route always supplies. This
+    # default only applies where no budget is passed (test harnesses,
+    # scratch/try_diagnosis.py) — and at 12 it starved the reflect loop there while
+    # production ran fine, which is the most confusing way for the two to disagree.
+    # 40 is the measured worst case: engagement_rate reaches 9 axes over 3 rounds
+    # and is weighted, so 3 + 9*4 = 39.
+    max_probes: int = 40
     deadline_seconds: float = 25.0
     probes_used: int = 0
     rounds_used: int = 0

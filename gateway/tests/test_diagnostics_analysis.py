@@ -597,17 +597,24 @@ class TestBudget:
     def test_not_spent_when_fresh(self) -> None:
         assert not Budget().spent
 
-    @pytest.mark.parametrize(
-        "kwargs, needle",
-        [
-            ({"rounds_used": 3}, "round"),
-            ({"probes_used": 12}, "probe"),
-            ({"seconds_used": 25.0}, "deadline"),
-        ],
-    )
-    def test_each_limit_stops_the_loop_and_explains_itself(self, kwargs, needle) -> None:
-        budget = Budget(**kwargs)
-        assert budget.spent
+    # Derived from the defaults rather than hardcoded. These were literals
+    # (rounds 3 / probes 12 / seconds 25.0) and the probe one silently stopped
+    # testing anything when `max_probes` went 12 -> 40 for the reflect loop: 12 no
+    # longer exhausts the budget, so `spent` was False and the assertion failed for
+    # the right reason but the wrong cause.
+    @pytest.mark.parametrize("field, needle", [
+        ("rounds_used", "round"),
+        ("probes_used", "probe"),
+        ("seconds_used", "deadline"),
+    ])
+    def test_each_limit_stops_the_loop_and_explains_itself(self, field, needle) -> None:
+        limit = {
+            "rounds_used": Budget().max_rounds,
+            "probes_used": Budget().max_probes,
+            "seconds_used": Budget().deadline_seconds,
+        }[field]
+        budget = Budget(**{field: limit})
+        assert budget.spent, f"{field}={limit} should exhaust the budget"
         assert needle in budget.why_spent()
 
     def test_probes_remaining_never_negative(self) -> None:

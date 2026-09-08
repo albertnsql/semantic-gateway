@@ -66,7 +66,10 @@ else:
         RunnableConfig = dict
 
 from core.diagnostics.analysis import (
+    DEFAULT_DOMINANT_SHARE,
+    DEFAULT_MIN_ABSOLUTE,
     baseline_representativeness,
+    concentration,
     build_hypothesis,
     decompose,
     is_broad_based,
@@ -112,6 +115,16 @@ class GraphState(TypedDict, total=False):
     budget: Budget
     answer: str
     stopped_because: str
+    # ── reflect-loop bookkeeping ────────────────────────────────────────────
+    # Dimensions already asked about, so a second round asks something NEW rather
+    # than re-selecting the same top-N and burning the round cap on an identical
+    # plan. NOT an additive reducer: plan_node rewrites it wholesale, and an
+    # additive one would accumulate duplicates across rounds.
+    probed_dimensions: list[str]
+    # How many axes the driver graph still has left. Computed in plan_node so the
+    # conditional edge can decide without needing the DriverGraph — a plain
+    # function on the edge does not get services injected the way a node does.
+    dimensions_remaining: int
 
 
 def _services(config: RunnableConfig) -> dict:
@@ -157,6 +170,8 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
     """
     graph: DriverGraph = _services(config).get("driver_graph") or DriverGraph.load()
     metric = state["metric"]
+    already = list(state.get("probed_dimensions") or [])
+    previous: ProbePlan | None = state.get("plan")
     try:
         plan = plan_time_comparison(
             metric,
@@ -166,6 +181,7 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
             max_dimensions=state.get("max_dimensions", 3),
             filters=state.get("filters") or [],
             weight_available=_weight_availability(_services(config)),
+            exclude_dimensions=already,
         )
     except KeyError as exc:
         logger.info("no playbook for %s: %s", metric, exc)
@@ -175,15 +191,50 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
         }
 
     budget = state.get("budget") or Budget()
-    if len(plan.probes) > budget.probes_remaining:
-        # Trim rather than refuse: a two-dimension diagnosis is worth more than none.
-        keep = plan.probes[: budget.probes_remaining]
+
+    # ── merge BEFORE trimming ───────────────────────────────────────────────
+    # `pair_findings()` iterates plan.probes, so a plan holding only the NEW
+    # dimensions would drop round one's pairs and lose its hypotheses. The plan
+    # therefore stays CUMULATIVE, and `execute_probes_node` skips whatever already
+    # has a finding — which also makes re-entering this node idempotent.
+    #
+    # Only probes carrying a `dimension` are carried over. The baseline/comparison/
+    # trend trio has none and is already answered; re-adding it would re-derive the
+    # same totals.
+    if previous is not None and already:
+        fresh = [pr for pr in plan.probes if pr.dimension]
+        plan = ProbePlan(
+            metric=previous.metric,
+            target=previous.target,
+            comparison=previous.comparison,
+            probes=previous.probes + fresh,
+            dimensions=previous.dimensions + plan.dimensions,
+            cautions=previous.cautions,
+            weight_metric=previous.weight_metric,
+            trend=previous.trend,
+            notes=previous.notes + plan.notes,
+        )
+
+    # ── trim only what has NOT been run ─────────────────────────────────────
+    # The budget bounds remaining WORK, and on a reflect round most of the plan is
+    # already executed. Comparing the cumulative length against `probes_remaining`
+    # would trim round one's probes away: churn_rate plans 15 and the default cap is
+    # 16, so round two saw `probes_remaining == 1` and would have cut a 27-probe
+    # cumulative plan down to a single baseline probe — discarding every finding's
+    # pairing and, because that survivor carries no dimension, adding no new axis
+    # either. Silent, and it would have looked like the loop simply found nothing.
+    answered = {f.label for f in (state.get("findings") or []) if f.ok}
+    done = [pr for pr in plan.probes if pr.label in answered]
+    pending = [pr for pr in plan.probes if pr.label not in answered]
+    if len(pending) > budget.probes_remaining:
+        # Trim rather than refuse: a two-dimension diagnosis beats none.
+        keep = pending[: budget.probes_remaining]
         logger.info(
-            "probe budget trims the plan from %d to %d", len(plan.probes), len(keep)
+            "probe budget trims %d pending probe(s) to %d", len(pending), len(keep)
         )
         plan = ProbePlan(
             metric=plan.metric, target=plan.target, comparison=plan.comparison,
-            probes=keep, dimensions=plan.dimensions, cautions=plan.cautions,
+            probes=done + keep, dimensions=plan.dimensions, cautions=plan.cautions,
             weight_metric=plan.weight_metric,
             # `trend` must be carried, or a trimmed plan silently loses the baseline
             # representativeness check and the answer stops warning about an
@@ -192,11 +243,25 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
             notes=plan.notes + ["the probe budget trimmed this plan"],
         )
 
+    budget.rounds_used += 1
+    # Axes the driver graph still holds. Compared on the plan's own dimension
+    # strings, which is what `exclude_dimensions` will be given next round.
+    remaining = [
+        d for d in graph.ordered_dimensions(metric)
+        if d not in plan.dimensions
+    ]
+
     logger.info(
-        "planned %d probe(s) for %s over %s vs %s",
-        len(plan.probes), metric, plan.target, plan.comparison,
+        "round %d: %d probe(s) planned for %s over %s vs %s (%d axis/axes left)",
+        budget.rounds_used, len(plan.probes), metric, plan.target, plan.comparison,
+        len(remaining),
     )
-    return {"plan": plan}
+    return {
+        "plan": plan,
+        "budget": budget,
+        "probed_dimensions": list(plan.dimensions),
+        "dimensions_remaining": len(remaining),
+    }
 
 
 def execute_probes_node(state: GraphState, config: RunnableConfig = None) -> dict:
@@ -217,6 +282,15 @@ def execute_probes_node(state: GraphState, config: RunnableConfig = None) -> dic
     query_cache = services.get("query_cache")
     budget = state.get("budget") or Budget()
 
+    # Findings already gathered by an earlier round. Two reasons this matters:
+    #   * a probe whose label is already answered is SKIPPED, so a reflect round
+    #     costs only its new axes rather than re-running the whole cumulative plan;
+    #   * `run_governed_query` derives finding ids from `existing`, so seeding it
+    #     keeps them unique. Starting from an empty list would mint a second F1 and
+    #     the answer's [F1] citation would point at two different probes.
+    prior: list[Finding] = list(state.get("findings") or [])
+    answered = {f.label for f in prior if f.ok}
+
     findings: list[Finding] = []
     # The clock starts AFTER the first probe. The first one can pay the warm
     # MetricFlow engine build — measured at 43 s cold — which is one-off
@@ -227,6 +301,8 @@ def execute_probes_node(state: GraphState, config: RunnableConfig = None) -> dic
     # cannot be cancelled anyway, so counting it only mislabels the cause.
     started: float | None = None
     for probe in plan.probes:
+        if probe.label in answered:
+            continue
         if started is not None and budget.spent:
             logger.info("budget spent mid-plan: %s", budget.why_spent())
             break
@@ -238,15 +314,17 @@ def execute_probes_node(state: GraphState, config: RunnableConfig = None) -> dic
         try:
             finding = run_governed_query(
                 intent, validator=validator, sql_generator=sql_generator,
-                existing=findings, label=probe.label, query_cache=query_cache,
+                existing=prior + findings, label=probe.label,
+                query_cache=query_cache,
             )
         except ProbeRejected as exc:
             # Governance said no. That is a driver-graph bug, not a data problem, so
             # record it as a failed finding and keep going rather than aborting.
             logger.warning("probe rejected: %s", exc)
             finding = Finding(
-                id=f"F{len(findings) + 1}", label=probe.label, metric=probe.metric,
-                dimensions=probe.dimensions, rows=[], error=str(exc),
+                id=f"F{len(prior) + len(findings) + 1}", label=probe.label,
+                metric=probe.metric, dimensions=probe.dimensions, rows=[],
+                error=str(exc),
             )
         findings.append(finding)
         budget.probes_used += 1
@@ -257,8 +335,9 @@ def execute_probes_node(state: GraphState, config: RunnableConfig = None) -> dic
 
     ok = sum(1 for f in findings if f.ok)
     logger.info(
-        "executed %d probe(s), %d ok, in %.0f ms after warm-up",
-        len(findings), ok, budget.seconds_used * 1000,
+        "executed %d new probe(s), %d ok, %d already answered, in %.0f ms "
+        "after warm-up",
+        len(findings), ok, len(answered), budget.seconds_used * 1000,
     )
     return {"findings": findings, "budget": budget}
 
@@ -336,6 +415,120 @@ def _attach_weights(buckets, weight_finding, dimension_column, weight_metric):
         return buckets
     by_label = {w.label: w.value for w in weight_buckets}
     return [Bucket(b.label, b.value, by_label.get(b.label)) for b in buckets]
+
+
+# How many hypotheses the answer enumerates before summarising the rest. Three
+# keeps a reflect-loop answer the same length as a single-round one, so extra
+# rounds buy accuracy rather than verbosity.
+_MAX_REPORTED_HYPOTHESES = 3
+
+
+def _top_share(hypothesis: Hypothesis) -> float:
+    """Share of the gap held by this axis's largest single mover.
+
+    The quantity the statements quote, and therefore the one the reader compares.
+    Distinct from `explained_share`, which is the decomposition's total coverage.
+    """
+    decomposition = hypothesis.decomposition
+    if decomposition is None or not decomposition.gap:
+        return 0.0
+    top = decomposition.top
+    if top is None:
+        return 0.0
+    return abs(top.delta / decomposition.gap)
+
+
+def should_reflect(state: GraphState) -> str:
+    """
+    After analysis: try another set of axes, or write the answer.
+
+    Returns the next node name. Four gates, and every one of them is a way the
+    loop could otherwise do harm rather than good:
+
+    1. **Something already explains it.** Judged by `is_broad_based()`, NOT by the
+       verdict. That distinction is the whole reason the loop is useful: `partial`
+       is not an established cause, it is "this axis leads a bit", and every one of
+       the nine snapshot scenarios returns `partial` on every axis. Gating on
+       verdict in (`explains`, `partial`) — which is what I wrote first — meant the
+       loop could never fire on any real diagnosis.
+
+       `is_broad_based()` already encodes the right question, and synthesize
+       already uses it to say "no single value accounts for as much as half of it".
+       When that is true nothing has been isolated, so another set of axes is worth
+       asking for. When it is false something concentrated was found, and more
+       probing only lengthens an answer that already has its cause.
+
+    2. **There is nothing to explain.** This is the gate that is easy to miss.
+       `build_hypothesis()` returns `inconclusive` for TWO different situations —
+       a residual too large to trust, and `abs(gap) < DEFAULT_MIN_ABSOLUTE`, i.e.
+       the metric barely moved. Looping on the second is pure waste: no axis can
+       decompose a gap that is not there, so it would spend the full round and
+       probe budget to conclude the same "no material gap" three times. Told apart
+       by the decomposition's own gap, not by the verdict.
+
+    3. **Budget.** `spent` covers rounds, probes and the deadline together, so the
+       loop cannot outrun any of the three.
+
+    4. **Axes left.** With no unprobed dimension remaining, a further round would
+       plan zero new probes and re-analyse identical findings forever. This is the
+       termination guarantee, and it does not depend on the others holding.
+
+    A plain function, not a node: it must not write state, and keeping it pure
+    means the decision is testable without a graph or a warehouse.
+    """
+    if state.get("plan") is None:
+        return "synthesize"
+
+    hypotheses = state.get("hypotheses") or []
+    if not hypotheses:
+        return "synthesize"
+
+    # (1) the metric did not materially move
+    material = any(
+        h.decomposition is not None
+        and abs(h.decomposition.gap) >= DEFAULT_MIN_ABSOLUTE
+        for h in hypotheses
+    )
+    if not material:
+        logger.info("no material gap to explain - not reflecting")
+        return "synthesize"
+
+    # (2) something concentrated was found — a cause is established
+    #
+    # Tested on `concentration()` against the same DEFAULT_DOMINANT_SHARE that
+    # `is_broad_based()` uses, so the loop and the answer agree on what "leads the
+    # movement" means. Deliberately NOT `is_broad_based()` itself: that requires at
+    # least two axes ("one slice says nothing about breadth"), which is right for
+    # deciding what to REPORT and wrong here — a diagnosis that examined one axis
+    # and found nothing is precisely the one that should try another, and
+    # `is_broad_based()` returns False for it, which would stop the loop.
+    graded = [
+        h for h in hypotheses
+        if h.decomposition is not None and h.verdict != "inconclusive"
+    ]
+    if any(
+        concentration(h.decomposition)[0] >= DEFAULT_DOMINANT_SHARE
+        for h in graded
+    ):
+        return "synthesize"
+
+    budget = state.get("budget") or Budget()
+    # (3) rounds / probes / deadline
+    if budget.spent:
+        logger.info("not reflecting: %s", budget.why_spent())
+        return "synthesize"
+
+    # (4) nothing new left to ask
+    if not state.get("dimensions_remaining"):
+        logger.info("not reflecting: no unprobed dimension remains")
+        return "synthesize"
+
+    logger.info(
+        "reflecting: %d axis/axes examined, movement still broad-based, "
+        "%d axis/axes left to try",
+        len(hypotheses), state.get("dimensions_remaining", 0),
+    )
+    return "plan"
 
 
 def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
@@ -419,8 +612,34 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
                 f"{share:.1%} of the gap"
             )
     elif explaining:
-        for h in explaining:
+        # Ordered by TOP SHARE, and capped.
+        #
+        # `rank_hypotheses()` orders by `explained_share` — how much of the gap the
+        # decomposition accounts for in total — which is ~1.0 for almost every
+        # additive decomposition, so among partials the sort collapses onto its
+        # tie-break and the displayed order carries no strength information. That
+        # was survivable at three axes and is not at nine: a churn diagnosis listed
+        # `country = AU at 10.1%` two lines above `plan_type = standard at 47.8%`,
+        # while every statement quotes its own top share, so the reader is invited
+        # to compare numbers the ordering contradicts.
+        #
+        # Sorted here rather than in `rank_hypotheses()` on purpose: that ordering
+        # feeds the API payload and the frontend panel, and changing it is a
+        # separate decision from how this sentence list reads.
+        ordered = sorted(explaining, key=lambda h: -_top_share(h))
+        for h in ordered[:_MAX_REPORTED_HYPOTHESES]:
             lines.append(f"{h.statement} [{', '.join(h.evidence)}]")
+        rest = ordered[_MAX_REPORTED_HYPOTHESES:]
+        if rest:
+            # Named, not hidden. The reflect loop can examine nine axes, and
+            # enumerating all of them buries the finding it exists to surface —
+            # but silently dropping evidence is worse, so the weaker axes are
+            # summarised with the largest share among them.
+            biggest = _top_share(rest[0])
+            lines.append(
+                f"  - also examined {', '.join(h.dimension for h in rest)}: "
+                f"none accounts for more than {biggest:.1%} of the gap"
+            )
     else:
         checked = ", ".join(h.dimension for h in hypotheses) or "no dimension"
         lines.append(
@@ -530,10 +749,15 @@ def build_diagnostic_agent(checkpointer: Any | None = None) -> Any:
     Compile the graph. Call lazily and memoise — the import alone is 10.7 s and
     +68.6 MB.
 
-    Linear in Phase 2: plan -> execute -> analyze -> synthesize. The reflect loop is
-    Phase 4, and the conditional edge it needs goes between analyze and synthesize.
-    Deliberately not added yet: a loop with nothing to iterate on is untestable
-    scaffolding.
+    plan -> execute -> analyze, then analyze either loops back to plan or falls
+    through to synthesize. The loop is what lets an inconclusive first pass try the
+    NEXT axes rather than answering "I cannot tell" while the driver graph still
+    held dimensions it never asked about.
+
+    Termination does not rest on the budget alone. `should_reflect()` also stops
+    when no unprobed dimension remains, so even a misconfigured `max_rounds` cannot
+    spin: each round consumes axes from a finite list and the planner excludes what
+    has already been asked.
     """
     from langgraph.graph import END, START, StateGraph
 
@@ -546,7 +770,17 @@ def build_diagnostic_agent(checkpointer: Any | None = None) -> Any:
     builder.add_edge(START, "plan")
     builder.add_edge("plan", "execute_probes")
     builder.add_edge("execute_probes", "analyze")
-    builder.add_edge("analyze", "synthesize")
+    # The reflect loop. `analyze` routes back to `plan` when a real gap exists and
+    # nothing found so far clears the effect-size floor — so an inconclusive first
+    # pass tries the NEXT axes instead of answering "I cannot tell" while the driver
+    # graph still had dimensions it never asked about. See should_reflect() for the
+    # four gates, one of which (no unprobed dimension left) is the termination
+    # guarantee and does not depend on the budget.
+    builder.add_conditional_edges(
+        "analyze",
+        should_reflect,
+        {"plan": "plan", "synthesize": "synthesize"},
+    )
     builder.add_edge("synthesize", END)
 
     return builder.compile(checkpointer=checkpointer)

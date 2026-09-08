@@ -199,6 +199,7 @@ def plan_time_comparison(
     filters: Sequence[Any] = (),
     weight_available: Any = None,
     trend_months: int = 12,
+    exclude_dimensions: Sequence[str] = (),
 ) -> ProbePlan:
     """
     Plan a "why did this move" diagnosis: target window versus a comparison window.
@@ -234,9 +235,16 @@ def plan_time_comparison(
     # where `country = DE` was reported as accounting for 100.0% of the gap. Same
     # shape as `expansion_mrr x mrr_type`, whose own metric filter pins mrr_type.
     pinned = _pinned_dimensions(filters)
+    # `exclude_dimensions` is what makes a second reflect round ask something NEW.
+    # Without it the planner would re-select the same top-N axes and the loop would
+    # re-probe an identical plan, burning the round cap to reach the identical
+    # verdict. Compared on the BARE name for the same reason `pinned` is: the caller
+    # holds whatever form the previous plan used, and `subscriber__country` and
+    # `country` are the same axis.
+    excluded = {_bare(d) for d in exclude_dimensions}
     dimensions = [
         d for d in graph.ordered_dimensions(metric)
-        if _bare(d) not in pinned
+        if _bare(d) not in pinned and _bare(d) not in excluded
     ][:max_dimensions]
     weight = graph.weight_metric(metric) if include_weights else ""
     notes: list[str] = []
