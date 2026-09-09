@@ -108,6 +108,72 @@ DEFAULT_MIN_LIFT = 1.25
 DEFAULT_DRIVER_MIN_SHARE = 0.25
 
 
+#: How far a decomposition's own gap may sit from the baseline gap before the
+#: decomposition is judged to be describing a DIFFERENT movement.
+#:
+#: `Decomposition.exact` checks the buckets against each other -- do the
+#: contributions sum to the gap. Nothing checked the buckets against the movement
+#: the answer is about, and for a RATIO metric they are not the same quantity at
+#: all. Live case, `net_mrr_growth` for 2026 vs 2025:
+#:
+#:     baseline probe                 -0.78 vs  0.58   gap  -1.36
+#:     sum of `mrr_type` buckets      ...            gap +26.21
+#:
+#: An offset metric is forced to group by `metric_time__month`, so grouping it also
+#: by `mrr_type` returns one growth RATE per (month, bucket) and summing those is
+#: not the metric. The decomposition was internally exact, so it was reported as
+#: `explains` -- and the answer then said "the metric is higher" three lines under a
+#: headline saying it was down, because each sentence took the sign of its own gap.
+#:
+#: 5% is deliberately loose. Float drift on an additive metric is ~1e-12 relative,
+#: and a grouped probe can legitimately differ slightly from an ungrouped one, so
+#: this must never fire on a real additive decomposition -- while a summed ratio is
+#: out by an order of magnitude and a sign, and is caught outright.
+DEFAULT_RECONCILE_TOLERANCE = 0.05
+
+
+def reconciles_with_baseline(
+    decomposition: Decomposition,
+    baseline_gap: float | None,
+    tolerance: float = DEFAULT_RECONCILE_TOLERANCE,
+) -> bool:
+    """
+    Whether this decomposition describes the same movement as the baseline probe.
+
+    Returns True when there is nothing to check against, so a caller with no
+    baseline keeps the previous behaviour rather than losing every hypothesis.
+
+    A sign disagreement always fails, independently of magnitude: "up" and "down"
+    are not a rounding difference, and that disagreement is exactly what reached a
+    user as a self-contradicting answer.
+    """
+    if baseline_gap is None:
+        return True
+    # A WEIGHTED decomposition is exempt, and this is a unit argument rather than a
+    # tolerance one. `_weighted_total` is `sum(w * r)`, so its total is in NUMERATOR
+    # units -- a churned COUNT -- while the baseline probe returns the rate itself.
+    # Measured against the live warehouse, H1-2026:
+    #
+    #     churn_rate x plan_type      decomp gap    165.00  baseline -0.0119
+    #     payment_failure_rate        decomp gap    497.00  baseline  0.0008
+    #     engagement_rate             decomp gap 13,224,632  baseline  2.7971
+    #     ltv                         decomp gap 165,534.02  baseline -2.7771
+    #
+    # These can never agree, so comparing them rejected every correct weighted
+    # diagnosis in the suite. The mix/rate identity (mix + rate == weighted total
+    # delta) is what makes a weighted decomposition valid, and `exact` already
+    # checks it.
+    if decomposition.weighted:
+        return True
+    scale = max(abs(baseline_gap), abs(decomposition.gap))
+    if scale <= DEFAULT_MIN_ABSOLUTE:
+        # Both gaps are ~0. There is no movement to misattribute.
+        return True
+    if (baseline_gap > 0) != (decomposition.gap > 0):
+        return False
+    return abs(decomposition.gap - baseline_gap) <= tolerance * scale
+
+
 def _to_map(buckets: Iterable[Bucket]) -> dict[str | None, Bucket]:
     """Index buckets by label, summing duplicates rather than silently keeping one."""
     out: dict[str | None, Bucket] = {}
@@ -376,6 +442,7 @@ def build_hypothesis(
     confidence: Confidence = "contribution",
     min_share: float = DEFAULT_MIN_SHARE,
     strong_share: float = DEFAULT_STRONG_SHARE,
+    baseline_gap: float | None = None,
 ) -> Hypothesis:
     """
     Turn a decomposition into a ranked, plainly-worded candidate explanation.
@@ -400,6 +467,25 @@ def build_hypothesis(
                 f"{dim} could not be decomposed reliably: the buckets leave a "
                 f"residual of {_fmt(decomposition.residual)} against a gap of "
                 f"{_fmt(decomposition.gap)}. Probably an inconsistent comparison."
+            ),
+            confidence=confidence,
+            verdict="inconclusive",
+            explained_share=0.0,
+            evidence=list(evidence),
+            decomposition=decomposition,
+        )
+
+    # Internally exact and still not about the same movement. See
+    # reconciles_with_baseline() for the net_mrr_growth case this exists for.
+    if not reconciles_with_baseline(decomposition, baseline_gap):
+        return Hypothesis(
+            dimension=dim,
+            statement=(
+                f"{dim} cannot be used to explain this movement: its buckets sum "
+                f"to a change of {_fmt(decomposition.gap)}, but the metric itself "
+                f"moved by {_fmt(baseline_gap)}. Summing this metric across "
+                f"{dim} does not reproduce it, so any share of the gap computed "
+                f"here would be measuring something else."
             ),
             confidence=confidence,
             verdict="inconclusive",
@@ -465,8 +551,15 @@ def build_hypothesis(
         )
     else:
         parts.append("a segment with no presence in the comparison period")
+    # States the concentration WITHOUT drawing a conclusion that can contradict the
+    # verdict beside it. A live answer read "accounts for 65.3% of the gap ... so it
+    # is spread" under an EXPLAINS badge: both halves were true and together they
+    # told the reader nothing.
     if to_eighty > 1:
-        parts.append(f"{to_eighty} values are needed to reach 80%, so it is spread")
+        parts.append(
+            f"it takes {to_eighty} values to cover 80% of the gap, so the rest is "
+            "spread across the other values"
+        )
     if decomposition.weighted and top.mix_effect is not None:
         # The distinction the weighted decomposition exists to make.
         bigger = "composition" if abs(top.mix_effect) >= abs(top.rate_effect or 0) else "within-bucket rate"

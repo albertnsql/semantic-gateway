@@ -18,7 +18,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.exceptions import IntentExtractionError
-from core.intent_extractor import FilterClause, IntentExtractor, QueryIntent, TimeRange
+import json as _json
+
+from core.intent_extractor import (
+    FilterClause,
+    IntentExtractor,
+    QueryIntent,
+    TimeRange,
+    _loads_tolerant,
+)
 
 
 # ──────────────────────────────────────────────── Shared constants
@@ -895,3 +903,63 @@ class TestProviderOrderIsConfiguration:
             f"{settings.openrouter_model} is not the same model as "
             f"{settings.google_model}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The intent parse was a bare `json.loads(message.content)`, so "the provider
+# wrapped its JSON" and "the provider returned prose" were the same
+# unrecoverable IntentExtractionError.
+#
+# Both wrappers below became live risks when Cerebras/qwen-3.8-27b became the
+# primary rung on 2026-09-09: the Qwen3 family is hybrid-reasoning and emits
+# <think> blocks unless suppressed, and any model that ignores JSON mode may
+# fence its output.
+#
+# The happy path is asserted FIRST and must stay byte-identical — the salvage
+# only runs after a bare json.loads has already failed.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestTolerantIntentJsonParse:
+    PAYLOAD = '{"query_type": "metric_query", "metrics": ["mrr"], "limit": 1}'
+
+    def test_plain_json_parses_unchanged(self):
+        assert _loads_tolerant(self.PAYLOAD)["metrics"] == ["mrr"]
+
+    def test_a_json_fence_is_stripped(self):
+        assert _loads_tolerant("```json\n" + self.PAYLOAD + "\n```")["limit"] == 1
+
+    def test_a_bare_fence_is_stripped(self):
+        assert _loads_tolerant("```\n" + self.PAYLOAD + "\n```")["limit"] == 1
+
+    def test_a_qwen_think_block_is_removed(self):
+        raw = "<think>The user wants MRR by country, so limit 1.</think>\n" + self.PAYLOAD
+        assert _loads_tolerant(raw)["query_type"] == "metric_query"
+
+    def test_a_think_block_inside_a_fence_is_handled(self):
+        raw = "<think>reasoning</think>\n```json\n" + self.PAYLOAD + "\n```"
+        assert _loads_tolerant(raw)["metrics"] == ["mrr"]
+
+    def test_json_embedded_in_prose_is_recovered(self):
+        raw = "Here is the intent you asked for:\n" + self.PAYLOAD + "\nHope that helps!"
+        assert _loads_tolerant(raw)["metrics"] == ["mrr"]
+
+    def test_a_brace_inside_a_string_does_not_end_the_object_early(self):
+        # The scan is string- and escape-aware. A filter value legitimately
+        # containing a brace or an escaped quote must not truncate the object.
+        raw = 'prefix {"metrics": ["mrr"], "note": "a } brace and a \\" quote"} suffix'
+        got = _loads_tolerant(raw)
+        assert got["metrics"] == ["mrr"]
+        assert got["note"] == 'a } brace and a " quote'
+
+    def test_nested_objects_survive_the_scan(self):
+        raw = 'noise {"a": {"b": {"c": 1}}, "d": 2} noise'
+        assert _loads_tolerant(raw) == {"a": {"b": {"c": 1}}, "d": 2}
+
+    def test_unparseable_output_still_raises_JSONDecodeError(self):
+        # extract() catches json.JSONDecodeError specifically and converts it to
+        # IntentExtractionError. Raising anything else would escape as a 500.
+        with pytest.raises(_json.JSONDecodeError):
+            _loads_tolerant("I cannot answer that question.")
+
+    def test_empty_output_raises_JSONDecodeError(self):
+        with pytest.raises(_json.JSONDecodeError):
+            _loads_tolerant("")

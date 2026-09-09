@@ -179,6 +179,118 @@ def trailing_months(anchor: str | date, months: int, *, inclusive: bool = True) 
     return Window(first, last)
 
 
+def last_complete_month(today: str | date) -> date:
+    """
+    The last day of the most recent month that has fully elapsed.
+
+    "Complete" is a CALENDAR notion here, not a data-availability one, and that is
+    deliberate: `windows.py` is import-pure (a test fails if `config` or `duckdb`
+    reach `sys.modules`), so it cannot ask the warehouse how far the facts run. The
+    two agree in practice — on 2026-09-09 the calendar says Jan..Aug and the event
+    facts end 2026-08-31 — and where they disagree, `fct_mrr_monthly`'s spine runs
+    AHEAD of the calendar rather than behind it, so the calendar is the safer bound.
+    """
+    return month_end(add_months(_parse(today), -1))
+
+
+def _starts_january(window: Window) -> bool:
+    """Begins on 1 January and stays inside that year. Necessary, not sufficient."""
+    return (
+        window.start.month == 1
+        and window.start.day == 1
+        and window.end.year == window.start.year
+    )
+
+
+def asks_about_a_year(window: Window, *, today: str | date) -> bool:
+    """
+    Whether this window is asking about a YEAR, as opposed to a stretch of months
+    that happens to begin in January.
+
+    Two accepted shapes, and the LLM emits different ones for the same question:
+
+        2026-01-01..2026-12-31   the whole year, asked mid-year
+        2026-01-01..2026-09-09   year to date, ending today
+        2026-01-01..2026-08-31   year to date, already month-aligned
+        2025-01-01..2025-12-31   a completed past year
+
+    A January start ALONE is not enough, and getting that wrong is easy: an earlier
+    version of this predicate tested only for it and so classified
+    `2026-01-01..2026-06-30` — a plain H1 question — as a year, which silently
+    switched H1-2026 from "against H2 2025" to "against H1 2025" and broke four
+    calibration fixtures. So the window must also either end the calendar year or
+    run up to the present.
+
+    `2026-03-01..2026-11-30` is nine months inside one year and is not a year
+    question either; it keeps the preceding-period comparison.
+    """
+    if not _starts_january(window):
+        return False
+    year = window.start.year
+    if window.end >= month_end(date(year, 12, 1)):
+        return True          # reaches 31 December: the whole year
+    return window.end >= last_complete_month(today)   # runs up to now: year to date
+
+
+def clamp_to_complete_months(window: Window, *, today: str | date) -> Window:
+    """
+    Trim a year-shaped window so it ends at the last COMPLETE month.
+
+    Without this, "this year versus last year" compares an incomplete year against a
+    whole one. Asked on 2026-09-09, `2026-01-01..2026-12-31` reads eight months of
+    real data on the target side and twelve on the comparison side, so the target
+    loses a third of its volume to a window boundary and every metric looks
+    collapsed — with nothing in the answer saying why. The dashboard hit the same
+    class of bug and it is already recorded in CLAUDE.md: `revenue_kpi` compared six
+    months of 2026 against SEVEN of 2025 and reported +81.7% where like-for-like was
+    +119.0%.
+
+    Two guards, and both are load-bearing:
+
+    * **Only year-shaped windows are touched.** "Why did churn spike in September
+      2026", asked on 2026-09-09, is `2026-09-01..2026-09-30` — clamping that would
+      end the window before it starts. A single month is a legitimate question about
+      an in-progress month and must be answered as asked.
+    * **A window already ending before the cutoff is returned UNCHANGED**, so a
+      completed past year (`2025-01-01..2025-12-31` asked in 2026) keeps all twelve
+      months and is not silently shortened.
+    """
+    if not asks_about_a_year(window, today=today):
+        return window
+    cutoff = last_complete_month(today)
+    if window.end <= cutoff:
+        return window
+    if cutoff < window.start:
+        # The year has no complete month yet (asked in January). Nothing to trim to.
+        return window
+    return Window(window.start, cutoff)
+
+
+def default_comparison(target: Window, *, today: str | date) -> Window:
+    """
+    The comparison window to use when the caller did not name one.
+
+    A year-shaped target gets the SAME months a year earlier; everything else keeps
+    the equal-length preceding period.
+
+    This is the half of the year-over-year bug that is easy to miss. A full-year
+    target got the right answer by accident — `previous_period` of a 12-month window
+    IS the previous calendar year — but a year-TO-DATE target did not. Live, asked on
+    2026-09-09:
+
+        target      2026-01-01..2026-09-09      (nine months of 2026)
+        comparison  2025-04-01..2025-12-31      <- the preceding nine months
+
+    That compares January-to-September against April-to-December: nine months on each
+    side, so no length check catches it, and it is not a year-over-year comparison at
+    all. It also straddles the seasonality it was supposed to control for, which is
+    the whole reason to compare against a year earlier.
+    """
+    if asks_about_a_year(target, today=today):
+        return year_over_year(target, monthly_grain=True)
+    return previous_period(target, monthly_grain=True)
+
+
 def describe_comparison(target: Window, comparison: Window) -> str:
     """
     One phrase naming what was compared, for the answer.

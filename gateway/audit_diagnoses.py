@@ -57,6 +57,7 @@ import sys
 import time
 import types
 from dataclasses import dataclass, field
+from datetime import date
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -136,6 +137,24 @@ SCENARIOS: tuple[Scenario, ...] = (
         why="cross-model ratio - only dim_subscribers dimensions are groupable",
     ),
     Scenario(
+        id="revenue-year-over-year",
+        metric="total_revenue", start="2025-01-01", end="2025-12-31",
+        why="a completed past year: 12 whole months, no trim, real attribution. "
+            "NOTE it cannot by itself distinguish year-over-year from the preceding "
+            "period, because for a full 12-month window the two are the SAME window "
+            "- that is `revenue-current-year` below",
+    ),
+    Scenario(
+        id="revenue-current-year",
+        metric="total_revenue", start="", end="", resolve="current_year",
+        why="THE case this exists for: a year still in progress must be trimmed to "
+            "complete months and compared against the SAME months a year earlier. "
+            "Resolved rather than hardcoded, following churn-phantom-period: the "
+            "window moves every month, and `target` is in the snapshot so it shows "
+            "as a diff line instead of silently testing nothing. This is the only "
+            "scenario where year-over-year and the preceding period differ",
+    ),
+    Scenario(
         id="engagement-h1-2026",
         metric="engagement_rate", start="2026-01-01", end="2026-06-30",
         why="session metric weighted by total_sessions; content_primary_genre must "
@@ -185,7 +204,21 @@ def _build_services():
         return None, f"could not open the warehouse ({exc}). Is the gateway running?"
 
     cache = SQLTemplateCache(
-        settings.sql_template_cache_ttl_seconds, settings.sql_template_cache_path
+        ttl_seconds=settings.sql_template_cache_ttl_seconds,
+        maxsize=settings.sql_template_cache_maxsize,
+        # `disk_path=None` DELIBERATELY, and it is not the bug that was fixed here.
+        # This used to be `SQLTemplateCache(ttl, path)`, which bound the path to
+        # `maxsize` and left disk_path None by accident; the int is the fix. Passing
+        # the real path would be a different mistake: `set()` always `_save()`s and
+        # the cache has no read-only mode, so every run of this tool would rewrite
+        # `.sql_template_cache.json` -- a committed build artifact owned by
+        # `precompile_templates.py` -- and the file would end up depending on
+        # whichever tool ran last. An audit must not mutate what it measures.
+        #
+        # Nothing is lost: MetricFlow compiles on the happy path and L1 is only a
+        # fallback, so an empty cache exercises the real compile path rather than
+        # masking an engine failure behind 69 committed templates.
+        disk_path=None,
     )
     services = Services(
         validator=SemanticValidator(registry),
@@ -212,6 +245,13 @@ def _resolve_window(scenario: Scenario, services: Services) -> tuple[str, str]:
     """Resolve a scenario whose window tracks a moving property of the data."""
     if scenario.resolve is None:
         return scenario.start, scenario.end
+    if scenario.resolve == "current_year":
+        # The year in progress, as the LLM emits it for "this fiscal year". The
+        # planner trims it to complete months, so what this pins is that the trim
+        # and the year-over-year comparison both happen.
+        year = date.today().year
+        return f"{year}-01-01", f"{year}-12-31"
+
     if scenario.resolve != "phantom_period":
         raise ValueError(f"unknown resolve strategy: {scenario.resolve!r}")
 

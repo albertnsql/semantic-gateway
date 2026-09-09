@@ -88,3 +88,102 @@ class TestDisableRag:
         )
         assert 'os.getenv("DISABLE_RAG"' not in source
         assert "settings.disable_rag" in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cerebras became the PRIMARY rung on 2026-09-09.
+#
+# The env-var contract matters here for the same reason DISABLE_RAG does: with
+# no `env_prefix` and `case_sensitive=False`, the FIELD NAME is what resolves
+# `CEREBRAS_API_KEY` in Render. Rename the field and the key set in the
+# dashboard is silently ignored — the rung is then skipped (no key), the chain
+# quietly falls back to Google, and that is unreachable from Render.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestCerebrasIsThePrimaryRung:
+    def test_default_order_is_cerebras_google_groq(self):
+        assert _settings().llm_provider_order == "cerebras,google,groq"
+
+    def test_openrouter_is_not_in_the_default_chain(self):
+        # It holds no credit; an unfunded rung returns a fast 402 and consumes a
+        # slot, which is worse than being absent.
+        s = _settings(cerebras_api_key="csk-x", google_api_key="g",
+                      openrouter_api_key="or-x")
+        assert [label for label, *_ in s.provider_chain()] == [
+            "cerebras", "google", "groq",
+        ]
+
+    def test_cerebras_resolves_to_qwen_on_the_openai_compatible_endpoint(self):
+        s = _settings(cerebras_api_key="csk-x")
+        label, key, base_url, model = s.provider_chain()[0]
+        assert label == "cerebras"
+        assert key == "csk-x"
+        assert base_url == "https://api.cerebras.ai/v1"
+        assert model == "qwen-3.8-27b"
+
+    def test_the_api_key_field_reads_the_CEREBRAS_API_KEY_variable(self, monkeypatch):
+        monkeypatch.setenv("CEREBRAS_API_KEY", "csk-from-env")
+        assert _settings().cerebras_api_key == "csk-from-env"
+
+    def test_the_model_field_reads_the_CEREBRAS_MODEL_variable(self, monkeypatch):
+        monkeypatch.setenv("CEREBRAS_MODEL", "qwen-3.8-27b-override")
+        assert _settings().cerebras_model == "qwen-3.8-27b-override"
+
+    def test_an_unconfigured_cerebras_key_is_skipped_not_offered_keyless(self):
+        # A rung with no key must drop out entirely rather than be handed to the
+        # SDK with api_key="" — that turns a config gap into a 401 at query time.
+        s = _settings(google_api_key="g")
+        assert [label for label, *_ in s.provider_chain()] == ["google", "groq"]
+
+    def test_the_chain_is_ordered_by_the_setting_not_by_the_dict(self):
+        s = _settings(cerebras_api_key="csk-x", google_api_key="g",
+                      llm_provider_order="groq,cerebras,google")
+        assert [label for label, *_ in s.provider_chain()] == [
+            "groq", "cerebras", "google",
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# qwen-3.8-27b is a REASONING model and its thinking tokens count against
+# max_tokens without appearing in the response or in completion_tokens_details.
+# Measured 2026-09-09 on the real ~9,800-token intent prompt: at max_tokens=300
+# one question returned finish_reason=length, completion=300 and content="" —
+# and the narrative call at max_tokens=150 did the same. Empty content, not
+# merely truncated, so the intent path raised and the prose silently vanished.
+#
+# reasoning_effort="none" fixed both AND was faster (that narrative went from
+# 3.18s/150-tokens/empty to 0.32s/55-tokens/complete).
+#
+# It is per-provider because providers validate unknown parameters — Cerebras
+# itself 400s on `chat_template_kwargs`.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPerProviderRequestKwargs:
+    def test_cerebras_gets_reasoning_suppressed(self):
+        assert _settings().llm_request_kwargs("cerebras") == {
+            "reasoning_effort": "none"
+        }
+
+    @pytest.mark.parametrize("label", ["google", "groq", "openrouter", "unknown"])
+    def test_every_other_provider_gets_nothing(self, label):
+        # Must be an empty dict, not None — call sites splat it unconditionally.
+        assert _settings().llm_request_kwargs(label) == {}
+
+    def test_the_effort_level_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("CEREBRAS_REASONING_EFFORT", "low")
+        assert _settings().llm_request_kwargs("cerebras") == {
+            "reasoning_effort": "low"
+        }
+
+    def test_an_empty_effort_stops_sending_the_parameter(self):
+        s = _settings(cerebras_reasoning_effort="")
+        assert s.llm_request_kwargs("cerebras") == {}
+
+    def test_it_works_unbound_against_a_duck_typed_settings(self):
+        # Same requirement provider_chain() has: test doubles are SimpleNamespace
+        # or MagicMock and rarely carry every field.
+        from types import SimpleNamespace
+
+        fake = SimpleNamespace(cerebras_reasoning_effort="none")
+        assert Settings.llm_request_kwargs(fake, "cerebras") == {
+            "reasoning_effort": "none"
+        }
+        assert Settings.llm_request_kwargs(SimpleNamespace(), "google") == {}

@@ -18,6 +18,10 @@ from datetime import date
 import pytest
 
 from core.diagnostics.windows import (
+    asks_about_a_year,
+    clamp_to_complete_months,
+    default_comparison,
+    last_complete_month,
     Window,
     add_months,
     describe_comparison,
@@ -239,3 +243,115 @@ class TestTimeRangeHandoff:
         )
         assert proc.returncode == 0, proc.stderr[-400:]
         assert not proc.stdout.strip(), f"windows.py now pulls in: {proc.stdout.strip()}"
+
+
+#: Fixed "now" for every case below. 2026-09-09 makes August the last complete
+#: month, which is also where the event facts genuinely end after the 2026-08 load.
+_TODAY = date(2026, 9, 9)
+
+
+class TestLikeForLikeYearComparison:
+    """
+    "This year versus last year" must compare COMPLETE months on both sides.
+
+    Two independent defects, and each hid the other. Asked on 2026-09-09:
+
+        was  target 2026-01-01..2026-09-09  vs  2025-04-01..2025-12-31
+        now  target 2026-01-01..2026-08-31  vs  2025-01-01..2025-08-31
+
+    The old comparison set January-September against April-December. Nine months on
+    each side, so no length check caught it, and it is not a year-over-year
+    comparison at all -- it straddles the seasonality that comparing against a year
+    earlier exists to control for.
+
+    Separately, a full-year target (`2026-01-01..2026-12-31`) read eight months of
+    real data against twelve, so the target lost a third of its volume to a window
+    boundary and every metric looked collapsed. The dashboard hit the same class of
+    bug: CLAUDE.md records `revenue_kpi` comparing six months of 2026 against SEVEN
+    of 2025 and reporting +81.7% where like-for-like was +119.0%.
+    """
+
+    def test_the_last_complete_month_is_the_previous_one(self) -> None:
+        assert last_complete_month(_TODAY) == date(2026, 8, 31)
+        # January: the last complete month is in the previous year.
+        assert last_complete_month(date(2026, 1, 20)) == date(2025, 12, 31)
+
+    @pytest.mark.parametrize("start,end", [
+        ("2026-01-01", "2026-12-31"),   # the whole year, asked mid-year
+        ("2026-01-01", "2026-09-09"),   # year to date, ending today
+        ("2026-01-01", "2026-08-31"),   # year to date, already month-aligned
+    ])
+    def test_every_shape_of_this_year_converges(self, start, end) -> None:
+        """
+        The LLM emits all three for the same question, so all three must land on the
+        same windows or the answer depends on phrasing.
+        """
+        target = clamp_to_complete_months(Window.of(start, end), today=_TODAY)
+        assert target == Window.of("2026-01-01", "2026-08-31")
+        assert default_comparison(target, today=_TODAY) == Window.of(
+            "2025-01-01", "2025-08-31"
+        )
+
+    def test_both_sides_have_the_same_month_count(self) -> None:
+        target = clamp_to_complete_months(
+            Window.of("2026-01-01", "2026-12-31"), today=_TODAY
+        )
+        comparison = default_comparison(target, today=_TODAY)
+        assert target.months_spanned == comparison.months_spanned == 8
+
+    def test_the_users_five_month_example(self) -> None:
+        """The case as stated: five complete months against the same five."""
+        today = date(2026, 6, 15)          # May is the last complete month
+        target = clamp_to_complete_months(
+            Window.of("2026-01-01", "2026-12-31"), today=today
+        )
+        assert target == Window.of("2026-01-01", "2026-05-31")
+        assert target.months_spanned == 5
+        assert default_comparison(target, today=today) == Window.of(
+            "2025-01-01", "2025-05-31"
+        )
+
+    def test_a_completed_past_year_keeps_all_twelve_months(self) -> None:
+        """A trim must never shorten a year that has already finished."""
+        window = Window.of("2025-01-01", "2025-12-31")
+        assert clamp_to_complete_months(window, today=_TODAY) == window
+        assert default_comparison(window, today=_TODAY) == Window.of(
+            "2024-01-01", "2024-12-31"
+        )
+
+    def test_an_in_progress_month_is_still_answered_as_asked(self) -> None:
+        """
+        "Why did churn spike in September 2026", asked on 2026-09-09. Clamping this
+        would end the window before it starts. A single month is a legitimate
+        question about an in-progress month.
+        """
+        window = Window.of("2026-09-01", "2026-09-30")
+        assert clamp_to_complete_months(window, today=_TODAY) == window
+
+    def test_january_alone_does_not_make_it_a_year_question(self) -> None:
+        """
+        The mistake an earlier version of the predicate made. `2026-01-01..2026-06-30`
+        is a plain H1 question; treating it as a year silently switched it from
+        "against H2 2025" to "against H1 2025" and broke four calibration fixtures.
+        """
+        h1 = Window.of("2026-01-01", "2026-06-30")
+        assert not asks_about_a_year(h1, today=_TODAY)
+        assert clamp_to_complete_months(h1, today=_TODAY) == h1
+        assert default_comparison(h1, today=_TODAY) == Window.of(
+            "2025-07-01", "2025-12-31"
+        )
+
+    def test_a_mid_year_stretch_keeps_the_preceding_period(self) -> None:
+        w = Window.of("2026-03-01", "2026-11-30")
+        assert not asks_about_a_year(w, today=_TODAY)
+        assert default_comparison(w, today=_TODAY) == previous_period(w)
+
+    def test_a_year_with_no_complete_month_yet_is_left_alone(self) -> None:
+        """Asked in January: there is nothing to trim to, so do not build an empty window."""
+        window = Window.of("2026-01-01", "2026-12-31")
+        assert clamp_to_complete_months(window, today=date(2026, 1, 10)) == window
+
+    def test_the_comparison_never_overlaps_the_target(self) -> None:
+        for end in ("2026-12-31", "2026-09-09", "2026-08-31"):
+            target = clamp_to_complete_months(Window.of("2026-01-01", end), today=_TODAY)
+            assert not target.overlaps(default_comparison(target, today=_TODAY))

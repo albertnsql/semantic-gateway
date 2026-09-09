@@ -364,3 +364,71 @@ class TestPlanIsDeterministic:
                 asked = {d for d in probe.dimensions
                          if d.split("__", 1)[0] != "metric_time"}
                 assert asked <= allowed, f"{metric}: {probe.dimensions}"
+
+
+class TestYearWindowPolicyReachesThePlan:
+    """
+    The planner owns window policy, so a year-shaped target is trimmed and compared
+    like-for-like before any probe is built. Everything downstream reads
+    `plan.target`, which is why fixing it here fixes the whole diagnosis.
+    """
+
+    def _current_year(self):
+        """A window covering the year in progress, whatever year the tests run in."""
+        from datetime import date
+        return Window.of(f"{date.today().year}-01-01", f"{date.today().year}-12-31")
+
+    def test_the_target_is_trimmed_to_complete_months(self, graph: DriverGraph) -> None:
+        from core.diagnostics.windows import last_complete_month
+        from datetime import date
+
+        requested = self._current_year()
+        plan = plan_time_comparison("total_revenue", requested, graph=graph)
+        if last_complete_month(date.today()) < requested.end:
+            assert plan.target.end == last_complete_month(date.today())
+            assert plan.target != requested
+
+    def test_the_comparison_is_the_same_months_a_year_earlier(
+        self, graph: DriverGraph
+    ) -> None:
+        plan = plan_time_comparison("total_revenue", self._current_year(), graph=graph)
+        assert plan.comparison.months_spanned == plan.target.months_spanned
+        assert plan.comparison.start.year == plan.target.start.year - 1
+        assert plan.comparison.start.month == plan.target.start.month
+        assert plan.comparison.end.month == plan.target.end.month
+
+    def test_the_trim_is_never_silent(self, graph: DriverGraph) -> None:
+        """
+        The user asked about a year and is answered about part of it. They may be
+        holding a full-year figure from elsewhere, and unexplained that reads as the
+        diagnosis being wrong.
+        """
+        from core.diagnostics.windows import last_complete_month
+        from datetime import date
+
+        requested = self._current_year()
+        plan = plan_time_comparison("total_revenue", requested, graph=graph)
+        if last_complete_month(date.today()) < requested.end:
+            assert any("still in progress" in n for n in plan.notes), plan.notes
+
+    def test_every_probe_uses_the_trimmed_windows(self, graph: DriverGraph) -> None:
+        """A probe still carrying the untrimmed window would compare 12 months to 8."""
+        plan = plan_time_comparison("total_revenue", self._current_year(), graph=graph)
+        windows = {pr.window for pr in plan.probes}
+        # The trend probe deliberately uses a longer trailing window; every other
+        # probe must sit on exactly the target or the comparison.
+        trend = {pr.window for pr in plan.probes if pr.role == "trend"}
+        assert windows - trend == {plan.target, plan.comparison}
+
+    def test_an_explicit_comparison_still_wins(self, graph: DriverGraph) -> None:
+        """The default must not override a caller that named its own baseline."""
+        explicit = Window.of("2024-01-01", "2024-06-30")
+        plan = plan_time_comparison(
+            "total_revenue", self._current_year(), graph=graph, comparison=explicit
+        )
+        assert plan.comparison == explicit
+
+    def test_a_non_year_window_is_untouched(self, graph: DriverGraph) -> None:
+        plan = plan_time_comparison("total_revenue", TARGET, graph=graph)
+        assert plan.target == TARGET
+        assert not any("still in progress" in n for n in plan.notes)

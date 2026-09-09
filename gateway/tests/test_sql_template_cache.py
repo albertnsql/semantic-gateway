@@ -607,3 +607,49 @@ class TestApplyGrainRounding:
         sql_end   = apply_grain_rounding("2026-06-19", "period_month", is_start=False)
         assert sql_start == "2025-12-01"
         assert sql_end   == "2026-06-30"
+
+
+class TestConstructorCannotBeCalledPositionally:
+    """
+    `SQLTemplateCache(ttl, path)` is the call a caller naturally writes -- a TTL and
+    a path are the two things worth thinking about -- but the second positional
+    parameter is `maxsize`, so that call bound the **path string** to `maxsize` and
+    left `disk_path=None`. Two offline callers did exactly that
+    (`audit_diagnoses.py`, `scratch/try_diagnosis.py`).
+
+    Both halves of the failure were bad:
+
+    * `set()` inserts the entry and only THEN evaluates
+      `len(self._store) > self._maxsize`, so it raised
+      `'>' not supported between instances of 'int' and 'str'` from inside the
+      caller's `except`, which logged "Failed to store SQL template" for an entry
+      that had in fact been stored.
+    * `disk_path=None` meant the committed template artifact was never loaded and
+      never written -- silent, and the part that actually mattered.
+
+    Keyword-only makes it a TypeError at the call site instead.
+    """
+
+    def test_two_positional_arguments_are_rejected(self) -> None:
+        with pytest.raises(TypeError):
+            SQLTemplateCache(86400, "./.sql_template_cache.json")
+
+    def test_even_one_positional_argument_is_rejected(self) -> None:
+        """No positional slot exists, so no future reordering can resurrect this."""
+        with pytest.raises(TypeError):
+            SQLTemplateCache(86400)
+
+    def test_keyword_construction_still_works(self) -> None:
+        cache = SQLTemplateCache(ttl_seconds=60, maxsize=7, disk_path=None)
+        assert cache._maxsize == 7
+        assert cache._disk_path is None
+
+    def test_a_string_maxsize_would_have_broken_set(self) -> None:
+        """
+        Pins the mechanism, not just the signature: this is what the misrouted path
+        did to `set()`, and it is why the warning named storage rather than config.
+        """
+        cache = SQLTemplateCache(ttl_seconds=60)
+        cache._maxsize = "./some/path.json"
+        with pytest.raises(TypeError, match="not supported between instances"):
+            cache.set(["mrr"], ["plan_type"], "SELECT 1", False)

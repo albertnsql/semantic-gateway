@@ -80,7 +80,12 @@ def _fake_agent(monkeypatch, final: dict | Exception):
 
 
 def _plan(dimensions=("plan_type",)):
+    # `target` is carried because the real ProbePlan always has one and the route
+    # reports `plan.target` rather than its own pre-plan copy -- the planner trims a
+    # year-shaped window to complete months, so the two can legitimately differ.
+    # H1-2026 against H2-2025 here: not a year question, so no trim applies.
     return SimpleNamespace(
+        target=Window.of("2026-01-01", "2026-06-30"),
         comparison=Window.of("2025-07-01", "2025-12-31"),
         dimensions=list(dimensions), cautions=["watch the trailing month"],
         notes=["a note"],

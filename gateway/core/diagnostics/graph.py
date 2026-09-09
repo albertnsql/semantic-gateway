@@ -73,6 +73,7 @@ from core.diagnostics.analysis import (
     decompose,
     is_broad_based,
     rank_hypotheses,
+    reconciles_with_baseline,
     rows_to_buckets,
 )
 from core.diagnostics.playbooks import (
@@ -113,6 +114,9 @@ class GraphState(TypedDict, total=False):
     hypotheses: list[Hypothesis]
     budget: Budget
     answer: str
+    # The bottom line, kept separate from `answer` so the UI can lead with a
+    # conclusion rather than the full linear prose. See synthesize_node.
+    summary: str
     stopped_because: str
     # ── reflect-loop bookkeeping ────────────────────────────────────────────
     # Dimensions already asked about, so a second round asks something NEW rather
@@ -211,7 +215,13 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
             cautions=previous.cautions,
             weight_metric=previous.weight_metric,
             trend=previous.trend,
-            notes=previous.notes + plan.notes,
+            # Deduplicated, order preserved. Most notes are properties of the METRIC
+            # rather than of the round -- "net_mrr_growth has no weight_metric" is
+            # re-derived identically every time plan_probes() runs -- so a plain
+            # concatenation printed it once per reflect round. A live two-round
+            # answer carried the same sentence twice, which reads as two separate
+            # problems.
+            notes=_dedupe(previous.notes + plan.notes),
         )
 
     # ── trim only what has NOT been run ─────────────────────────────────────
@@ -239,7 +249,7 @@ def plan_node(state: GraphState, config: RunnableConfig = None) -> dict:
             # representativeness check and the answer stops warning about an
             # unrepresentative comparison without saying why.
             trend=plan.trend,
-            notes=plan.notes + ["the probe budget trimmed this plan"],
+            notes=_dedupe(plan.notes + ["the probe budget trimmed this plan"]),
         )
 
     budget.rounds_used += 1
@@ -356,6 +366,14 @@ def analyze_node(state: GraphState, config: RunnableConfig = None) -> dict:
     grouped = pair_findings(plan, findings)
     hypotheses: list[Hypothesis] = []
 
+    # The movement every hypothesis is supposed to be explaining. Passed into
+    # build_hypothesis so a decomposition whose buckets do not reproduce this gap is
+    # reported as inconclusive rather than as a cause -- the net_mrr_growth case,
+    # where summing a growth RATE over (month x bucket) gave +26.21 against a real
+    # movement of -1.36 and was badged "explains" with the opposite sign.
+    baseline = _baseline_gap(plan, findings)
+    baseline_gap = baseline[2] if baseline is not None else None
+
     for dim in usable_pairs(grouped):
         roles = grouped[dim]
         qualified = next(
@@ -386,7 +404,9 @@ def analyze_node(state: GraphState, config: RunnableConfig = None) -> dict:
 
         result = decompose(dim, target_buckets, comparison_buckets)
         evidence = [roles["target"].id, roles["comparison"].id]
-        hypotheses.append(build_hypothesis(result, evidence=evidence))
+        hypotheses.append(
+            build_hypothesis(result, evidence=evidence, baseline_gap=baseline_gap)
+        )
 
     ranked = rank_hypotheses(hypotheses)
     logger.info(
@@ -420,6 +440,175 @@ def _attach_weights(buckets, weight_finding, dimension_column, weight_metric):
 # keeps a reflect-loop answer the same length as a single-round one, so extra
 # rounds buy accuracy rather than verbosity.
 _MAX_REPORTED_HYPOTHESES = 3
+
+
+def describe_movement(
+    metric: str,
+    target_total: float,
+    comparison_total: float,
+    gap: float,
+    comparison_phrase: str,
+) -> str:
+    """
+    The headline sentence: what moved, by how much, against what.
+
+    A percent change is only interpretable when the baseline is non-zero AND the
+    two sides share a sign. `net_mrr_growth` for 2026 vs 2025 went from +0.58 to
+    -0.78 -- a swing from growth to decline -- and dividing by the baseline
+    reported "down 234.6%", which reads as a catastrophe of a magnitude the numbers
+    do not contain. Worse, it hides the only thing that actually happened: the sign
+    flipped.
+
+    So a sign change is described as a sign change, a zero baseline gets the
+    absolute move, and an ordinary same-sign change keeps the percentage it has
+    always had.
+    """
+    direction = "down" if gap < 0 else "up"
+    # Zero is tested BEFORE the signs: `0.0 > 0` is False, so a 0 -> 50 move read as
+    # a sign flip and was described as "turned from decline to growth" off a
+    # baseline that was never negative.
+    if not comparison_total:
+        return (
+            f"{metric} is {direction} by {abs(gap):,.2f} against "
+            f"{comparison_phrase} ({target_total:,.2f} vs "
+            f"{comparison_total:,.2f}). The baseline is zero, so there is no "
+            f"percentage to quote."
+        )
+
+    sides_differ = (target_total > 0) != (comparison_total > 0)
+
+    if not sides_differ:
+        pct = gap / comparison_total * 100
+        return (
+            f"{metric} is {direction} {abs(pct):.1f}% against {comparison_phrase} "
+            f"({target_total:,.2f} vs {comparison_total:,.2f})."
+        )
+
+    # A sign flip. The percentage is unusable and the sign change IS the finding.
+    moved = "from growth to decline" if comparison_total > 0 else "from decline to growth"
+    return (
+        f"{metric} turned {moved} against {comparison_phrase}: "
+        f"{comparison_total:,.2f} to {target_total:,.2f}, a move of {gap:+,.2f}. "
+        f"The two periods have opposite signs, so a percentage change is not "
+        f"meaningful here."
+    )
+
+
+def _unreconciled(
+    hypotheses: list[Hypothesis], baseline_gap: float | None
+) -> list[Hypothesis]:
+    """
+    The axes refused because the metric does not add up across segments.
+
+    `inconclusive` covers three unrelated situations -- a residual too large to
+    trust, a gap of ~0, and a decomposition that does not reproduce the baseline
+    movement -- and only the third means "this metric cannot be broken down". They
+    are told apart by the decomposition rather than by the verdict, the same
+    distinction the reflect loop makes for the same reason: a zero-gap axis
+    described as "does not add up across segments" is simply false, and a live test
+    fixture with a flat 100-vs-100 comparison caught exactly that.
+    """
+    if baseline_gap is None:
+        return []
+    return [
+        h for h in hypotheses
+        if h.verdict == "inconclusive"
+        and h.decomposition is not None
+        and not reconciles_with_baseline(h.decomposition, baseline_gap)
+    ]
+
+
+def _bottom_line(
+    plan: ProbePlan, hypotheses: list[Hypothesis], baseline_gap: float | None = None
+) -> str:
+    """
+    The verdict in one plain sentence, with no citations and no jargon.
+
+    This is the line that answers "so what was the issue", and it exists because
+    the previous answer never stated one. A live diagnosis opened with a signed
+    percentage, then a hypothesis sentence carrying four clauses and a lift ratio,
+    then five ruled-out axes, two duplicated notes and a caveat -- every fact a
+    reader needed was present and none of them was the conclusion.
+
+    Says "I could not attribute this" whenever that is the truth. An unattributable
+    movement stated plainly is more useful than the largest bucket dressed up as a
+    cause, which is the failure mode `leading_driver()` and the reconciliation check
+    both exist to prevent.
+    """
+    explaining = [h for h in hypotheses if h.verdict in ("explains", "partial")]
+    ruled_out = [h for h in hypotheses if h.verdict == "not_it"]
+    unusable = _unreconciled(hypotheses, baseline_gap)
+
+    if not hypotheses:
+        return (
+            "No breakdown was available, so this movement could not be attributed "
+            "to any segment."
+        )
+
+    # Every axis unusable. Almost always one cause, and it is worth naming: the
+    # metric cannot be summed across segments, so no decomposition of it is valid.
+    # This is `net_mrr_growth`, where the buckets summed to +26.21 against a real
+    # move of -1.36 -- and the old code reported that as an explanation.
+    if unusable and not explaining and not ruled_out:
+        return (
+            f"I could not attribute this. {plan.metric} does not add up across "
+            f"segments, so breaking it down by "
+            f"{_and_list([h.dimension for h in unusable])} does not reproduce the "
+            f"movement and no share of it can be trusted. The totals above are "
+            f"correct; only the attribution is unavailable."
+        )
+
+    if is_broad_based(hypotheses):
+        return (
+            f"No single segment is behind this. The movement is spread across "
+            f"every axis I checked "
+            f"({_and_list([h.dimension for h in hypotheses])}) -- on each one, no "
+            f"value carries meaningfully more of it than its own size implies."
+        )
+
+    if explaining:
+        lead = max(explaining, key=_top_share)
+        top = lead.decomposition.top if lead.decomposition else None
+        label = "(not set)" if top is None or top.label is None else top.label
+        share = _top_share(lead)
+        checked = ""
+        if ruled_out:
+            checked = (
+                f" {_and_list([h.dimension for h in ruled_out])} "
+                f"{'were' if len(ruled_out) > 1 else 'was'} checked and ruled out."
+            )
+        strength = "explains most of" if lead.verdict == "explains" else "is the largest part of"
+        return (
+            f"The clearest driver is {lead.dimension} = {label}, which "
+            f"{strength} the movement at {share:.0%} of it.{checked}"
+        )
+
+    return (
+        f"Nothing I checked explains this. On "
+        f"{_and_list([h.dimension for h in hypotheses])}, no value carries "
+        f"meaningfully more of the movement than its own size implies."
+    )
+
+
+def _and_list(items: list[str]) -> str:
+    """`a`, `a and b`, `a, b and c` -- prose, not a comma-joined dump."""
+    items = [i for i in items if i]
+    if not items:
+        return "no dimension"
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    """Drop repeats, keep first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def _top_share(hypothesis: Hypothesis) -> float:
@@ -546,29 +735,33 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
     stopped = state.get("stopped_because", "")
 
     if plan is None:
-        return {"answer": stopped or "This question could not be diagnosed."}
+        text = stopped or "This question could not be diagnosed."
+        return {"answer": text, "summary": text}
 
     lines: list[str] = []
+    # The summary shares its sentences with the full prose rather than rewording
+    # them, so the two can never disagree about what the numbers were.
+    summary_lines: list[str] = []
     baseline = _baseline_gap(plan, state.get("findings") or [])
     comparison_phrase = describe_comparison(plan.target, plan.comparison)
     if baseline is not None:
         target_total, comparison_total, gap = baseline
-        direction = "down" if gap < 0 else "up"
-        pct = (gap / comparison_total * 100) if comparison_total else 0.0
-        lines.append(
-            f"{plan.metric} is {direction} {abs(pct):.1f}% against {comparison_phrase} "
-            f"({target_total:,.2f} vs {comparison_total:,.2f})."
+        headline = describe_movement(
+            plan.metric, target_total, comparison_total, gap, comparison_phrase
         )
     else:
-        lines.append(
+        headline = (
             f"Comparing {plan.metric} against {comparison_phrase}; the baseline "
             "totals could not be established."
         )
+    lines.append(headline)
+    summary_lines.append(headline)
 
     # A gap is only as meaningful as what it is measured against. A live June churn
     # diagnosis reported +163.7% against a May that was itself 41% below the trailing
     # 12-month average; against trend the figure is +55%. Both correct, one useful.
     # This says so rather than swapping the baseline for another guessable one.
+    baseline_gap = baseline[2] if baseline is not None else None
     check = _baseline_check(plan, state.get("findings") or [], baseline)
     if check is not None and not check.representative:
         message = (
@@ -582,9 +775,11 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
                 f"{check.trend_relative_gap:+.0%}"
             )
         lines.append(message + ".")
+        summary_lines.append(message + ".")
 
     explaining = [h for h in hypotheses if h.verdict in ("explains", "partial")]
     ruled_out = [h for h in hypotheses if h.verdict == "not_it"]
+    unusable = _unreconciled(hypotheses, baseline_gap)
 
     if is_broad_based(hypotheses):
         # Three weak partials is honest and useless. "Spread across every axis" IS
@@ -641,6 +836,19 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
                 f"  - also examined {', '.join(h.dimension for h in rest)}: "
                 f"none accounts for more than {biggest:.1%} of the gap"
             )
+    elif unusable and not ruled_out:
+        # Every axis refused, so none of them was CHECKED in the sense the branch
+        # below claims. Saying "no value carries meaningfully more of the movement
+        # than its own size implies" would assert a result the arithmetic never
+        # produced -- the decomposition was rejected before any share was computed.
+        lines.append(
+            f"No attribution is available. {plan.metric} does not add up across "
+            f"segments, so decomposing it by "
+            f"{_and_list([h.dimension for h in unusable])} does not reproduce the "
+            f"movement above and no share of it would be trustworthy."
+        )
+        for h in unusable:
+            lines.append(f"  - {h.statement} [{', '.join(h.evidence)}]")
     else:
         checked = ", ".join(h.dimension for h in hypotheses) or "no dimension"
         # Wording matches what is actually tested. It used to say "none accounts for
@@ -683,7 +891,28 @@ def synthesize_node(state: GraphState, config: RunnableConfig = None) -> dict:
     if budget is not None and budget.spent:
         lines.append(f"Stopped early: {budget.why_spent()}.")
 
-    return {"answer": "\n".join(lines), "stopped_because": stopped}
+    # One sentence saying what the reader came for: did we find a cause or not.
+    # Deliberately the LAST thing built and the SECOND thing shown, because it has
+    # to be phrased against the same hypothesis set the sections below it render.
+    summary_lines.append(_bottom_line(plan, hypotheses, baseline_gap))
+
+    # `answer` stays the complete linear text, because a text-only consumer
+    # (the API, a log, a client without the panel) must still get everything.
+    #
+    # `summary` is the BOTTOM LINE, and it exists because the panel renders the
+    # hypotheses, the ruled-out list, the notes, the cautions and the data
+    # warnings as their own sections -- so putting the full prose above them
+    # showed the reader every one of those things TWICE. A live answer repeated
+    # its data warning verbatim in a red box and again six lines down, restated
+    # its one finding under an EXPLAINS badge that already carried it, and
+    # listed five ruled-out axes immediately above a section headed "checked
+    # and ruled out". The panel renders this instead and keeps `answer` behind
+    # a disclosure.
+    return {
+        "answer": "\n".join(lines),
+        "summary": "\n".join(summary_lines),
+        "stopped_because": stopped,
+    }
 
 
 def _baseline_check(plan: ProbePlan, findings: list[Finding], baseline):

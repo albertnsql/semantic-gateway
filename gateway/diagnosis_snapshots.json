@@ -2,7 +2,7 @@
   "note": "Structural conclusions of canned diagnoses. Regenerate with `python audit_diagnoses.py --update` and review the diff - a change here means an answer changed.",
   "scenarios": [
     {
-      "answer_lines": 7,
+      "answer_lines": 5,
       "baseline_flagged": false,
       "caution_count": 2,
       "comparison": "2025-07-01..2025-12-31",
@@ -15,21 +15,21 @@
       "hypotheses": [
         {
           "confidence": "contribution",
-          "dimension": "country",
-          "explained": "116%",
+          "dimension": "plan_type",
+          "explained": "100%",
           "verdict": "partial"
         },
         {
           "confidence": "contribution",
           "dimension": "acquisition_channel",
-          "explained": "111%",
-          "verdict": "partial"
+          "explained": "0%",
+          "verdict": "inconclusive"
         },
         {
           "confidence": "contribution",
-          "dimension": "plan_type",
-          "explained": "100%",
-          "verdict": "partial"
+          "dimension": "country",
+          "explained": "0%",
+          "verdict": "inconclusive"
         }
       ],
       "id": "churn-h1-2026",
@@ -42,7 +42,7 @@
       "verdict": "concentrated_or_none"
     },
     {
-      "answer_lines": 7,
+      "answer_lines": 6,
       "baseline_flagged": true,
       "caution_count": 2,
       "comparison": "2026-05-01..2026-05-31",
@@ -61,15 +61,15 @@
         },
         {
           "confidence": "contribution",
-          "dimension": "country",
-          "explained": "100%",
-          "verdict": "not_it"
+          "dimension": "acquisition_channel",
+          "explained": "0%",
+          "verdict": "inconclusive"
         },
         {
           "confidence": "contribution",
-          "dimension": "acquisition_channel",
-          "explained": "100%",
-          "verdict": "not_it"
+          "dimension": "country",
+          "explained": "0%",
+          "verdict": "inconclusive"
         }
       ],
       "id": "churn-june-2026",
@@ -82,7 +82,7 @@
       "verdict": "concentrated_or_none"
     },
     {
-      "answer_lines": 8,
+      "answer_lines": 7,
       "baseline_flagged": true,
       "caution_count": 2,
       "comparison": "2026-09-01..2026-09-30",
@@ -104,14 +104,14 @@
         {
           "confidence": "contribution",
           "dimension": "acquisition_channel",
-          "explained": "100%",
-          "verdict": "not_it"
+          "explained": "0%",
+          "verdict": "inconclusive"
         },
         {
           "confidence": "contribution",
           "dimension": "country",
-          "explained": "100%",
-          "verdict": "not_it"
+          "explained": "0%",
+          "verdict": "inconclusive"
         }
       ],
       "id": "churn-phantom-period",
@@ -228,7 +228,7 @@
       "verdict": "concentrated_or_none"
     },
     {
-      "answer_lines": 13,
+      "answer_lines": 11,
       "baseline_flagged": false,
       "caution_count": 1,
       "comparison": "2025-07-01..2025-12-31",
@@ -283,7 +283,7 @@
       ],
       "id": "mrr-h1-2026",
       "metric": "mrr",
-      "note_count": 3,
+      "note_count": 1,
       "outcome": "ok",
       "probes_failed": 0,
       "probes_planned": 16,
@@ -329,6 +329,70 @@
       "probes_planned": 15,
       "target": "2026-01-01..2026-06-30",
       "verdict": "concentrated_or_none"
+    },
+    {
+      "answer_lines": 13,
+      "baseline_flagged": false,
+      "caution_count": 2,
+      "comparison": "2025-01-01..2025-08-31",
+      "data_warnings": [],
+      "dimensions": [
+        "plan_type",
+        "country",
+        "acquisition_channel",
+        "cohort_month",
+        "payment_method",
+        "is_renewal",
+        "currency",
+        "age_group",
+        "subscription_status"
+      ],
+      "hypotheses": [
+        {
+          "confidence": "contribution",
+          "dimension": "cohort_month",
+          "explained": "117%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "acquisition_channel",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "country",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "is_renewal",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "payment_method",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "plan_type",
+          "explained": "100%",
+          "verdict": "not_it"
+        }
+      ],
+      "id": "revenue-current-year",
+      "metric": "total_revenue",
+      "note_count": 2,
+      "outcome": "ok",
+      "probes_failed": 0,
+      "probes_planned": 16,
+      "target": "2026-01-01..2026-08-31",
+      "verdict": "broad_based"
     },
     {
       "answer_lines": 6,
@@ -408,6 +472,67 @@
       "probes_failed": 0,
       "probes_planned": 9,
       "target": "2026-01-01..2026-06-30",
+      "verdict": "concentrated_or_none"
+    },
+    {
+      "answer_lines": 6,
+      "baseline_flagged": false,
+      "caution_count": 2,
+      "comparison": "2024-01-01..2024-12-31",
+      "data_warnings": [],
+      "dimensions": [
+        "plan_type",
+        "country",
+        "acquisition_channel",
+        "cohort_month",
+        "payment_method",
+        "is_renewal"
+      ],
+      "hypotheses": [
+        {
+          "confidence": "contribution",
+          "dimension": "is_renewal",
+          "explained": "100%",
+          "verdict": "explains"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "cohort_month",
+          "explained": "109%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "acquisition_channel",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "country",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "payment_method",
+          "explained": "100%",
+          "verdict": "not_it"
+        },
+        {
+          "confidence": "contribution",
+          "dimension": "plan_type",
+          "explained": "100%",
+          "verdict": "not_it"
+        }
+      ],
+      "id": "revenue-year-over-year",
+      "metric": "total_revenue",
+      "note_count": 1,
+      "outcome": "ok",
+      "probes_failed": 0,
+      "probes_planned": 15,
+      "target": "2025-01-01..2025-12-31",
       "verdict": "concentrated_or_none"
     }
   ]

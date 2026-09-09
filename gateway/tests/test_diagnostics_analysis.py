@@ -21,6 +21,7 @@ import pytest
 
 from core.diagnostics.analysis import (
     bucket_lift,
+    reconciles_with_baseline,
     DEFAULT_MIN_LIFT,
     leading_driver,
     DEFAULT_MIN_SHARE,
@@ -867,3 +868,132 @@ class TestLift:
         assert "1.6" in statement or "1.7" in statement, (
             f"the lift multiple is not stated: {statement}"
         )
+
+
+class TestReconciliationWithTheBaseline:
+    """
+    A decomposition can be internally exact and still describe a DIFFERENT movement.
+
+    `Decomposition.exact` compares the buckets against each other. Nothing compared
+    them against the movement the answer is about, and for a metric that does not
+    add up across segments the two are unrelated quantities.
+
+    The live case, `net_mrr_growth` for 2026 vs 2025: the metric went from +0.58 to
+    -0.78, a move of -1.36, while the sum of its `mrr_type` buckets moved +26.21.
+    The decomposition was exact, so it was reported as `explains` -- and the answer
+    then read "the metric is higher" three lines below a headline saying it was
+    down, because each sentence took the sign of its own gap.
+    """
+
+    def _ratio_shaped(self):
+        """Buckets that sum to a gap unrelated to the metric's real movement."""
+        return decompose(
+            "mrr_type",
+            target=[b("contraction", 20.0), b("expansion", 12.0)],
+            comparison=[b("contraction", 2.87), b("expansion", 2.92)],
+        )
+
+    def test_the_live_case_is_refused(self) -> None:
+        d = self._ratio_shaped()
+        assert d.exact, "the fixture must be internally exact or it proves nothing"
+        assert not reconciles_with_baseline(d, -1.36)
+
+    def test_it_is_reported_as_inconclusive_not_as_a_cause(self) -> None:
+        h = build_hypothesis(self._ratio_shaped(), baseline_gap=-1.36)
+        assert h.verdict == "inconclusive"
+        # The reader must be told WHY, or "inconclusive" reads as a weak finding.
+        assert "does not reproduce it" in h.statement
+        assert "26.21" in h.statement and "-1.36" in h.statement
+
+    def test_without_a_baseline_nothing_changes(self) -> None:
+        """A caller with no baseline must keep every hypothesis, not lose them all."""
+        h = build_hypothesis(self._ratio_shaped())
+        assert h.verdict in ("explains", "partial")
+
+    def test_a_valid_additive_decomposition_is_untouched(self) -> None:
+        d = decompose(
+            "country",
+            target=[b("US", 500.0), b("DE", 100.0)],
+            comparison=[b("US", 450.0), b("DE", 250.0)],
+        )
+        assert reconciles_with_baseline(d, d.gap)
+        assert build_hypothesis(d, baseline_gap=d.gap).verdict != "inconclusive"
+
+    def test_float_drift_never_trips_it(self) -> None:
+        """
+        The tolerance must be loose enough that a real additive decomposition can
+        never be refused. Drift is ~1e-12 relative; a summed ratio is out by an
+        order of magnitude and a sign.
+        """
+        d = decompose("country", target=[b("US", 500.0)], comparison=[b("US", 450.0)])
+        assert reconciles_with_baseline(d, d.gap * (1 + 1e-9))
+        assert reconciles_with_baseline(d, d.gap * (1 + 0.04))
+
+    def test_a_sign_disagreement_fails_regardless_of_magnitude(self) -> None:
+        """'Up' and 'down' are not a rounding difference."""
+        d = decompose("country", target=[b("US", 101.0)], comparison=[b("US", 100.0)])
+        assert d.gap == pytest.approx(1.0)
+        assert not reconciles_with_baseline(d, -1.0)
+
+    def test_two_gaps_of_zero_are_not_a_mismatch(self) -> None:
+        d = decompose("country", target=[b("US", 100.0)], comparison=[b("US", 100.0)])
+        assert reconciles_with_baseline(d, 0.0)
+
+
+    def test_a_weighted_decomposition_is_exempt(self) -> None:
+        """
+        A unit argument, not a tolerance one. `_weighted_total` is `sum(w * r)`, so a
+        weighted total is in NUMERATOR units -- a churned COUNT -- while the baseline
+        probe returns the rate itself. Measured live, H1-2026:
+
+            churn_rate x plan_type   decomp gap  165.00   baseline -0.0119
+            engagement_rate          decomp gap  13.2M    baseline  2.7971
+
+        Comparing those rejected every correct weighted diagnosis in the snapshot
+        suite -- 7 of 9 scenarios collapsed to "I cannot tell". The mix/rate identity
+        is what makes a weighted decomposition valid, and `exact` already checks it.
+        """
+        d = decompose(
+            "plan_type",
+            target=[b("basic", 0.05, weight=1000.0), b("premium", 0.03, weight=500.0)],
+            comparison=[b("basic", 0.04, weight=900.0), b("premium", 0.02, weight=600.0)],
+        )
+        assert d.weighted
+        # The weighted total is a count; a rate baseline is orders of magnitude away.
+        assert reconciles_with_baseline(d, 0.0119)
+        assert build_hypothesis(d, baseline_gap=0.0119).verdict != "inconclusive"
+
+    def test_an_unweighted_rate_axis_is_still_caught(self) -> None:
+        """
+        The other half of the same case: `churn_rate` by `country` gets NO weights,
+        because `monthly_subscriber_base` does not certify that dimension, so it
+        degrades to summing per-bucket RATES. Live ratio was 20.5x the real movement,
+        and the old code reported `explained: 116%` -- over 100%, which is itself
+        proof the arithmetic was not describing the gap.
+        """
+        d = decompose(
+            "country",
+            target=[b("US", 0.05), b("DE", 0.04), b("GB", 0.06)],
+            comparison=[b("US", 0.03), b("DE", 0.02), b("GB", 0.05)],
+        )
+        assert not d.weighted
+        assert not reconciles_with_baseline(d, 0.0119)
+        assert build_hypothesis(d, baseline_gap=0.0119).verdict == "inconclusive"
+
+
+class TestConcentrationWordingDoesNotContradictTheVerdict:
+    def test_a_concentrated_driver_is_not_called_spread(self) -> None:
+        """
+        A live answer read "accounts for 65.3% of the gap ... so it is spread" under
+        an EXPLAINS badge. Both halves were true; together they told the reader
+        nothing. The fact is kept, the contradictory conclusion is not.
+        """
+        d = decompose(
+            "mrr_type",
+            target=[b("contraction", 100.0), b("expansion", 40.0), b("new", 30.0)],
+            comparison=[b("contraction", 35.0), b("expansion", 20.0), b("new", 25.0)],
+        )
+        h = build_hypothesis(d, baseline_gap=d.gap)
+        assert h.verdict == "explains"
+        assert "so it is spread" not in h.statement
+        assert "to cover 80% of the gap" in h.statement

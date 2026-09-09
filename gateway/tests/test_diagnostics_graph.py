@@ -18,7 +18,9 @@ import pytest
 
 from core.diagnostics.graph import (
     GraphState,
+    _dedupe,
     analyze_node,
+    describe_movement,
     build_diagnostic_agent,
     execute_probes_node,
     initial_state,
@@ -664,3 +666,163 @@ class TestAnswerOrdering:
         from core.diagnostics.graph import _top_share
 
         assert _top_share(TestReflectLoop._hyp("inconclusive", 0.0, 0.5)) == 0.0
+
+
+class TestMovementDescriptionStaysInterpretable:
+    """
+    A percent change is only meaningful when the baseline is non-zero AND both
+    sides share a sign.
+
+    `net_mrr_growth` went from +0.58 to -0.78 and the old formula reported "down
+    234.6%" -- a number that reads as a catastrophe of a magnitude the data does
+    not contain, and which hides the only thing that actually happened: the sign
+    flipped from growth to decline.
+    """
+
+    def test_a_sign_flip_is_described_as_a_sign_flip(self) -> None:
+        out = describe_movement("net_mrr_growth", -0.78, 0.58, -1.36, "last year")
+        assert "234" not in out, "a percentage across a sign flip is not meaningful"
+        assert "growth to decline" in out
+        assert "0.58" in out and "-0.78" in out
+
+    def test_the_other_direction_too(self) -> None:
+        out = describe_movement("net_mrr_growth", 0.58, -0.78, 1.36, "last year")
+        assert "decline to growth" in out
+
+    def test_an_ordinary_change_keeps_its_percentage(self) -> None:
+        out = describe_movement("total_revenue", 1180.0, 1000.0, 180.0, "last year")
+        assert "up 18.0%" in out
+
+    def test_a_negative_to_more_negative_change_keeps_its_percentage(self) -> None:
+        """Same sign on both sides, so the ratio is still interpretable."""
+        out = describe_movement("net_mrr_growth", -2.0, -1.0, -1.0, "last year")
+        assert "100.0%" in out
+
+    def test_a_zero_baseline_is_not_reported_as_a_sign_flip(self) -> None:
+        """
+        `0.0 > 0` is False, so a 0 -> 50 move looked like a sign change and was
+        described as "turned from decline to growth" off a baseline that was never
+        negative. Zero is therefore tested before the signs.
+        """
+        out = describe_movement("mrr", 50.0, 0.0, 50.0, "last year")
+        assert "decline" not in out
+        assert "baseline is zero" in out
+
+
+class TestNotesAreNotRepeated:
+    """
+    Most notes are properties of the METRIC, not of the round, so `plan_probes()`
+    re-derives them identically each reflect round. A plain concatenation printed
+    "net_mrr_growth has no weight_metric" once per round, and a live two-round
+    answer carried the sentence twice -- which reads as two separate problems.
+    """
+
+    def test_a_repeated_note_appears_once(self) -> None:
+        note = "net_mrr_growth has no weight_metric"
+        assert _dedupe([note, note]) == [note]
+
+    def test_first_seen_order_is_preserved(self) -> None:
+        assert _dedupe(["a", "b", "a", "c", "b"]) == ["a", "b", "c"]
+
+    def test_a_reflect_round_does_not_duplicate_the_metric_note(
+        self, graph: DriverGraph
+    ) -> None:
+        """End to end through the merge, which is where the duplication happened."""
+        state = initial_state("why is revenue down", "total_revenue", TARGET,
+                              max_dimensions=1)
+        cfg = _config(_SqlGenerator(_values_for_revenue_drop()), graph)
+        state.update(plan_node(state, cfg))
+        state.update(execute_probes_node(state, cfg))
+        state.update(analyze_node(state, cfg))
+        # A second planning round merges the previous plan with a fresh one.
+        state.update(plan_node(state, cfg))
+        notes = state["plan"].notes
+        assert len(notes) == len(set(notes)), f"duplicated notes: {notes}"
+
+
+class TestTheAnswerLeadsWithAConclusion:
+    """
+    The panel renders the hypotheses, the ruled-out list, the notes, the cautions
+    and the data warnings as their own sections, so the full prose above them
+    showed the reader every one of those things twice. `summary` is the bottom line
+    it leads with instead -- one sentence saying whether a cause was found.
+    """
+
+    def _run(self, graph, values, metric="total_revenue", max_dimensions=1):
+        state = initial_state("why", metric, TARGET, max_dimensions=max_dimensions)
+        cfg = _config(_SqlGenerator(values), graph)
+        for node in (plan_node, execute_probes_node, analyze_node):
+            state.update(node(state, cfg))
+        return synthesize_node(state, cfg)
+
+    def test_a_summary_is_produced_alongside_the_full_answer(
+        self, graph: DriverGraph
+    ) -> None:
+        out = self._run(graph, _values_for_revenue_drop())
+        assert out["summary"], "the panel has nothing to lead with"
+        assert out["answer"]
+
+    def test_the_summary_is_shorter_than_the_full_prose(
+        self, graph: DriverGraph
+    ) -> None:
+        out = self._run(graph, _values_for_revenue_drop())
+        assert len(out["summary"]) < len(out["answer"])
+
+    def test_it_names_the_driver_when_there_is_one(self, graph: DriverGraph) -> None:
+        out = self._run(graph, _values_for_revenue_drop())
+        assert "premium" in out["summary"]
+        assert "clearest driver" in out["summary"]
+
+    def test_the_summary_carries_no_citations(self, graph: DriverGraph) -> None:
+        """
+        The bottom line is for a reader who wants the conclusion. Citations belong
+        on the hypothesis rows and in the evidence table, both of which the panel
+        renders below it.
+        """
+        out = self._run(graph, _values_for_revenue_drop())
+        assert "[F" not in out["summary"]
+
+    def test_the_headline_is_the_first_line_of_both(self, graph: DriverGraph) -> None:
+        """Shared, not reworded, so the two cannot disagree about the numbers."""
+        out = self._run(graph, _values_for_revenue_drop())
+        assert out["summary"].splitlines()[0] == out["answer"].splitlines()[0]
+
+    def test_an_unattributable_movement_says_so_plainly(
+        self, graph: DriverGraph
+    ) -> None:
+        """
+        Every axis refused by the reconciliation check. The summary must state that
+        no attribution is available AND that the totals are still correct, rather
+        than leaving the reader with a bare "inconclusive".
+        """
+        # Buckets that do not sum to the baseline movement: the ratio-metric shape.
+        values = {
+            ("total_revenue", "plan_type", "2026-01-01"): {"premium": 900.0},
+            ("total_revenue", "plan_type", "2025-07-01"): {"premium": 100.0},
+            ("total_revenue", "", "2026-01-01"): {"t": 100.0},
+            ("total_revenue", "", "2025-07-01"): {"t": 200.0},
+        }
+        out = self._run(graph, values)
+        assert "could not attribute" in out["summary"]
+        assert "does not add up across segments" in out["summary"]
+        assert "totals above are correct" in out["summary"]
+
+    def test_a_flat_comparison_is_not_called_undecomposable(
+        self, graph: DriverGraph
+    ) -> None:
+        """
+        `inconclusive` covers three unrelated situations and only one of them means
+        "this metric does not add up across segments". A flat 100-vs-100 comparison
+        is inconclusive because there is no gap, and describing THAT as a
+        decomposition failure is simply false. Told apart by the decomposition, not
+        by the verdict -- the same distinction the reflect loop makes.
+        """
+        flat = {}
+        for dim in ("plan_type", "country", "payment_method"):
+            flat[("total_revenue", dim, "2026-01-01")] = {"a": 50.0, "b": 50.0}
+            flat[("total_revenue", dim, "2025-07-01")] = {"a": 50.0, "b": 50.0}
+        flat[("total_revenue", "", "2026-01-01")] = {"a": 50.0, "b": 50.0}
+        flat[("total_revenue", "", "2025-07-01")] = {"a": 50.0, "b": 50.0}
+        out = self._run(graph, flat, max_dimensions=2)
+        assert "does not add up across segments" not in out["answer"]
+        assert "does not add up across segments" not in out["summary"]

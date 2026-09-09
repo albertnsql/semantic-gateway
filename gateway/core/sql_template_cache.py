@@ -249,12 +249,30 @@ class SQLTemplateCache:
 
     def __init__(
         self,
+        *,
         ttl_seconds: int = 86400,
         maxsize: int = 200,
         disk_path: Optional[str] = None,
         refresh_on_load: bool = False,
     ) -> None:
         """
+        KEYWORD-ONLY, and that is a fix rather than a style choice.
+
+        The natural two-argument call is `SQLTemplateCache(ttl, path)` -- ttl and a
+        path are the two things a caller thinks about -- but the second positional
+        parameter is `maxsize`, so that call silently bound the **path string** to
+        `maxsize` and left `disk_path=None`. Two offline callers did exactly that.
+
+        The failure was deferred and misleading. `set()` inserts the entry and only
+        THEN evaluates `len(self._store) > self._maxsize`, so it raised
+        `'>' not supported between instances of 'int' and 'str'` from inside the
+        caller's `except`, which logged "Failed to store SQL template" for an entry
+        that had in fact been stored -- while the real damage was silent:
+        `disk_path=None` meant the committed 69-template artifact was never loaded
+        and never written.
+
+        A star here turns that into an immediate TypeError at the call site.
+
         Args:
             ttl_seconds: How long a compiled template stays valid.  Default 24 h.
             maxsize:     Maximum entries before LRU eviction.  Default 200.

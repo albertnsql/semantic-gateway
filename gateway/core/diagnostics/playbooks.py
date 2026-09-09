@@ -31,7 +31,13 @@ from typing import Any, Iterable, Literal, Sequence
 
 import yaml
 
-from core.diagnostics.windows import Window
+from datetime import date
+
+from core.diagnostics.windows import (
+    Window,
+    clamp_to_complete_months,
+    default_comparison,
+)
 
 _GRAPH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "driver_graph.yml")
 
@@ -227,7 +233,27 @@ def plan_time_comparison(
             f"'{metric}' has no driver_graph entry, so there is no playbook for it"
         )
 
-    comparison = comparison or previous_window(target)
+    # ── window policy, before anything else reads `target` ──────────────────
+    # A year-shaped target is trimmed to COMPLETE months and compared against the
+    # same months a year earlier. Both halves matter and both were wrong:
+    #
+    #   asked 2026-09-09, "why is net mrr lower this year than last"
+    #     was  target 2026-01-01..2026-09-09  vs  2025-04-01..2025-12-31
+    #     now  target 2026-01-01..2026-08-31  vs  2025-01-01..2025-08-31
+    #
+    # The old comparison put January-September against April-December -- nine months
+    # on each side, so no length check caught it, and not a year-over-year comparison
+    # at all. And a full-year target (`2026-01-01..2026-12-31`) read eight months of
+    # real data against twelve, so the target lost a third of its volume to a window
+    # boundary and every metric looked collapsed.
+    #
+    # Ordering is load-bearing: the comparison defaults off the CLAMPED target, or a
+    # trimmed 8-month target would be compared against a full 12-month prior year and
+    # the mismatch would simply move to the other side.
+    requested = target
+    _today = date.today()
+    target = clamp_to_complete_months(target, today=_today)
+    comparison = comparison or default_comparison(target, today=_today)
 
     # A dimension the filters already pin to one value is not a decomposition axis:
     # it yields a single bucket holding 100% of the gap, which reads as a finding and
@@ -248,6 +274,16 @@ def plan_time_comparison(
     ][:max_dimensions]
     weight = graph.weight_metric(metric) if include_weights else ""
     notes: list[str] = []
+    if target != requested:
+        # Never silent. The user asked about a year and is being answered about part
+        # of it, and they may well be holding a full-year figure from elsewhere --
+        # unexplained, that reads as the diagnosis being wrong.
+        notes.append(
+            f"{requested.end.year} is still in progress, so this compares the "
+            f"{target.months_spanned} complete months "
+            f"({target}) against the same months a year earlier, rather than a "
+            f"part-year against a full one"
+        )
     if include_weights and not weight:
         notes.append(
             f"{metric} has no weight_metric, so only the additive decomposition is "

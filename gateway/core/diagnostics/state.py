@@ -231,6 +231,9 @@ class DiagnosticState(TypedDict, total=False):
     hypotheses: list[Hypothesis]
     budget: Budget
     answer: str
+    # The bottom line, kept separate from `answer` so the UI can lead with a
+    # conclusion rather than the full linear prose. See synthesize_node.
+    summary: str
     stopped_because: str
 
 

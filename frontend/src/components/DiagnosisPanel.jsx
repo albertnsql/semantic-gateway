@@ -149,20 +149,31 @@ function Hypothesis({ item }) {
 
 export default function DiagnosisPanel({ diagnosis, message, compact = false }) {
   const [showEvidence, setShowEvidence] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(false);
   if (!diagnosis) return null;
 
   const {
-    answer, metric, target_window: targetWindow, comparison_window: comparisonWindow,
+    answer, summary, metric, target_window: targetWindow,
+    comparison_window: comparisonWindow,
     dimensions_examined: dimensionsExamined = [], hypotheses = [], evidence = [],
     cautions = [], notes = [], stopped_because: stoppedBecause,
     data_warnings: dataWarnings = [],
   } = diagnosis;
 
+  // The bottom line is what the reader came for, so it is the only prose shown by
+  // default. `answer` — the full linear text — repeats every section below it, and
+  // showing both is what made a live answer unreadable: the data warning appeared
+  // in the red box and again six lines down, the one finding appeared in the prose
+  // and again under its own EXPLAINS badge, and five ruled-out axes were listed
+  // immediately above a section headed "checked and ruled out".
+  const bottomLine = summary || answer || message;
+  const hasFullReasoning = Boolean(answer) && answer !== bottomLine;
+
   // Ruled-out findings are separated rather than dropped: knowing what was checked
   // and eliminated is often the most useful part of an answer.
   const leading = hypotheses.filter((h) => h.verdict === 'explains' || h.verdict === 'partial');
   const ruledOut = hypotheses.filter((h) => h.verdict === 'not_it');
-  const unclear = hypotheses.filter((h) => h.verdict === 'inconclusive');
+  const unusable = hypotheses.filter((h) => h.verdict === 'inconclusive');
   const failedProbes = evidence.filter((e) => e.error);
 
   return (
@@ -234,12 +245,50 @@ export default function DiagnosisPanel({ diagnosis, message, compact = false }) 
         </div>
       )}
 
-      <p
-        className="text-sm text-[#1A3A38] leading-relaxed whitespace-pre-line mb-2"
-        style={FONT}
+      {/* The conclusion, given the visual weight of a conclusion. */}
+      <div
+        className="px-3 py-2.5 rounded-xl mb-2.5"
+        style={{ background: 'rgba(124,58,237,0.05)', border: '1px solid rgba(124,58,237,0.12)' }}
       >
-        <WithCitations text={answer || message} />
-      </p>
+        <div
+          className="text-[9px] font-bold uppercase tracking-wider mb-1"
+          style={{ color: '#7C3AED', ...FONT }}
+        >
+          Bottom line
+        </div>
+        <p
+          className="text-sm text-[#1A3A38] leading-relaxed whitespace-pre-line"
+          style={FONT}
+        >
+          <WithCitations text={bottomLine} />
+        </p>
+      </div>
+
+      {/* Axes that produced no usable attribution. Kept OUT of the verdict list
+          below, because an "Inconclusive" badge beside a dimension name reads as a
+          weak finding when it actually means no share was computed at all — either
+          the metric does not sum across segments (a rate), or there was no gap to
+          explain. The statement says which; the heading must be true of both. */}
+      {unusable.length > 0 && (
+        <div
+          className="mb-2.5 px-3 py-2 rounded-xl border-l-[3px]"
+          style={{ background: 'rgba(100,116,139,0.05)', borderColor: '#94A3B8' }}
+        >
+          <div
+            className="flex items-center gap-1.5 font-bold text-[9.5px] uppercase tracking-wider mb-1"
+            style={{ color: '#475569', ...FONT }}
+          >
+            <HelpCircle size={11} /> Not usable for attribution
+          </div>
+          <ul className="list-disc pl-4 m-0 space-y-1">
+            {unusable.map((h, i) => (
+              <li key={i} className="text-[11px] text-[#334155] leading-snug" style={FONT}>
+                {h.statement}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {leading.length > 0 && (
         <ul className="list-none p-0 m-0 mb-1">
@@ -256,12 +305,6 @@ export default function DiagnosisPanel({ diagnosis, message, compact = false }) 
             {ruledOut.map((h, i) => <Hypothesis key={`${h.dimension}-out-${i}`} item={h} />)}
           </ul>
         </div>
-      )}
-
-      {unclear.length > 0 && (
-        <ul className="list-none p-0 m-0 mt-1">
-          {unclear.map((h, i) => <Hypothesis key={`${h.dimension}-unk-${i}`} item={h} />)}
-        </ul>
       )}
 
       {/* Caveats are metric-specific traps that would otherwise turn a data artifact
@@ -297,6 +340,28 @@ export default function DiagnosisPanel({ diagnosis, message, compact = false }) 
       {stoppedBecause && (
         <div className="mt-2 text-[10.5px] text-[#B45309]" style={FONT}>
           {stoppedBecause}
+        </div>
+      )}
+
+      {hasFullReasoning && (
+        <div className="mt-2.5">
+          <button
+            type="button"
+            onClick={() => setShowReasoning((v) => !v)}
+            className="inline-flex items-center gap-1 text-[10px] font-bold text-[#7C3AED] hover:underline"
+            style={FONT}
+          >
+            {showReasoning ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+            Full reasoning
+          </button>
+          {showReasoning && (
+            <p
+              className="mt-1.5 px-3 py-2 rounded-xl text-[11px] text-[#334155] leading-relaxed whitespace-pre-line"
+              style={{ background: 'rgba(255,255,255,0.5)', ...FONT }}
+            >
+              <WithCitations text={answer} />
+            </p>
+          )}
         </div>
       )}
 

@@ -79,7 +79,21 @@ def main() -> int:
     registry.load(settings.metrics_path, settings.semantic_models_path, parser)
     pool = DuckDBPool(settings); pool.initialise()
     template_cache = SQLTemplateCache(
-        settings.sql_template_cache_ttl_seconds, settings.sql_template_cache_path
+        ttl_seconds=settings.sql_template_cache_ttl_seconds,
+        maxsize=settings.sql_template_cache_maxsize,
+        # `disk_path=None` DELIBERATELY, and it is not the bug that was fixed here.
+        # This used to be `SQLTemplateCache(ttl, path)`, which bound the path to
+        # `maxsize` and left disk_path None by accident; the int is the fix. Passing
+        # the real path would be a different mistake: `set()` always `_save()`s and
+        # the cache has no read-only mode, so every run of this tool would rewrite
+        # `.sql_template_cache.json` -- a committed build artifact owned by
+        # `precompile_templates.py` -- and the file would end up depending on
+        # whichever tool ran last. An audit must not mutate what it measures.
+        #
+        # Nothing is lost: MetricFlow compiles on the happy path and L1 is only a
+        # fallback, so an empty cache exercises the real compile path rather than
+        # masking an engine failure behind 69 committed templates.
+        disk_path=None,
     )
     app = types.SimpleNamespace(state=types.SimpleNamespace(
         semantic_validator=SemanticValidator(registry),

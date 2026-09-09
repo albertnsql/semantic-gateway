@@ -102,6 +102,13 @@ def _chat_with_fallback(
     # answers — the two paths would have disagreed about which provider is primary.
     providers: list[tuple[str, str, str, str]] = settings.provider_chain()
 
+    # provider_chain() is deliberately written to tolerate a duck-typed settings
+    # stand-in (see its docstring); this lookup has to be equally tolerant or a
+    # test double without the method turns into an AttributeError mid-request.
+    _extra_kwargs = getattr(settings, "llm_request_kwargs", None)
+    if not callable(_extra_kwargs):
+        _extra_kwargs = lambda _label: {}  # noqa: E731
+
     if not providers:
         logger.warning("%s: no LLM provider is configured.", purpose)
         return ""
@@ -131,6 +138,11 @@ def _chat_with_fallback(
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens,
+                # qwen's reasoning tokens count against max_tokens without
+                # appearing anywhere, so at max_tokens=150 this call returned
+                # finish_reason=length with an EMPTY body -- the prose silently
+                # vanished. See Settings.llm_request_kwargs().
+                **_extra_kwargs(label),
             )
             text = (response.choices[0].message.content or "").strip()
             if text:
@@ -435,8 +447,14 @@ def _run_diagnosis(body, intent, request: Request, request_id: str) -> dict | No
     plan = final.get("plan")
     return {
         "answer": answer,
+        # The bottom line, so the panel can LEAD with a conclusion instead of the
+        # full linear prose. Falls back to `answer` for a client that predates it.
+        "summary": (final.get("summary") or "").strip() or answer,
         "metric": metric,
-        "target_window": str(target),
+        # `plan.target`, NOT the local `target`: the planner trims a year-shaped
+        # window to complete months, so reporting the pre-trim copy would label the
+        # answer with a window it did not actually query.
+        "target_window": str(plan.target) if plan else str(target),
         "comparison_window": str(plan.comparison) if plan else None,
         "dimensions_examined": list(plan.dimensions) if plan else [],
         "hypotheses": [
@@ -472,7 +490,12 @@ def _run_diagnosis(body, intent, request: Request, request_id: str) -> dict | No
             {"id": a.id, "severity": a.severity, "summary": a.summary,
              "guidance": a.guidance}
             for a in (
-                _artifact_registry().applicable(metric, target, plan.comparison)
+                # Also `plan.target`: the trailing-churn-only-period artifact fires
+                # on a window that reaches the end of `fct_mrr_monthly`, and trimming
+                # to complete months is exactly what stops it reaching there. Passing
+                # the untrimmed window would keep warning about a period the
+                # diagnosis no longer touches.
+                _artifact_registry().applicable(metric, plan.target, plan.comparison)
                 if plan else []
             )
         ],

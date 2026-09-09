@@ -31,7 +31,30 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------ LLM Providers
-    # Primary: OpenRouter
+    # Primary: Cerebras (qwen-3.8-27b), from 2026-09-09.
+    #
+    # Chosen because it is the only rung whose limits can actually hold this
+    # prompt. The intent-extraction system prompt measures ~9,478 tokens (20
+    # metrics, the dimension map and the rule blocks), and the other rungs sit
+    # either side of it:
+    #
+    #   Cerebras qwen-3.8-27b  450,000 TPM / 150,000 uncached TPM, 450 RPM
+    #   Google   free tier      250,000 TPM, 15 RPM  -- fits, but see below
+    #   Groq     free tier        8,000 TPM          -- CANNOT fit one request
+    #
+    # Groq's ceiling is BELOW the size of a single request, so that rung 413s
+    # on every query regardless of which model id it names. Verified live
+    # 2026-09-09 against all five viable Groq models: "Limit 8000, Requested
+    # 9592", rejected in ~0.1s by a pre-flight size check. The retired
+    # `llama-3.1-8b-instant` id was never the whole story.
+    #
+    # Cerebras is also OpenAI-compatible, so it needs no new client code --
+    # only an entry in provider_chain() below.
+    cerebras_api_key: str = ""
+    cerebras_model: str = "qwen-3.8-27b"
+    cerebras_base_url: str = "https://api.cerebras.ai/v1"
+
+    # Secondary: OpenRouter
     openrouter_api_key: str = ""
     # The SAME model as the Google rung, deliberately. OpenRouter's catalogue
     # includes google/gemini-3.1-flash-lite, so this is not a downgrade to a
@@ -103,7 +126,74 @@ class Settings(BaseSettings):
     # Deliberately config and not code: CLAUDE.md's rule is that swapping or
     # reordering providers touches config.py and the client construction, never the
     # call sites.
-    llm_provider_order: str = "google,groq,openrouter"
+    # cerebras,google,groq from 2026-09-09. Was "google,groq,openrouter", whose
+    # comment claimed the default "keeps today's behaviour" -- by then that
+    # behaviour was a 32s 400 on every query, because all three rungs were dead:
+    # Google unreachable from Render, Groq under-sized (see the Cerebras note
+    # above), OpenRouter out of credit.
+    #
+    # OpenRouter is deliberately NOT in this list. It is still configured and can
+    # be re-added, but it holds no credit, and an unfunded rung is worse than an
+    # absent one -- it returns a fast 402 that consumes a slot.
+    #
+    # IMPORTANT: IntentExtractor reads exactly THREE slots (_slot(0..2)), so a
+    # fourth entry here is silently ignored on the intent path while
+    # _chat_with_fallback() (which iterates the whole chain) would still use it.
+    # The two paths would then disagree about the chain. __init__ logs a warning
+    # if the chain is longer than three.
+    llm_provider_order: str = "cerebras,google,groq"
+
+
+    # Extra chat-completion parameters that apply to ONE provider only.
+    #
+    # qwen-3.8-27b is a reasoning model and its thinking tokens count against
+    # max_tokens WITHOUT appearing in the response or in
+    # completion_tokens_details. Measured 2026-09-09 against the real
+    # ~9,800-token intent prompt:
+    #
+    #   max_tokens=300   "Show churn by plan type for 2026"
+    #                    -> finish_reason=length, completion=300, content=""
+    #   max_tokens=1500  same question
+    #                    -> finish_reason=stop, completion=576
+    #                    "MRR by plan type last 3 months" -> completion=1052
+    #   narrative, max_tokens=150
+    #                    -> finish_reason=length, completion=150, content=""
+    #
+    # So the caps were not merely tight, they produced EMPTY responses: an
+    # unrecoverable IntentExtractionError on the intent path and silently missing
+    # prose on the narrative path. reasoning_effort="none" removes the reasoning
+    # entirely and is both correct and faster -- the same narrative call went from
+    # 3.18s/150-tokens/empty to 0.32s/55-tokens/complete.
+    #
+    # Raising every max_tokens instead was the alternative and is worse: it would
+    # let a NON-reasoning provider write 10x the intended length, and CLAUDE.md
+    # already records max_tokens being treated as a RESERVATION by credit-gated
+    # providers (OpenRouter refused "up to 1024" when it could afford 434).
+    #
+    # Kept per-provider rather than sent to everyone because providers validate
+    # unknown parameters: Cerebras itself 400s on `chat_template_kwargs`
+    # ("property 'chat_template_kwargs' is unsupported"). Gemini was verified to
+    # ACCEPT reasoning_effort, but it is already non-reasoning (152 completion
+    # tokens whether the cap is 300 or 1500), so sending it buys nothing there and
+    # only adds risk with a future strict provider.
+    #
+    # Set to "" to stop sending it.
+    cerebras_reasoning_effort: str = "none"
+
+    def llm_request_kwargs(self, label: str) -> dict:
+        """Provider-specific ``chat.completions.create`` kwargs for *label*.
+
+        Empty for every provider that needs no quirk, so call sites can splat it
+        unconditionally. Keeping this beside provider_chain() is what holds to
+        the repo rule that swapping or tuning a provider touches config.py and
+        the client construction, never the call sites.
+        """
+        get = lambda name, default="": getattr(self, name, default)  # noqa: E731
+        if label == "cerebras":
+            effort = (get("cerebras_reasoning_effort", "none") or "").strip()
+            if effort:
+                return {"reasoning_effort": effort}
+        return {}
 
     def provider_chain(self) -> list[tuple[str, str, str, str]]:
         """Ordered [(label, api_key, base_url, model)], skipping unconfigured ones.
@@ -124,6 +214,8 @@ class Settings(BaseSettings):
         # method exists to remove.
         get = lambda name, default="": getattr(self, name, default)  # noqa: E731
         available = {
+            "cerebras": (get("cerebras_api_key"), get("cerebras_base_url"),
+                         get("cerebras_model")),
             "google": (get("google_api_key"), get("google_base_url"),
                        get("google_model")),
             "groq": (get("openai_api_key"), get("llm_base_url"),
@@ -131,7 +223,7 @@ class Settings(BaseSettings):
             "openrouter": (get("openrouter_api_key"), get("openrouter_base_url"),
                            get("openrouter_model")),
         }
-        order = get("llm_provider_order", "google,groq,openrouter") or ""
+        order = get("llm_provider_order", "cerebras,google,groq") or ""
         chain: list[tuple[str, str, str, str]] = []
         for label in (part.strip().lower() for part in order.split(",")):
             spec = available.get(label)

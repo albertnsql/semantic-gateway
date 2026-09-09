@@ -95,6 +95,74 @@ _TRANSIENT_LLM_MARKERS = (
 )
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_JSON_FENCE_RE = re.compile(r"\A\s*```(?:json)?\s*|\s*```\s*\Z", re.IGNORECASE)
+
+
+def _loads_tolerant(raw: str) -> dict:
+    """
+    ``json.loads`` with a salvage pass for provider-specific response wrappers.
+
+    The happy path is unchanged -- a bare ``json.loads`` is tried FIRST, so a
+    provider that honours ``response_format={"type": "json_object"}`` costs
+    nothing extra and parses byte-identically to before.
+
+    The salvage exists because the parse used to be a bare ``json.loads`` on
+    ``message.content``, which made "the provider wrapped its JSON" and "the
+    provider returned prose" the same unrecoverable IntentExtractionError. Two
+    wrappers are common enough to be worth handling, and BOTH became live risks
+    when Cerebras/qwen-3.8-27b became the primary rung on 2026-09-09:
+
+    * ```` ```json ... ``` ```` fences, from any model that ignores JSON mode
+    * ``<think>...</think>`` preambles -- the Qwen3 family is hybrid-reasoning
+      and emits them unless thinking is suppressed
+
+    Last resort is the first BALANCED ``{...}`` object, scanned with string- and
+    escape-awareness so a brace inside a filter value ("Smith, John") cannot end
+    the object early.
+
+    Raises:
+        json.JSONDecodeError: if nothing parses, so the caller's existing
+            ``except json.JSONDecodeError`` still handles it.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    text = _JSON_FENCE_RE.sub("", _THINK_BLOCK_RE.sub("", raw).strip()).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[start:index + 1])
+
+    raise json.JSONDecodeError("no JSON object in LLM response", raw or "", 0)
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     """A request that got no response at all before the client gave up."""
     status = _status_of(exc)
@@ -382,6 +450,16 @@ class IntentExtractor:
         else:
             from config import Settings as _Settings
             chain = _Settings.provider_chain(settings)
+        # The provider LABEL has to survive into the call sites: qwen needs
+        # reasoning_effort="none" and Gemini must not necessarily get it, so the
+        # quirk is looked up per rung from settings.llm_request_kwargs().
+        _kwargs_for = getattr(settings, "llm_request_kwargs", None)
+        if not callable(_kwargs_for):
+            from config import Settings as _SettingsForKwargs
+            _kwargs_for = lambda lbl: _SettingsForKwargs.llm_request_kwargs(  # noqa: E731
+                settings, lbl
+            )
+
         clients: list[tuple[str, object, str]] = []
         for label, api_key, base_url, model in chain:
             clients.append((
@@ -398,9 +476,25 @@ class IntentExtractor:
         def _slot(index: int):
             return clients[index] if index < len(clients) else (None, None, "")
 
-        (_, self._primary_client, self._primary_model) = _slot(0)
-        (_, self._fallback_client, self._fallback_model) = _slot(1)
-        (_, self._tertiary_client, self._tertiary_model) = _slot(2)
+        # IntentExtractor has exactly three rungs, but _chat_with_fallback()
+        # iterates the WHOLE chain -- so a fourth provider would apply to the
+        # narrative and schema answers and silently not to intent extraction,
+        # which is the same split-brain provider_chain() was created to remove.
+        if len(clients) > 3:
+            logger.warning(
+                "llm_provider_order lists %d providers but IntentExtractor uses "
+                "only the first 3 -- %s will never serve intent extraction "
+                "(though _chat_with_fallback still uses them).",
+                len(clients), [label for label, _, _ in clients[3:]],
+            )
+
+        (_pl, self._primary_client, self._primary_model) = _slot(0)
+        (_fl, self._fallback_client, self._fallback_model) = _slot(1)
+        (_tl, self._tertiary_client, self._tertiary_model) = _slot(2)
+
+        self._primary_kwargs = _kwargs_for(_pl) if _pl else {}
+        self._fallback_kwargs = _kwargs_for(_fl) if _fl else {}
+        self._tertiary_kwargs = _kwargs_for(_tl) if _tl else {}
 
         logger.info(
             "IntentExtractor initialised (order=%s): primary=%s fallback=%s tertiary=%s",
@@ -498,6 +592,7 @@ class IntentExtractor:
                         # could afford 434, for an answer needing ~145.
                         max_tokens=_INTENT_MAX_TOKENS,
                         response_format={"type": "json_object"},
+                        **self._primary_kwargs,
                     )
                 except Exception as exc:
                     retryable = _is_transient_llm_error(exc)
@@ -530,6 +625,7 @@ class IntentExtractor:
                     # the answer it would have produced needed ~145.
                     max_tokens=_INTENT_MAX_TOKENS,
                     response_format={"type": "json_object"},
+                    **self._fallback_kwargs,
                 )
             except Exception as exc:
                 logger.warning("Fallback LLM (%s) failed: %s. Falling back to tertiary...", self._fallback_model, exc)
@@ -549,6 +645,7 @@ class IntentExtractor:
                     # the answer it would have produced needed ~145.
                     max_tokens=_INTENT_MAX_TOKENS,
                     response_format={"type": "json_object"},
+                    **self._tertiary_kwargs,
                 )
             except Exception as exc:
                 raise IntentExtractionError(
@@ -562,7 +659,7 @@ class IntentExtractor:
         logger.debug("Raw LLM response (first 500 chars): %s", raw_content[:500])
 
         try:
-            parsed = json.loads(raw_content)
+            parsed = _loads_tolerant(raw_content)
         except json.JSONDecodeError as exc:
             raise IntentExtractionError(
                 f"LLM returned non-JSON response: {exc}",
