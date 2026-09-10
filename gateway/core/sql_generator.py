@@ -167,28 +167,22 @@ from core.sql_template_cache import (
 )
 
 import importlib.util
-import pathlib
-
-_skill_loader_path = (
-    pathlib.Path(__file__).resolve()
-    .parent   # gateway/core/
-    .parent   # gateway/
-    .parent   # Streaming_Analytics/
-    / "backend" / "core" / "skill_loader.py"
-)
-
-if _skill_loader_path.exists():
-    _spec = importlib.util.spec_from_file_location("skill_loader", _skill_loader_path)
-    _skill_loader_mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
-    _spec.loader.exec_module(_skill_loader_mod)  # type: ignore[union-attr]
-    load_skill = _skill_loader_mod.load_skill
+# A plain import now that the loader lives alongside this module. This was the
+# SECOND copy of a file-path importlib bootstrap (intent_extractor.py had the
+# other), both walking three parents up into the old sibling `backend/` package.
+# Worth knowing how it failed: both degrade with a warning and a disabled flag, so
+# moving the loader without fixing this would have silently switched SQL review
+# off -- and the reviewer only runs on the MetricFlow-failure path, so no test
+# would have caught it.
+try:
+    from core.skill_loader import load_skill
     _SKILL_LOADER_AVAILABLE = True
-else:
+except ImportError as _exc:  # pragma: no cover - defensive
     _SKILL_LOADER_AVAILABLE = False
     import logging as _logging
     _logging.getLogger(__name__).warning(
-        "backend/core/skill_loader.py not found at '%s' — SQL review disabled.",
-        _skill_loader_path,
+        "core/skill_loader.py could not be imported (%s) — SQL review disabled.",
+        _exc,
     )
 
 if TYPE_CHECKING:
@@ -1669,7 +1663,7 @@ class SQLGenerator:
         """
         Run the SQL through the adversarial sql_reviewer skill before execution.
 
-        Loads ``backend/skills/sql_reviewer.md`` and calls the LLM with the SQL
+        Loads ``gateway/skills/sql_reviewer.md`` and calls the LLM with the SQL
         as the user message.  Parses the response for PASS or ISSUES FOUND.
 
         Args:

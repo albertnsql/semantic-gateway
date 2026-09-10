@@ -28,6 +28,20 @@ That separation is the whole point.
 
 ## Architecture
 
+**Full reference: [`docs/architecture.html`](docs/architecture.html)** — open it in any
+browser, no server or build step. Ten sections and seven diagrams covering the
+governance boundary, the request pipeline stage by stage, all four SQL-generation
+fallback rungs, the LangGraph diagnostic engine, and the dbt semantic layer. Its
+counts were read from the live metric registry and the route modules rather than
+transcribed, so they are current.
+
+> The ASCII diagram below predates several changes — it shows a separate
+> `IntentClassifier` call, an OpenRouter-first provider chain, active RAG retrieval
+> and Snowflake execution. None of those are current: routing happens inside the
+> extraction call, the chain is Cerebras → Google → Groq, RAG never runs, and the
+> warehouse is DuckDB. Use the HTML reference above.
+
+
 ```
 User Query
     │
@@ -87,10 +101,10 @@ React Frontend
 - all-MiniLM-L6-v2 — sentence embeddings (HuggingFace, cached locally)
 - pydantic-settings — typed configuration from `.env`
 
-**Backend (backend/)**
+**Offline tooling (inside gateway/)**
 - `evals/` — offline accuracy evaluation harness for the IntentExtractor
-- `skills/` — domain knowledge loader (`streaming_analytics.md`, `sql_reviewer.md`)
-- `core/skill_loader.py` — loads markdown skill files and injects them into LLM prompts at startup
+- `skills/` — domain knowledge (`streaming_analytics.md`, `sql_reviewer.md`), read at runtime
+- `core/skill_loader.py` — loads markdown skill files and injects them into LLM prompts
 
 **Frontend**
 - React + Vite + TailwindCSS
@@ -180,20 +194,20 @@ Churned subscribers by churn reason
 
 ## Offline Evals
 
-The `backend/evals/` directory contains an accuracy harness that runs every case in `golden_set.json` through the real `IntentExtractor` (using live credentials from `gateway/.env`) and scores the result against pinned expected values.
+The `gateway/evals/` directory contains an accuracy harness that runs every case in `golden_set.json` through the real `IntentExtractor` (using live credentials from `gateway/.env`) and scores the result against pinned expected values.
 
 ```bash
 # Run all cases
-python backend/evals/run_evals.py
+python evals/run_evals.py
 
 # Write a dated JSON snapshot
-python backend/evals/run_evals.py --snapshot
+python evals/run_evals.py --snapshot
 
 # Run only hallucination-resistance cases
-python backend/evals/run_evals.py --category hallucination_resistance --verbose
+python evals/run_evals.py --category hallucination_resistance --verbose
 
 # Fail CI if pass rate drops below 90%
-python backend/evals/run_evals.py --fail-under 90
+python evals/run_evals.py --fail-under 90
 ```
 
 Scores: metric match, dimension match, time range extraction, aggregation level, filter presence, and clarification flag. Supports `partial_match_ok` for soft-fail cases.
@@ -282,20 +296,16 @@ semantic-gateway/
 │   │   ├── snowflake_pool.py           # Connection pool
 │   │   ├── cache_warmer.py             # Startup pre-warm for top metric+dim combos
 │   │   └── exceptions.py              # Typed gateway exceptions
-│   └── rag/
-│       └── embedder.py                 # ChromaDB + SentenceTransformer
-│
-├── backend/                            # Offline tooling
-│   ├── core/
-│   │   └── skill_loader.py             # Loads markdown skill files
-│   ├── skills/
+│   ├── rag/
+│   │   └── embedder.py                 # ChromaDB + SentenceTransformer (never runs)
+│   ├── skills/                         # Prompt grounding, read at runtime
 │   │   ├── streaming_analytics.md      # Schema knowledge injected into prompts
 │   │   └── sql_reviewer.md             # SQL review rules
-│   ├── evals/
+│   ├── evals/                          # Offline accuracy harness
 │   │   ├── run_evals.py                # Eval harness CLI
 │   │   ├── golden_set.json             # Pinned expected outputs
 │   │   └── snapshots/                  # Dated JSON eval results
-│   └── tests/
+│   └── tests/                          # 847 tests, one suite
 │
 ├── frontend/
 │   └── src/
@@ -353,8 +363,10 @@ With 15 metrics and growing, passing all of them into every prompt wastes contex
 **Why a skills system?**
 The `streaming_analytics.md` skill injects schema knowledge (physical column names, hygiene filters, grain definitions) into the SQL reviewer prompt at runtime. This is what catches things like `is_active = TRUE` being missing, or `country IS NOT NULL` being skipped. Without it, the reviewer would have no grounding in the actual schema.
 
-**Why a separate `backend/` directory?**
-The `gateway/` directory is the deployable FastAPI service. `backend/` is the offline layer — eval harness, skill loader, and tests — that never ships to production but is critical for maintaining accuracy and schema knowledge. Keeping them separate avoids polluting the deployed bundle with eval dependencies.
+**Why is the offline tooling inside `gateway/`?**
+It used to live in a separate `backend/` directory, on the reasoning that eval dependencies should stay out of the deployed bundle. That reasoning did not survive contact with the deploy: Render checks out the whole repository, and the deployed gateway read its prompt grounding from `../backend/skills/` **at runtime** — so nothing was actually excluded, and the files the service depends on simply sat outside its own root directory.
+
+The split also cost four separate path-bridging hacks: `intent_extractor` and `sql_generator` each carried their own `importlib` file-path bootstrap to reach the skill loader, and the eval harness plus two test files each did their own `sys.path` surgery. Folding `backend/` into `gateway/` turned all four into plain imports and merged two test suites into one.
 
 ---
 

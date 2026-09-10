@@ -14,11 +14,11 @@ Run the eval harness from the project root:
 
 ```bash
 # Run all cases and write a dated snapshot
-python backend/evals/run_evals.py --snapshot
+python evals/run_evals.py --snapshot
 
 # Gate a CI merge — fail if accuracy drops below 85%
-python backend/evals/run_evals.py --fail-under 85
+python evals/run_evals.py --fail-under 85
 
 # Run only a specific category to debug failures
-python backend/evals/run_evals.py --category hallucination_resistance --verbose
+python evals/run_evals.py --category hallucination_resistance --verbose
 ```

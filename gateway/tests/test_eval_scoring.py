@@ -28,15 +28,15 @@ from pathlib import Path
 
 import pytest
 
-_ROOT = Path(__file__).resolve().parents[2]
-_GATEWAY = _ROOT / "gateway"
+_GATEWAY = Path(__file__).resolve().parents[1]   # gateway/
+_ROOT = _GATEWAY.parent                          # Streaming_Analytics/
 
 
 def _load_harness():
     if str(_GATEWAY) not in sys.path:
         sys.path.insert(0, str(_GATEWAY))
     spec = importlib.util.spec_from_file_location(
-        "_run_evals_under_test", _ROOT / "backend" / "evals" / "run_evals.py"
+        "_run_evals_under_test", _GATEWAY / "evals" / "run_evals.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -92,7 +92,7 @@ class TestFixtureSupportsItsOwnGoldenCases:
         """
         import json
 
-        path = _ROOT / "backend" / "evals" / "golden_set.json"
+        path = _GATEWAY / "evals" / "golden_set.json"
         raw = json.loads(path.read_text(encoding="utf-8"))
         cases = raw if isinstance(raw, list) else raw.get("cases", raw.get("golden_set", []))
 

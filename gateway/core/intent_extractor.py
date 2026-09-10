@@ -21,29 +21,21 @@ from pydantic import BaseModel, field_validator
 
 from core.exceptions import IntentExtractionError
 
-import importlib.util
-import pathlib
-
-_skill_loader_path = (
-    pathlib.Path(__file__).resolve()
-    .parent   # gateway/core/
-    .parent   # gateway/
-    .parent   # Streaming_Analytics/
-    / "backend" / "core" / "skill_loader.py"
-)
-
-if _skill_loader_path.exists():
-    _spec = importlib.util.spec_from_file_location("skill_loader", _skill_loader_path)
-    _skill_loader_mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
-    _spec.loader.exec_module(_skill_loader_mod)  # type: ignore[union-attr]
-    get_skill_section = _skill_loader_mod.get_skill_section
+# A plain import since the skills moved inside gateway/. This was previously a
+# ~20-line `importlib.util.spec_from_file_location` bootstrap that walked three
+# parents up to the repo root and into `backend/core/`, because the loader lived in
+# a sibling package the gateway could not import. It also meant the DEPLOYED
+# gateway read its prompt grounding from outside its own root directory, and only
+# worked because Render checks out the whole repo.
+try:
+    from core.skill_loader import get_skill_section
     _SKILL_LOADER_AVAILABLE = True
-else:
+except ImportError as _exc:  # pragma: no cover - defensive
     _SKILL_LOADER_AVAILABLE = False
     import logging as _logging
     _logging.getLogger(__name__).warning(
-        "backend/core/skill_loader.py not found at '%s' — skill injection disabled.",
-        _skill_loader_path,
+        "core/skill_loader.py could not be imported (%s) — skill injection disabled.",
+        _exc,
     )
 
 logger = logging.getLogger(__name__)

@@ -1,8 +1,8 @@
 """
-backend/core/skill_loader.py — Utility for loading skill markdown files.
+gateway/core/skill_loader.py — Utility for loading skill markdown files.
 
 Provides two pure functions for reading skill files from
-backend/skills/{skill_name}.md and extracting individual sections by header.
+gateway/skills/{skill_name}.md and extracting individual sections by header.
 
 No external dependencies beyond the Python standard library.
 """
@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 
 # Resolve the skills directory relative to this file's location.
-# This file lives at backend/core/skill_loader.py, so skills are one level up
+# This file lives at gateway/core/skill_loader.py, so skills are one level up
 # then into the skills/ subdirectory.
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
@@ -25,7 +25,7 @@ def load_skill(skill_name: str) -> str:
     Args:
         skill_name: The base name of the skill (without the .md extension),
             e.g. ``"streaming_analytics"`` loads
-            ``backend/skills/streaming_analytics.md``.
+            ``gateway/skills/streaming_analytics.md``.
 
     Returns:
         The full markdown string contents of the skill file.
@@ -38,7 +38,7 @@ def load_skill(skill_name: str) -> str:
     if not skill_path.exists():
         raise FileNotFoundError(
             f"Skill file not found: '{skill_path}'. "
-            f"Expected a file at backend/skills/{skill_name}.md. "
+            f"Expected a file at gateway/skills/{skill_name}.md. "
             f"Available skills: {[p.stem for p in _SKILLS_DIR.glob('*.md')]}"
         )
     return skill_path.read_text(encoding="utf-8")

@@ -899,7 +899,7 @@ async def submit_query(
             },
         )
 
-    # ── Stage 6: Snowflake execution ───────────────────────────────────────────
+    # ── Stage 6: Warehouse execution ───────────────────────────────────────────
     results: list[dict] = []
     try:
         all_rows = await anyio.to_thread.run_sync(partial(sql_gen.execute_query, gen_query.compiled_sql))

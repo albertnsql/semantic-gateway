@@ -1,23 +1,23 @@
 """
-backend/evals/run_evals.py — Offline accuracy harness for the IntentExtractor.
+evals/run_evals.py — Offline accuracy harness for the IntentExtractor.
 
 Runs every question in golden_set.json through the REAL IntentExtractor
 (using credentials from gateway/.env) and scores each result against the
 pinned expected values.
 
 Usage (from the project root):
-    python backend/evals/run_evals.py
+    python evals/run_evals.py
 
 Options:
-    --snapshot          Write a dated JSON results file to backend/evals/snapshots/
+    --snapshot          Write a dated JSON results file to evals/snapshots/
     --fail-under N      Exit code 1 if pass rate < N% (default: 80)
     --category CATEGORY Run only cases matching this category
     --verbose           Print full intent JSON for every case (not just failures)
 
 Examples:
-    python backend/evals/run_evals.py --snapshot
-    python backend/evals/run_evals.py --category hallucination_resistance --verbose
-    python backend/evals/run_evals.py --fail-under 90
+    python evals/run_evals.py --snapshot
+    python evals/run_evals.py --category hallucination_resistance --verbose
+    python evals/run_evals.py --fail-under 90
 """
 
 from __future__ import annotations
@@ -41,9 +41,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 # ---------------------------------------------------------------------------
 # Path bootstrap — makes gateway/ importable from the project root
 # ---------------------------------------------------------------------------
-_HERE = Path(__file__).resolve().parent          # backend/evals/
-_PROJECT_ROOT = _HERE.parent.parent              # Streaming_Analytics/
-_GATEWAY_ROOT = _PROJECT_ROOT / "gateway"
+_HERE = Path(__file__).resolve().parent          # gateway/evals/
+_GATEWAY_ROOT = _HERE.parent                     # gateway/
+_PROJECT_ROOT = _GATEWAY_ROOT.parent             # Streaming_Analytics/
 
 if str(_GATEWAY_ROOT) not in sys.path:
     sys.path.insert(0, str(_GATEWAY_ROOT))
@@ -161,10 +161,8 @@ def _load_live_registry():
     loaded, so `--live-registry` degrades to a clear message rather than a stack
     trace.
     """
-    gateway = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        "gateway",
-    )
+    # gateway/ is this file's grandparent now that evals live inside it.
+    gateway = str(_GATEWAY_ROOT)
     if gateway not in sys.path:
         sys.path.insert(0, gateway)
     try:
@@ -633,7 +631,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--snapshot",
         action="store_true",
-        help="Write a dated JSON results file to backend/evals/snapshots/",
+        help="Write a dated JSON results file to evals/snapshots/",
     )
     p.add_argument(
         "--fail-under",

@@ -1,31 +1,20 @@
 """
-backend/tests/test_skill_loader.py — Integration smoke tests for skill_loader.
+tests/test_skill_loader.py — Integration smoke tests for skill_loader.
 
 These tests run against the real .md files on disk (no mocking).
 If a skill file is moved or a section header is renamed, these tests
 will break immediately and pinpoint exactly what changed.
 
-Run from the project root:
-    python -m pytest backend/tests/test_skill_loader.py -v
+Run from gateway/:
+    python -m pytest tests/test_skill_loader.py -v
 """
 
-import importlib.util
-import pathlib
 import pytest
 
-# ---------------------------------------------------------------------------
-# Bootstrap: load skill_loader directly from its file path so this test file
-# works regardless of how pytest is invoked (project root, gateway/, etc.)
-# ---------------------------------------------------------------------------
-_HERE = pathlib.Path(__file__).resolve().parent          # backend/tests/
-_SKILL_LOADER_PATH = _HERE.parent / "core" / "skill_loader.py"
-
-_spec = importlib.util.spec_from_file_location("skill_loader", _SKILL_LOADER_PATH)
-_mod = importlib.util.module_from_spec(_spec)            # type: ignore[arg-type]
-_spec.loader.exec_module(_mod)                           # type: ignore[union-attr]
-
-load_skill = _mod.load_skill
-get_skill_section = _mod.get_skill_section
+# A plain import now that the loader lives in gateway/core/, same as every other
+# test in this directory. This was an importlib file-path bootstrap when the
+# loader sat in a sibling `backend/` package the gateway could not import.
+from core.skill_loader import get_skill_section, load_skill
 
 
 # ---------------------------------------------------------------------------

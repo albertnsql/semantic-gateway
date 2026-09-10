@@ -1,0 +1,1071 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="How a natural-language question becomes governed SQL in SemanticGateway: the three deployables, the request pipeline, every SQL fallback rung, the LangGraph diagnostic engine and the dbt semantic layer.">
+<!--
+  SemanticGateway architecture reference. Self-contained: open it in any browser,
+  no server and no build step. Web fonts load from Google Fonts when online and
+  fall back to the declared stacks (Georgia / Arial / Consolas) when offline.
+
+  THIS FILE IS THE SOURCE. It is a complete document; the published Claude artifact
+  is the same page minus the doctype/<head> wrapper, because that host injects its
+  own. If you edit here and want the hosted copy updated too, strip everything from
+  <!doctype> down to <body> and republish that fragment to the existing artifact URL
+  rather than a new one.
+
+  Numbers on this page were read from the live metric registry, the dbt project and
+  the route modules -- not transcribed from CLAUDE.md.
+-->
+<title>SemanticGateway Architecture</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+  :root {
+    --paper:        #F1F5F3;
+    --surface:      #FBFCFC;
+    --surface-sunk: #E7EDEA;
+    --ink:          #10241F;
+    --ink-soft:     #3D5A55;
+    --ink-faint:    #6E8A85;
+    --rule:         #CFDCD8;
+    --rule-strong:  #A9BFBA;
+    --accent:       #0D9488;
+    --accent-deep:  #1A3A38;
+    --accent-wash:  rgba(13,148,136,0.09);
+    --violet:       #7C3AED;
+    --violet-wash:  rgba(124,58,237,0.09);
+    --warn:         #B45309;
+    --warn-wash:    rgba(180,83,9,0.10);
+    --danger:       #B91C1C;
+
+    color-scheme: light;
+
+    --measure: 66ch;
+    --f-display: 'Archivo', 'Helvetica Neue', Arial, sans-serif;
+    --f-body: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    --f-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --paper:        #0B1614;
+      --surface:      #11201D;
+      --surface-sunk: #0A1412;
+      --ink:          #DEEAE7;
+      --ink-soft:     #9EB8B3;
+      --ink-faint:    #6E8A85;
+      --rule:         #24403B;
+      --rule-strong:  #38574F;
+      --accent:       #35C4B4;
+      --accent-deep:  #A5DED6;
+      --accent-wash:  rgba(53,196,180,0.13);
+      --violet:       #B18AF7;
+      --violet-wash:  rgba(177,138,247,0.14);
+      --warn:         #E0A050;
+      --warn-wash:    rgba(224,160,80,0.13);
+      --danger:       #F08585;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --paper:        #0B1614;
+    --surface:      #11201D;
+    --surface-sunk: #0A1412;
+    --ink:          #DEEAE7;
+    --ink-soft:     #9EB8B3;
+    --ink-faint:    #6E8A85;
+    --rule:         #24403B;
+    --rule-strong:  #38574F;
+    --accent:       #35C4B4;
+    --accent-deep:  #A5DED6;
+    --accent-wash:  rgba(53,196,180,0.13);
+    --violet:       #B18AF7;
+    --violet-wash:  rgba(177,138,247,0.14);
+    --warn:         #E0A050;
+    --warn-wash:    rgba(224,160,80,0.13);
+    --danger:       #F08585;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 16.5px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 24px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 940px; margin: 0 auto; }
+
+  /* ─────────────────────────────── masthead */
+  .masthead { padding: 56px 0 28px; border-bottom: 2px solid var(--ink); }
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  h1 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: clamp(2.1rem, 5.4vw, 3.3rem);
+    line-height: 1.02;
+    letter-spacing: -0.022em;
+    text-wrap: balance;
+    margin: 0 0 20px;
+  }
+  .thesis {
+    font-size: 1.14rem;
+    color: var(--ink-soft);
+    max-width: var(--measure);
+    margin: 0 0 6px;
+  }
+  .thesis strong { color: var(--ink); font-weight: 600; }
+
+  /* ─────────────────────────────── section rhythm */
+  section { padding-top: 52px; }
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 1.44rem;
+    letter-spacing: -0.014em;
+    text-wrap: balance;
+    margin: 0 0 6px;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  h2 .num {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+    flex: none;
+  }
+  h3 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 1.02rem;
+    letter-spacing: -0.005em;
+    margin: 34px 0 8px;
+  }
+  p { max-width: var(--measure); margin: 0 0 14px; }
+  .lede { color: var(--ink-soft); margin-bottom: 26px; }
+  code, .m {
+    font-family: var(--f-mono);
+    font-size: 0.855em;
+    background: var(--surface-sunk);
+    padding: 0.1em 0.34em;
+    border-radius: 3px;
+    color: var(--accent-deep);
+    word-break: break-word;
+  }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 2px;
+  }
+
+  /* ─────────────────────────────── figures */
+  figure {
+    margin: 26px 0 8px;
+    padding: 0;
+  }
+  .canvas {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 20px 18px;
+  }
+  figure svg { display: block; max-width: 100%; height: auto; margin: 0 auto; color: var(--ink-soft); }
+  figcaption {
+    font-family: var(--f-display);
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    margin-top: 11px;
+    max-width: var(--measure);
+    line-height: 1.5;
+  }
+  svg text { font-family: 'Archivo', Arial, sans-serif; }
+  svg .lbl  { font-size: 12.5px; font-weight: 600; fill: var(--ink); }
+  svg .sub  { font-size: 10.5px; fill: var(--ink-faint); font-family: 'JetBrains Mono', monospace; }
+  svg .edge { font-size: 10px; fill: var(--ink-faint); font-family: 'JetBrains Mono', monospace; }
+  svg .cap  { font-size: 10px; font-weight: 700; letter-spacing: 0.09em; fill: var(--accent); }
+  svg .box  { fill: var(--surface); stroke: var(--rule-strong); stroke-width: 1.2; }
+  svg .box-a { fill: var(--accent-wash); stroke: var(--accent); stroke-width: 1.4; }
+  svg .box-v { fill: var(--violet-wash); stroke: var(--violet); stroke-width: 1.4; }
+  svg .box-w { fill: var(--warn-wash); stroke: var(--warn); stroke-width: 1.2; }
+  svg .flow { stroke: var(--rule-strong); stroke-width: 1.4; fill: none; }
+  svg .flow-a { stroke: var(--accent); stroke-width: 1.7; fill: none; }
+  svg .flow-v { stroke: var(--violet); stroke-width: 1.5; fill: none; }
+  svg .flow-d { stroke: var(--ink-faint); stroke-width: 1.3; fill: none; stroke-dasharray: 5 4; }
+  svg .fence { fill: none; stroke: var(--accent); stroke-width: 1.3; stroke-dasharray: 7 5; }
+  svg .box-d { fill: var(--surface-sunk); stroke: var(--ink-faint); stroke-width: 1.2; stroke-dasharray: 5 4; }
+
+  /* ─────────────────────────────── stage list */
+  .stages { margin: 26px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+  .stage {
+    display: grid;
+    grid-template-columns: 74px 1fr;
+    gap: 18px;
+    padding: 15px 0;
+    border-top: 1px solid var(--rule);
+    align-items: start;
+  }
+  .stage:last-child { border-bottom: 1px solid var(--rule); }
+  .stage-n {
+    font-family: var(--f-mono);
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--accent);
+    padding-top: 2px;
+    letter-spacing: 0.02em;
+  }
+  .stage-b .stage-n { color: var(--violet); }
+  .stage-name { font-family: var(--f-display); font-weight: 600; font-size: 0.99rem; margin: 0 0 3px; }
+  .stage-what { margin: 0; font-size: 0.95rem; color: var(--ink-soft); max-width: 62ch; }
+  .tag {
+    font-family: var(--f-mono);
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-left: 9px;
+    vertical-align: 1.5px;
+    white-space: nowrap;
+  }
+  .tag-llm { background: var(--violet-wash); color: var(--violet); }
+  .tag-cache { background: var(--accent-wash); color: var(--accent); }
+  .tag-exit { background: var(--surface-sunk); color: var(--ink-faint); }
+
+  /* ─────────────────────────────── tables */
+  .tblwrap { overflow-x: auto; margin: 24px 0 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; min-width: 460px; }
+  caption {
+    text-align: left;
+    font-family: var(--f-display);
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    padding-bottom: 9px;
+  }
+  th {
+    text-align: left;
+    font-family: var(--f-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding: 0 14px 8px 0;
+    border-bottom: 1.5px solid var(--rule-strong);
+    white-space: nowrap;
+  }
+  td {
+    padding: 10px 14px 10px 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+    color: var(--ink-soft);
+  }
+  td:first-child { color: var(--ink); font-weight: 600; }
+  td.n { font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  /* ─────────────────────────────── counts strip */
+  .counts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    margin: 26px 0 8px;
+    overflow: hidden;
+  }
+  .count { background: var(--surface); padding: 15px 16px; }
+  .count-v {
+    font-family: var(--f-mono);
+    font-size: 1.36rem;
+    font-weight: 700;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    line-height: 1.1;
+  }
+  .count-k {
+    font-family: var(--f-display);
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--ink-faint);
+    margin-top: 5px;
+    line-height: 1.35;
+  }
+
+  /* ─────────────────────────────── notes */
+  .note {
+    border-left: 3px solid var(--warn);
+    background: var(--warn-wash);
+    padding: 14px 18px;
+    margin: 24px 0;
+    border-radius: 0 4px 4px 0;
+    max-width: var(--measure);
+  }
+  .note-k {
+    font-family: var(--f-mono);
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--warn);
+    display: block;
+    margin-bottom: 5px;
+  }
+  .note p { margin: 0; font-size: 0.93rem; }
+  .note p + p { margin-top: 9px; }
+
+  .rule-card {
+    border: 1.5px solid var(--accent);
+    background: var(--accent-wash);
+    border-radius: 4px;
+    padding: 20px 22px;
+    margin: 28px 0 8px;
+    max-width: var(--measure);
+  }
+  .rule-card p { margin: 0; font-size: 1.02rem; }
+  .rule-card p + p { margin-top: 10px; color: var(--ink-soft); font-size: 0.94rem; }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 22px;
+    border-top: 2px solid var(--ink);
+    font-family: var(--f-mono);
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.8;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+  @media (max-width: 620px) {
+    body { padding: 0 16px 72px; font-size: 16px; }
+    .stage { grid-template-columns: 1fr; gap: 4px; }
+  }
+
+  /* ── print: a local reference doc gets printed ───────────────────────────── */
+  @media print {
+    :root {
+      --paper: #FFFFFF; --surface: #FFFFFF; --surface-sunk: #F2F2F2;
+      --ink: #000000; --ink-soft: #333333; --ink-faint: #555555;
+      --rule: #CCCCCC; --rule-strong: #888888;
+      color-scheme: light;
+    }
+    body { padding: 0; font-size: 10.5pt; }
+    .wrap { max-width: none; }
+    section { padding-top: 22pt; break-inside: avoid-page; }
+    h2 { break-after: avoid-page; }
+    figure, .canvas, table, .note, .rule-card, .counts { break-inside: avoid; }
+    .canvas { overflow: visible; }
+    a { color: #000; text-decoration: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">Architecture reference &middot; verified against main @ 1380b76</p>
+    <h1>SemanticGateway</h1>
+    <p class="thesis">A natural-language analytics gateway over a governed dbt semantic layer. The organising rule, and the reason every component sits where it does: <strong>the LLM never writes SQL.</strong></p>
+    <p class="thesis">It extracts intent — metric, dimensions, time range, filters — and MetricFlow compiles the SQL from a governed manifest.</p>
+  </header>
+
+  <section>
+    <h2><span class="num">01</span> The governance boundary</h2>
+    <p class="lede">Everything else in this document is downstream of one decision. A model that emits SQL can invent a column, a join, or a filter, and the result is a confident wrong number that nothing catches. So the model's output is a typed <code>QueryIntent</code> — never a string of SQL.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 800 320" role="img" aria-label="A question reaches an LLM which emits a typed QueryIntent object; the intent then passes through the semantic validator to the MetricFlow compiler and the DuckDB warehouse, a region no LLM has any path into.">
+          <defs>
+            <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--rule-strong)"/>
+            </marker>
+            <marker id="a1v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--violet)"/>
+            </marker>
+            <marker id="a1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <!-- row 1 : the model side -->
+          <text class="cap" x="30" y="34">MODEL SIDE &mdash; INTENT ONLY</text>
+          <rect class="box" x="30" y="52" width="112" height="46" rx="3"/>
+          <text class="lbl" x="86" y="80" text-anchor="middle">Question</text>
+
+          <rect class="box-v" x="192" y="52" width="196" height="46" rx="3"/>
+          <text class="lbl" x="290" y="74" text-anchor="middle">IntentExtractor</text>
+          <text class="sub" x="290" y="90" text-anchor="middle">LLM call #1</text>
+
+          <rect class="box" x="438" y="52" width="206" height="46" rx="3"/>
+          <text class="lbl" x="541" y="74" text-anchor="middle">QueryIntent</text>
+          <text class="sub" x="541" y="90" text-anchor="middle">metric · dims · time · filters</text>
+
+          <line class="flow" x1="142" y1="75" x2="186" y2="75" marker-end="url(#a1)"/>
+          <line class="flow-v" x1="388" y1="75" x2="432" y2="75" marker-end="url(#a1v)"/>
+
+          <!-- hand-off -->
+          <path class="flow-a" d="M541 98 L541 138 L104 138 L104 196" marker-end="url(#a1a)"/>
+          <text class="edge" x="330" y="131" text-anchor="middle">typed object, validated field by field</text>
+
+          <!-- row 2 : the governed region -->
+          <rect class="fence" x="14" y="176" width="700" height="120" rx="5"/>
+          <text class="cap" x="30" y="290">NO LLM HAS A PATH INTO THIS REGION</text>
+
+          <rect class="box-a" x="30" y="200" width="148" height="46" rx="3"/>
+          <text class="lbl" x="104" y="222" text-anchor="middle">SemanticValidator</text>
+          <text class="sub" x="104" y="238" text-anchor="middle">267 certified pairs</text>
+
+          <rect class="box-a" x="228" y="200" width="196" height="46" rx="3"/>
+          <text class="lbl" x="326" y="222" text-anchor="middle">MetricFlow</text>
+          <text class="sub" x="326" y="238" text-anchor="middle">compiles every line of SQL</text>
+
+          <rect class="box-a" x="474" y="200" width="152" height="46" rx="3"/>
+          <text class="lbl" x="550" y="222" text-anchor="middle">DuckDB</text>
+          <text class="sub" x="550" y="238" text-anchor="middle">assert_read_only()</text>
+
+          <line class="flow-a" x1="178" y1="223" x2="222" y2="223" marker-end="url(#a1a)"/>
+          <line class="flow-a" x1="424" y1="223" x2="468" y2="223" marker-end="url(#a1a)"/>
+          <line class="flow-a" x1="626" y1="223" x2="700" y2="223" marker-end="url(#a1a)"/>
+          <text class="edge" x="663" y="215" text-anchor="middle">rows</text>
+        </svg>
+      </div>
+      <figcaption>The model produces a typed intent; the compiler produces SQL. There is no code path that lets a model concatenate a query — which is why a wrong answer here is a wrong <em>metric choice</em>, never invalid SQL.</figcaption>
+    </figure>
+
+    <div class="rule-card">
+      <p>Read-only is enforced <em>in SQL</em>, not by the connection.</p>
+      <p>dbt-duckdb hardcodes <code>read_only=False</code>, and DuckDB refuses a second connection with a different config in one process — and this process hosts the in-process MetricFlow engine. So the pool connects read-write and <code>assert_read_only()</code> rejects anything that is not a single <code>WITH</code>/<code>SELECT</code> before execution. A read-only dbt target cannot work here.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">02</span> Three pieces, one of them deployed</h2>
+    <p class="lede">Only <code>gateway/</code> ships to production; the other two are a client and a compiler input. A fourth piece, <code>backend/</code>, held the eval harness and the prompt-grounding skill files until 2026-09-10 &mdash; it was folded into <code>gateway/</code>, because the deployed service was reading those skills from outside its own root directory at runtime.</p>
+
+    <div class="tblwrap">
+      <table>
+        <caption>Deployables and where they run.</caption>
+        <thead>
+          <tr><th scope="col">Piece</th><th scope="col">Stack</th><th scope="col">Runs on</th><th scope="col">Role</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>gateway/</code></td><td>FastAPI</td><td>Render</td><td>The only production artifact. 9 endpoints, 9 HTTP routes, plus <code>skills/</code> (prompt grounding, read at runtime) and <code>evals/</code> (the offline accuracy harness).</td></tr>
+          <tr><td><code>frontend/</code></td><td>React · Vite · Tailwind</td><td>Vercel</td><td>7 pages. Two of them post to the same query endpoint.</td></tr>
+          <tr><td><code>dbt_streaming_analytics/</code></td><td>dbt · DuckDB</td><td>Build time</td><td>Defines the semantic layer. Emits the manifests the gateway reads.</td></tr>
+                  </tbody>
+      </table>
+    </div>
+
+    <h3>The warehouse is a file</h3>
+    <p><code>streaming_analytics.duckdb</code>, ~300&nbsp;MB, gitignored, shipped as a GitHub <em>release asset</em> because that has a 2&nbsp;GB limit rather than 100&nbsp;MB. Snowflake was not deleted — it is dormant and still selectable through <code>warehouse_engine</code>, with dialect differences confined to two places.</p>
+    <p>The filename is part of the contract: DuckDB derives the catalog name from it, which is what makes <code>database: streaming_analytics</code> resolve in the sources and keeps the hand-written three-part names in the dashboard route working untouched.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">03</span> The request pipeline</h2>
+    <p class="lede">Thirteen ordered stages, four possible branches, three caches that can short-circuit the whole thing. Stage numbers below match the <code># ── Stage N</code> comments in <code>api/routes/query.py</code>.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 840 706" role="img" aria-label="A vertical pipeline: question, raw-question cache, intent extraction, then a router that peels off schema, diagnostic and out-of-scope branches. The metric branch continues through the intent-keyed cache, validation, SQL generation, the warehouse, response assembly and the narrative call. Both caches short-circuit directly to the response.">
+          <defs>
+            <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--rule-strong)"/>
+            </marker>
+            <marker id="a2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--accent)"/>
+            </marker>
+            <marker id="a2v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--violet)"/>
+            </marker>
+          </defs>
+
+          <!-- main spine -->
+          <rect class="box" x="60" y="16" width="240" height="40" rx="3"/>
+          <text class="lbl" x="180" y="41" text-anchor="middle">POST /api/v1/query</text>
+
+          <rect class="box-a" x="60" y="76" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="97" text-anchor="middle">Stage 0 · raw-question cache</text>
+          <text class="sub" x="180" y="112" text-anchor="middle">before any LLM call</text>
+
+          <rect class="box-v" x="60" y="140" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="161" text-anchor="middle">Stage 1 · IntentExtractor</text>
+          <text class="sub" x="180" y="176" text-anchor="middle">LLM #1 · returns query_type</text>
+
+          <rect class="box" x="60" y="204" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="225" text-anchor="middle">Stage 1.25 · router</text>
+          <text class="sub" x="180" y="240" text-anchor="middle">one call, four outcomes</text>
+
+          <rect class="box-a" x="60" y="336" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="357" text-anchor="middle">Stage 2 · intent-keyed cache</text>
+          <text class="sub" x="180" y="372" text-anchor="middle">L2 · full result rows</text>
+
+          <rect class="box" x="60" y="400" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="421" text-anchor="middle">Stage 3 · SemanticValidator</text>
+          <text class="sub" x="180" y="436" text-anchor="middle">metric × dimension</text>
+
+          <rect class="box-a" x="60" y="464" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="485" text-anchor="middle">Stage 5 · SQL generation</text>
+          <text class="sub" x="180" y="500" text-anchor="middle">MetricFlow, then 3 fallbacks</text>
+
+          <rect class="box-a" x="60" y="528" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="549" text-anchor="middle">Stage 6 · warehouse</text>
+          <text class="sub" x="180" y="564" text-anchor="middle">assert_read_only() first</text>
+
+          <rect class="box" x="60" y="592" width="240" height="44" rx="3"/>
+          <text class="lbl" x="180" y="613" text-anchor="middle">Stage 7–8 · lineage + shape</text>
+          <text class="sub" x="180" y="628" text-anchor="middle">grain and lineage metadata</text>
+
+          <rect class="box-v" x="60" y="656" width="240" height="40" rx="3"/>
+          <text class="lbl" x="180" y="681" text-anchor="middle">Stage 8b · narrative · LLM #2</text>
+
+          <!-- spine arrows -->
+          <line class="flow" x1="180" y1="56"  x2="180" y2="70"  marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="120" x2="180" y2="134" marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="184" x2="180" y2="198" marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="248" x2="180" y2="330" marker-end="url(#a2)"/>
+          <text class="edge" x="188" y="293">metric_query</text>
+          <line class="flow" x1="180" y1="380" x2="180" y2="394" marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="444" x2="180" y2="458" marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="508" x2="180" y2="522" marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="572" x2="180" y2="586" marker-end="url(#a2)"/>
+          <line class="flow" x1="180" y1="636" x2="180" y2="650" marker-end="url(#a2)"/>
+
+          <!-- branches -->
+          <text class="cap" x="404" y="180">OTHER BRANCHES</text>
+          <rect class="box" x="404" y="194" width="256" height="34" rx="3"/>
+          <text class="lbl" x="416" y="216">schema_question</text>
+          <text class="sub" x="648" y="216" text-anchor="end">LLM answer</text>
+
+          <rect class="box-v" x="404" y="236" width="256" height="34" rx="3"/>
+          <text class="lbl" x="416" y="258">diagnostic_query</text>
+          <text class="sub" x="648" y="258" text-anchor="end">Stage 1.3 · graph</text>
+
+          <rect class="box" x="404" y="278" width="256" height="34" rx="3"/>
+          <text class="lbl" x="416" y="300">out_of_scope</text>
+          <text class="sub" x="648" y="300" text-anchor="end">suggestion</text>
+
+          <path class="flow" d="M300 220 L352 220 L352 211 L398 211" marker-end="url(#a2)"/>
+          <path class="flow-v" d="M300 226 L352 226 L352 253 L398 253" marker-end="url(#a2v)"/>
+          <path class="flow" d="M300 232 L352 232 L352 295 L398 295" marker-end="url(#a2)"/>
+
+          <!-- also stage 1.5 and 4 as inline exits -->
+          <rect class="box-w" x="404" y="392" width="256" height="34" rx="3"/>
+          <text class="lbl" x="416" y="414">Stage 1.5 · clarification</text>
+          <text class="sub" x="648" y="414" text-anchor="end">grain check</text>
+          <rect class="box-w" x="404" y="456" width="256" height="34" rx="3"/>
+          <text class="lbl" x="416" y="478">Stage 4 · dry_run</text>
+          <text class="sub" x="648" y="478" text-anchor="end">plan only</text>
+          <line class="flow-d" x1="300" y1="415" x2="398" y2="409" marker-end="url(#a2)"/>
+          <line class="flow-d" x1="300" y1="480" x2="398" y2="473" marker-end="url(#a2)"/>
+
+          <!-- cache short circuits -->
+          <path class="flow-a" d="M300 98 L742 98 L742 668 L306 668" marker-end="url(#a2a)"/>
+          <path class="flow-a" d="M300 358 L706 358 L706 684 L306 684" marker-end="url(#a2a)"/>
+          <text class="edge" x="750" y="330" transform="rotate(-90 750 330)" text-anchor="middle">HIT-RAW &mdash; skips both LLM calls</text>
+          <text class="edge" x="714" y="500" transform="rotate(-90 714 500)" text-anchor="middle">HIT &mdash; skips SQL + warehouse</text>
+        </svg>
+      </div>
+      <figcaption>The metric path runs the full spine; the other three <code>query_type</code> values peel off at the router. Solid teal marks the two cache short-circuits — the upper one is the only escape that avoids paying for both LLM calls.</figcaption>
+    </figure>
+
+    <ol class="stages">
+      <li class="stage"><span class="stage-n">0</span><div><p class="stage-name">Raw-question cache<span class="tag tag-cache">cache</span></p><p class="stage-what">Keyed on the normalised question plus a hash of conversation history, whether dashboard context was supplied, and <code>max_rows</code>. Exists because the L2 cache is intent-keyed and therefore sits <em>after</em> the first LLM call. Measured on one repeated question: 11,662&nbsp;ms → 9.8&nbsp;ms → 7.2&nbsp;ms.</p></div></li>
+      <li class="stage"><span class="stage-n">1</span><div><p class="stage-name">IntentExtractor<span class="tag tag-llm">LLM #1</span></p><p class="stage-what">One call both classifies (<code>metric_query</code> / <code>schema_question</code> / <code>diagnostic_query</code> / <code>out_of_scope</code>) and extracts the intent. There is deliberately no separate classifier round-trip.</p></div></li>
+      <li class="stage"><span class="stage-n">1.25</span><div><p class="stage-name">Route on query_type</p><p class="stage-what">Branches on the field the extraction call already returned.</p></div></li>
+      <li class="stage stage-b"><span class="stage-n">1.3</span><div><p class="stage-name">Diagnostic path</p><p class="stage-what">The &ldquo;why did this move&rdquo; branch. A LangGraph agent, zero LLM calls of its own — see section 06.</p></div></li>
+      <li class="stage"><span class="stage-n">1.5</span><div><p class="stage-name">Clarification and time-grain validation<span class="tag tag-exit">can exit</span></p><p class="stage-what">Rejects an under-specified or wrong-grain question before it costs a compile.</p></div></li>
+      <li class="stage"><span class="stage-n">2</span><div><p class="stage-name">Intent-keyed result cache (L2)<span class="tag tag-cache">cache</span></p><p class="stage-what"><code>SHA256(metric + dimensions + time_range + filters)</code>. A hit returns immediately, skipping validation, SQL generation and the warehouse. Two phrasings of one question share an intent but not a raw key.</p></div></li>
+      <li class="stage"><span class="stage-n">3</span><div><p class="stage-name">SemanticValidator</p><p class="stage-what">Rejects a metric×dimension combination that is not certified. Certification is an assertion, so a separate audit pushes all 267 pairs through the real compiler <em>and</em> checks each returns more than one distinct bucket.</p></div></li>
+      <li class="stage"><span class="stage-n">4</span><div><p class="stage-name">Dry run<span class="tag tag-exit">can exit</span></p><p class="stage-what">Returns the plan and the SQL without touching the warehouse.</p></div></li>
+      <li class="stage"><span class="stage-n">5</span><div><p class="stage-name">SQL generation</p><p class="stage-what">MetricFlow first, on every query, then three fallback rungs — section 05.</p></div></li>
+      <li class="stage"><span class="stage-n">6</span><div><p class="stage-name">Warehouse execution</p><p class="stage-what"><code>DuckDBPool.execute()</code>, every statement through <code>assert_read_only()</code>. Column names are uppercased so the downstream response shaping — written against Snowflake's <code>DictCursor</code> — did not have to change.</p></div></li>
+      <li class="stage"><span class="stage-n">7–8</span><div><p class="stage-name">Lineage resolution and response assembly</p><p class="stage-what">Attaches grain and the <code>raw → stg → int → mart → metric</code> chain, read straight out of the dbt manifest.</p></div></li>
+      <li class="stage"><span class="stage-n">8b</span><div><p class="stage-name">Narrative summary<span class="tag tag-llm">LLM #2</span></p><p class="stage-what">Writes the prose from the result rows. It sees values, not semantics — so it will narrate whatever metric Stage 1 picked, and a wrong metric with right numbers still reads as a confident answer.</p></div></li>
+    </ol>
+
+    <div class="note">
+      <span class="note-k">Where the latency actually is</span>
+      <p>MetricFlow compiles in 60–96&nbsp;ms and a local DuckDB query is milliseconds. The two LLM calls are ~1–2&nbsp;s <em>each</em>, so they are roughly 90% of a 2.9–5.2&nbsp;s round trip. Retrieval tuning touches neither.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">04</span> Two read paths to the same warehouse</h2>
+    <p class="lede">The dashboard does not use any of the above. It is a separate, deliberate path — and the reason the same business concept can be defined twice.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 800 250" role="img" aria-label="The frontend reaches the warehouse two ways: the query endpoint through thirteen stages, two LLM calls and MetricFlow in seconds, or the dashboard endpoint through a hand-written SQL dictionary in milliseconds.">
+          <defs>
+            <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--rule-strong)"/>
+            </marker>
+            <marker id="a3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <rect class="box" x="20" y="88" width="118" height="58" rx="3"/>
+          <text class="lbl" x="79" y="112" text-anchor="middle">Frontend</text>
+          <text class="sub" x="79" y="128" text-anchor="middle">7 pages</text>
+
+          <!-- NL path -->
+          <rect class="box-v" x="212" y="26" width="330" height="52" rx="3"/>
+          <text class="lbl" x="228" y="48">POST /query</text>
+          <text class="sub" x="228" y="66">13 stages · 2 LLM calls · MetricFlow</text>
+          <rect class="box" x="592" y="26" width="188" height="52" rx="3"/>
+          <text class="lbl" x="686" y="48" text-anchor="middle">Semantic layer</text>
+          <text class="sub" x="686" y="66" text-anchor="middle">governed manifest</text>
+
+          <!-- widget path -->
+          <rect class="box-a" x="212" y="176" width="330" height="52" rx="3"/>
+          <text class="lbl" x="228" y="198">GET /dashboard/{widget}</text>
+          <text class="sub" x="228" y="216">13 entries · hand-written SQL · no LLM</text>
+
+          <rect class="box" x="592" y="176" width="188" height="52" rx="3"/>
+          <text class="lbl" x="686" y="198" text-anchor="middle">_WIDGET_SQL</text>
+          <text class="sub" x="686" y="216" text-anchor="middle">static builders</text>
+
+          <path class="flow" d="M138 104 L176 104 L176 52 L206 52" marker-end="url(#a3)"/>
+          <path class="flow-a" d="M138 130 L176 130 L176 202 L206 202" marker-end="url(#a3a)"/>
+          <line class="flow" x1="542" y1="52" x2="586" y2="52" marker-end="url(#a3)"/>
+          <line class="flow-a" x1="542" y1="202" x2="586" y2="202" marker-end="url(#a3a)"/>
+
+          <text class="edge" x="376" y="96" text-anchor="middle">2.9&ndash;5.2 s</text>
+          <text class="edge" x="376" y="166" text-anchor="middle">1&ndash;5 ms</text>
+
+          <!-- the risk -->
+          <path class="flow-d" d="M686 84 L686 168"/>
+          <text class="edge" x="700" y="130">same concept,</text>
+          <text class="edge" x="700" y="144">two definitions</text>
+        </svg>
+      </div>
+      <figcaption>A deliberate performance trade: widgets answer in single-digit milliseconds because nothing on their path is dynamic. The cost is that a metric can be defined once in MetricFlow YAML and again in hand-written SQL, and the two can silently diverge.</figcaption>
+    </figure>
+
+    <div class="note">
+      <span class="note-k">The maintenance rule this creates</span>
+      <p>When you change a metric definition, check <code>_WIDGET_SQL</code> for a widget computing the same thing, and vice versa. <code>churn_rate</code> was redefined once specifically so its formula would match the widget.</p>
+      <p>A second trap: an empty widget result is not an error to the frontend — it is silently replaced with mock data and labelled &ldquo;Estimated&rdquo;. Anything wearing that label is worth checking against the warehouse before believing it.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">05</span> SQL generation: four rungs</h2>
+    <p class="lede">MetricFlow runs first on every query, because the semantic layer is the source of truth and compiling from it is cheaper than the round trip it feeds. The rungs below it exist for engine <em>unavailability</em> — not for retrying a query the compiler has already rejected.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 780 342" role="img" aria-label="Four SQL generation rungs tried in order: the warm in-process MetricFlow engine at 60 to 96 milliseconds, the L1 template cache, the mf command line subprocess at about 30 seconds, and finally a hand-written governed builder which is the only rung an LLM reviews.">
+          <defs>
+            <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--rule-strong)"/>
+            </marker>
+          </defs>
+
+          <text class="cap" x="20" y="18">TRIED IN ORDER · EACH RUNG ONLY IF THE ONE ABOVE IS UNAVAILABLE</text>
+
+          <rect class="box-a" x="20" y="32" width="470" height="56" rx="3"/>
+          <text class="lbl" x="36" y="56">1 · Warm in-process MetricFlow engine</text>
+          <text class="sub" x="36" y="74">primary path, every query · +101 MB resident</text>
+          <text class="sub" x="758" y="66" text-anchor="end">60&ndash;96 ms</text>
+
+          <rect class="box" x="20" y="106" width="470" height="56" rx="3"/>
+          <text class="lbl" x="36" y="130">2 · L1 SQLTemplateCache</text>
+          <text class="sub" x="36" y="148">committed artifact · 69 templates · metric × dims</text>
+          <text class="sub" x="758" y="140" text-anchor="end">~0 ms</text>
+
+          <rect class="box-w" x="20" y="180" width="470" height="56" rx="3"/>
+          <text class="lbl" x="36" y="204">3 · mf CLI subprocess</text>
+          <text class="sub" x="36" y="222">argv shared with rung 1, so they cannot drift</text>
+          <text class="sub" x="758" y="214" text-anchor="end">~30 s</text>
+
+          <rect class="box-w" x="20" y="254" width="470" height="56" rx="3"/>
+          <text class="lbl" x="36" y="278">4 · Governed fallback builder</text>
+          <text class="sub" x="36" y="296">hand-written · the only rung an LLM reviews</text>
+          <text class="sub" x="758" y="288" text-anchor="end">last resort</text>
+
+          <line class="flow" x1="255" y1="88"  x2="255" y2="100" marker-end="url(#a4)"/>
+          <line class="flow" x1="255" y1="162" x2="255" y2="174" marker-end="url(#a4)"/>
+          <line class="flow" x1="255" y1="236" x2="255" y2="248" marker-end="url(#a4)"/>
+
+          <path class="flow-d" d="M500 60 L520 60 L520 282 L500 282"/>
+          <text class="edge" x="534" y="168" transform="rotate(-90 534 168)" text-anchor="middle">governance decreases</text>
+        </svg>
+      </div>
+      <figcaption>Rungs 3 and 4 are marked as degraded states, not alternatives. Because MetricFlow leads, the template cache is now insurance rather than the strategy: a stale entry costs ~40&nbsp;ms, where it used to cost 40&nbsp;s.</figcaption>
+    </figure>
+
+    <h3>Three normalisations run before any of it</h3>
+    <p>The validator certifies dimensions by their <em>bare</em> name; MetricFlow resolves them by their <em>qualified</em> name. Nothing reconciled the two, so three guards now sit at the top of generation — before the post-filter split, the cache key, or the outer predicate read the names.</p>
+    <div class="tblwrap">
+      <table>
+        <caption>Guards between validation and the compiler.</caption>
+        <thead><tr><th scope="col">Guard</th><th scope="col">Fixes</th></tr></thead>
+        <tbody>
+          <tr><td><code>correct_dimension_entity()</code></td><td>An entity prefix the model invented that is unreachable from the metric. Narrow by design — a deliberate choice between two <em>reachable</em> entities is never second-guessed.</td></tr>
+          <tr><td><code>require_metric_time()</code></td><td>An offset metric cannot resolve without <code>metric_time</code> in the group-by. Grain is read from the offset window, not hard-coded.</td></tr>
+          <tr><td><code>is_deterministic_mf_error()</code></td><td>Stops the pointless subprocess retry. A query-resolution error is deterministic; retrying it burned 24&nbsp;s reaching a byte-identical verdict.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">06</span> The diagnostic path</h2>
+    <p class="lede">A &ldquo;why did this move&rdquo; question does not narrate one result set — it gathers evidence. A LangGraph agent plans probes, Python computes the attribution, and MetricFlow still writes every line of SQL.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 780 262" role="img" aria-label="A four-node graph: plan, execute probes, analyze, synthesize. A conditional edge routes from analyze back to plan for another round when no axis explains the movement and budget remains, otherwise on to synthesize.">
+          <defs>
+            <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--rule-strong)"/>
+            </marker>
+            <marker id="a5v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--violet)"/>
+            </marker>
+          </defs>
+
+          <text class="sub" x="20" y="102">START</text>
+
+          <rect class="box" x="72" y="76" width="136" height="50" rx="3"/>
+          <text class="lbl" x="140" y="98" text-anchor="middle">plan</text>
+          <text class="sub" x="140" y="114" text-anchor="middle">driver_graph.yml</text>
+
+          <rect class="box" x="248" y="76" width="152" height="50" rx="3"/>
+          <text class="lbl" x="324" y="98" text-anchor="middle">execute_probes</text>
+          <text class="sub" x="324" y="114" text-anchor="middle">~60 ms each, warm</text>
+
+          <rect class="box" x="440" y="76" width="136" height="50" rx="3"/>
+          <text class="lbl" x="508" y="98" text-anchor="middle">analyze</text>
+          <text class="sub" x="508" y="114" text-anchor="middle">pure arithmetic</text>
+
+          <rect class="box-v" x="616" y="76" width="136" height="50" rx="3"/>
+          <text class="lbl" x="684" y="98" text-anchor="middle">synthesize</text>
+          <text class="sub" x="684" y="114" text-anchor="middle">summary + answer</text>
+
+          <line class="flow" x1="52" y1="98" x2="66" y2="98" marker-end="url(#a5)"/>
+          <line class="flow" x1="208" y1="101" x2="242" y2="101" marker-end="url(#a5)"/>
+          <line class="flow" x1="400" y1="101" x2="434" y2="101" marker-end="url(#a5)"/>
+          <line class="flow-v" x1="576" y1="101" x2="610" y2="101" marker-end="url(#a5v)"/>
+          <text class="edge" x="593" y="92" text-anchor="middle">done</text>
+          <text class="sub" x="762" y="102">END</text>
+
+          <!-- reflect loop -->
+          <path class="flow" d="M508 126 L508 196 L140 196 L140 132" marker-end="url(#a5)"/>
+          <text class="edge" x="324" y="214" text-anchor="middle">reflect &mdash; no axis clears the concentration floor, and axes + budget remain</text>
+          <text class="edge" x="324" y="230" text-anchor="middle">bounded by 3 rounds · 40 probes · 25 s deadline · axes run out</text>
+        </svg>
+      </div>
+      <figcaption>The loop terminates four independent ways, and &ldquo;axes remaining reaches zero&rdquo; is the guarantee that does not depend on the budget being configured correctly.</figcaption>
+    </figure>
+
+    <h3>What licenses a causal claim</h3>
+    <p>The narrative path is forbidden causal language because a model handed three numbers will invent a reason. This path may say &ldquo;because&rdquo; only because arithmetic computed the attribution first — and every claim ships with the probe ids behind it, so a reader can check it rather than trust it.</p>
+    <div class="tblwrap">
+      <table>
+        <caption>Effect-size gates. Each without the other misfires on real data.</caption>
+        <thead><tr><th scope="col">Gate</th><th scope="col">Threshold</th><th scope="col">Prevents</th></tr></thead>
+        <tbody>
+          <tr><td>Lift</td><td class="n">&ge; 1.25&times;</td><td>Naming the biggest bucket, which carries the most movement almost by definition.</td></tr>
+          <tr><td>Share of gap</td><td class="n">&ge; 25%</td><td>Reporting a segment holding a fourteenth of the movement as its driver.</td></tr>
+          <tr><td>Reconciliation</td><td class="n">5% tol.</td><td>Attributing a metric that does not sum across segments. A sign disagreement fails outright.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Two modules the causal claims rest on — <code>analysis.py</code> and <code>windows.py</code> — are import-pure, and a test runs a subprocess import that fails if <code>config</code>, <code>duckdb</code>, <code>openai</code>, <code>metricflow</code> or <code>dbt</code> appear in <code>sys.modules</code>. One convenience import would cost that.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">07</span> LangGraph, and why it is quarantined</h2>
+    <p class="lede">One module imports it. <code>core/diagnostics/graph.py</code> is the only file in the package that knows LangGraph exists — every other module is a plain function over plain dataclasses. That isolation buys two things: the analysis engine is testable with <code>langgraph</code> absent, and if a 200-line asyncio orchestrator later turns out to be enough, this is a one-file replacement rather than a rewrite.</p>
+
+    <h3>It is expensive, so it is built lazily and memoised</h3>
+    <p>The import alone measures <strong>10.7&nbsp;s and +68.6&nbsp;MB RSS</strong>, against ~251&nbsp;MB already resident on a 512&nbsp;MB instance. So <code>build_diagnostic_agent()</code> is never called at import time. <code>get_diagnostic_agent()</code> caches <em>both</em> success and failure — matching the warm MetricFlow engine — so a deployment where LangGraph cannot import does not re-pay the 10.7&nbsp;s on every diagnostic question, and a <code>threading.Lock</code> makes the build happen once even when several <code>anyio</code> worker threads arrive together.</p>
+
+    <h3>Two channels, and they are not the same channel</h3>
+    <p>This is the part worth having a picture of. State flows <em>through</em> the nodes and is merged by per-key rules; services are injected <em>sideways</em> per invocation and never enter state at all.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 880 402" role="img" aria-label="Gateway services flow from app.state through service_config into a per-invocation config bus that drops into all four nodes but not into the edge function. The four nodes run plan, execute probes, analyze and synthesize, with a reflect edge back to plan. Below, GraphState is merged key by key: findings is additive, probed dimensions is overwritten wholesale, and dimensions remaining is precomputed so the edge function can decide without services.">
+          <defs>
+            <marker id="a7" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--rule-strong)"/>
+            </marker>
+            <marker id="a7f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--ink-faint)"/>
+            </marker>
+            <marker id="a7v" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--violet)"/>
+            </marker>
+          </defs>
+
+          <!-- ── band 1 : services, injected per invocation ── -->
+          <rect class="box" x="60" y="20" width="200" height="44" rx="3"/>
+          <text class="lbl" x="160" y="42" text-anchor="middle">app.state</text>
+          <text class="sub" x="160" y="57" text-anchor="middle">validator · generator · caches</text>
+
+          <rect class="box" x="300" y="20" width="190" height="44" rx="3"/>
+          <text class="lbl" x="395" y="42" text-anchor="middle">service_config()</text>
+          <text class="sub" x="395" y="57" text-anchor="middle">builds configurable</text>
+
+          <line class="flow" x1="260" y1="42" x2="294" y2="42" marker-end="url(#a7)"/>
+          <line class="flow-d" x1="395" y1="64" x2="395" y2="96"/>
+          <line class="flow-d" x1="100" y1="96" x2="790" y2="96"/>
+          <text class="edge" x="520" y="88">config["configurable"] &mdash; per invocation, never part of state</text>
+
+          <line class="flow-d" x1="110" y1="96" x2="110" y2="122" marker-end="url(#a7f)"/>
+          <line class="flow-d" x1="287" y1="96" x2="287" y2="122" marker-end="url(#a7f)"/>
+          <line class="flow-d" x1="457" y1="96" x2="457" y2="122" marker-end="url(#a7f)"/>
+          <line class="flow-d" x1="782" y1="96" x2="782" y2="122" marker-end="url(#a7f)"/>
+
+          <!-- the edge function gets no services -->
+          <text class="edge" x="619" y="112" text-anchor="middle" style="fill: var(--warn)">no services</text>
+
+          <!-- ── band 2 : the four nodes plus the edge function ── -->
+          <rect class="box" x="40" y="126" width="140" height="54" rx="3"/>
+          <text class="lbl" x="110" y="148" text-anchor="middle">plan</text>
+          <text class="sub" x="110" y="165" text-anchor="middle">node</text>
+
+          <rect class="box" x="206" y="126" width="162" height="54" rx="3"/>
+          <text class="lbl" x="287" y="148" text-anchor="middle">execute_probes</text>
+          <text class="sub" x="287" y="165" text-anchor="middle">node · serial</text>
+
+          <rect class="box" x="394" y="126" width="126" height="54" rx="3"/>
+          <text class="lbl" x="457" y="148" text-anchor="middle">analyze</text>
+          <text class="sub" x="457" y="165" text-anchor="middle">node</text>
+
+          <rect class="box-d" x="548" y="126" width="142" height="54" rx="3"/>
+          <text class="lbl" x="619" y="148" text-anchor="middle">should_reflect</text>
+          <text class="sub" x="619" y="165" text-anchor="middle">edge fn · pure</text>
+
+          <rect class="box-v" x="716" y="126" width="132" height="54" rx="3"/>
+          <text class="lbl" x="782" y="148" text-anchor="middle">synthesize</text>
+          <text class="sub" x="782" y="165" text-anchor="middle">node</text>
+
+          <line class="flow" x1="180" y1="153" x2="200" y2="153" marker-end="url(#a7)"/>
+          <line class="flow" x1="368" y1="153" x2="388" y2="153" marker-end="url(#a7)"/>
+          <line class="flow" x1="520" y1="153" x2="542" y2="153" marker-end="url(#a7)"/>
+          <line class="flow-v" x1="690" y1="153" x2="710" y2="153" marker-end="url(#a7v)"/>
+
+          <path class="flow" d="M619 180 L619 232 L110 232 L110 186" marker-end="url(#a7)"/>
+          <text class="edge" x="364" y="250" text-anchor="middle">reflect &mdash; another round of axes</text>
+
+          <!-- ── band 3 : how state merges ── -->
+          <text class="cap" x="40" y="292">GRAPHSTATE &mdash; RETURNED AS A PARTIAL DICT, MERGED KEY BY KEY</text>
+
+          <rect class="box-a" x="40" y="304" width="256" height="70" rx="3"/>
+          <text class="lbl" x="56" y="326">findings</text>
+          <text class="sub" x="56" y="343">Annotated[list, operator.add]</text>
+          <text class="sub" x="56" y="360">additive &mdash; concurrency-safe</text>
+
+          <rect class="box" x="312" y="304" width="256" height="70" rx="3"/>
+          <text class="lbl" x="328" y="326">probed_dimensions</text>
+          <text class="sub" x="328" y="343">plain list &mdash; overwritten</text>
+          <text class="sub" x="328" y="360">additive would duplicate</text>
+
+          <rect class="box-w" x="584" y="304" width="264" height="70" rx="3"/>
+          <text class="lbl" x="600" y="326">dimensions_remaining</text>
+          <text class="sub" x="600" y="343">computed in plan, for the edge</text>
+          <text class="sub" x="600" y="360">the edge cannot ask a service</text>
+        </svg>
+      </div>
+      <figcaption>Services arrive per-invocation on the config channel, so one compiled graph serves every request. <code>should_reflect</code> is a plain function on an edge, not a node — it therefore receives state but <em>no</em> services, which is exactly why <code>dimensions_remaining</code> has to be computed inside <code>plan</code> and carried in state.</figcaption>
+    </figure>
+
+    <h3>The annotation trap that costs an afternoon</h3>
+    <p>LangGraph decides whether to inject the config by matching the node's <strong>raw annotation string</strong> — not by resolving the type. Get it wrong and the node receives <code>None</code>, every service lookup returns <code>None</code>, and it surfaces from inside the graph as <code>'NoneType' object has no attribute 'validate'</code>, which reads like a wiring bug and is a typing one.</p>
+
+    <div class="tblwrap">
+      <table>
+        <caption>Verified against langgraph 1.2.11. Only the last form works.</caption>
+        <thead><tr><th scope="col">Node signature</th><th scope="col">Config injected?</th></tr></thead>
+        <tbody>
+          <tr><td><code>config: dict | None = None</code></td><td>No</td></tr>
+          <tr><td><code>config: "RunnableConfig | None" = None</code></td><td>No</td></tr>
+          <tr><td><code>config: RunnableConfig | None = None</code></td><td>No</td></tr>
+          <tr><td><code>config: RunnableConfig = None</code></td><td>Yes</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The third row is the instructive one: <code>typing.get_type_hints()</code> resolves it correctly and it compares equal to the fourth, so the annotation is not the problem — the string match is. LangGraph's own warning names <code>RunnableConfig | None</code> as acceptable and then rejects it, so the message cannot be trusted. Keep the bare form; the <code>= None</code> default stays so nodes remain directly callable in tests.</p>
+    <p>The same import block aliases <code>RunnableConfig</code> to <code>dict</code> when <code>langchain_core</code> is absent, which is what keeps this module importable — and its nodes unit-testable — with LangGraph not installed at all.</p>
+
+    <h3>Why the loop decision is a function, not a node</h3>
+    <p><code>should_reflect</code> must not write state, and keeping it pure means the routing decision is testable without a graph or a warehouse. It returns the next node name and nothing else. Its gates run in this order, and the last one is the termination guarantee that does not depend on the budget being configured correctly:</p>
+
+    <div class="tblwrap">
+      <table>
+        <caption>The four reflect gates, and what each prevents.</caption>
+        <thead><tr><th scope="col">Gate</th><th scope="col">Prevents</th></tr></thead>
+        <tbody>
+          <tr><td>Nothing to explain</td><td>Spending the full budget on a gap of ~0. No axis can decompose a movement that is not there.</td></tr>
+          <tr><td>A driver was found</td><td>Lengthening an answer that already has its cause. Tested with <code>leading_driver()</code>, so a merely large bucket does not stop the loop.</td></tr>
+          <tr><td>Budget spent</td><td>Rounds, probes and the deadline together — 3 / 40 / 25&nbsp;s.</td></tr>
+          <tr><td>No axes left</td><td>Re-analysing identical findings forever. Each round consumes axes from a finite list and the planner excludes what was already asked.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <span class="note-k">Two gates that look right and are not</span>
+      <p>Gating on <code>verdict in ("explains", "partial")</code> is the obvious reading of &ldquo;something explains it&rdquo; and it means the loop can <strong>never fire</strong>: all nine snapshot scenarios return <code>partial</code> on every axis. <code>partial</code> means &ldquo;this axis leads a bit&rdquo;, not &ldquo;this is the cause&rdquo;.</p>
+      <p>Gating on <code>is_broad_based()</code> is also wrong here, though it is right for deciding what to <em>report</em>: it requires at least two axes, so a diagnosis that examined one axis and found nothing — precisely the one most worth extending — would stop.</p>
+    </div>
+
+    <h3>Rounds are idempotent by construction</h3>
+    <p><code>execute_probes_node</code> skips any probe whose label already carries an <code>ok</code> finding, so a reflect round costs only its new axes rather than re-running the whole cumulative plan. It also seeds the tool with the findings gathered so far, because citation ids are derived from that list — starting from empty would mint a second <code>F1</code> and the answer's <code>[F1]</code> would point at two different probes.</p>
+    <p>One measurement detail sits here too: the deadline clock starts <em>after</em> the first probe, because that probe can pay the 43&nbsp;s cold MetricFlow engine build. That is one-off infrastructure warm-up, not diagnosis work, and timing it defeated the deadline it was meant to enforce.</p>
+
+    <h3>One tool, and it is the governed path</h3>
+    <p>The agent has exactly one way to reach data: <code>run_governed_query()</code>, which emits a <code>QueryIntent</code> into the same <code>SemanticValidator → SQLGenerator → pool</code> chain the NL pipeline uses. Every probe therefore inherits certification, filter coercion, <code>assert_read_only()</code> and both cache layers — a probe can even hit an L2 entry a user query populated, and vice versa.</p>
+    <p>Failure handling splits deliberately. An execution error comes back as a <code>Finding</code> with <code>error</code> set, so one dead probe costs its own evidence slot and not the whole diagnosis. A governance rejection <em>raises</em>, because that means the agent asked for something uncertified — a bug in the plan, not a data problem.</p>
+
+    <div class="rule-card">
+      <p>Zero LLM calls, end to end.</p>
+      <p>Planning needs the metric (intent extraction already supplied it), the dimensions (<code>driver_graph.yml</code> orders them) and the windows (<code>windows.py</code> builds them) — none of which needs a model. Analysis is arithmetic by construction, and each hypothesis already carries a plainly-worded statement. So a diagnosis is <em>reproducible</em>, and it does not compete with chat traffic for provider quota. A later prose pass can sit on top, but the numbers and the strength claims still originate here — which is what keeps the citation check meaningful rather than decorative.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2><span class="num">08</span> The semantic layer</h2>
+    <p class="lede">Four dbt layers, lineage in one direction only. The gateway reads <code>target/manifest.json</code> directly, which is why <code>dbt compile</code> has to be re-run after any model change or lineage resolves stale.</p>
+
+    <figure>
+      <div class="canvas">
+        <svg viewBox="0 0 800 176" role="img" aria-label="Lineage flows one direction: raw CSVs to ten staging views, six intermediate views, seven marts tables, five semantic model definitions, and nineteen metric files defining twenty-three metric objects.">
+          <defs>
+            <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <polygon points="0,1 9,5 0,9" fill="var(--accent)"/>
+            </marker>
+          </defs>
+
+          <rect class="box" x="14" y="52" width="112" height="56" rx="3"/>
+          <text class="lbl" x="70" y="76" text-anchor="middle">raw</text>
+          <text class="sub" x="70" y="93" text-anchor="middle">output/*.csv</text>
+
+          <rect class="box" x="152" y="52" width="112" height="56" rx="3"/>
+          <text class="lbl" x="208" y="76" text-anchor="middle">staging</text>
+          <text class="sub" x="208" y="93" text-anchor="middle">10 views</text>
+
+          <rect class="box" x="290" y="52" width="112" height="56" rx="3"/>
+          <text class="lbl" x="346" y="76" text-anchor="middle">intermediate</text>
+          <text class="sub" x="346" y="93" text-anchor="middle">6 views</text>
+
+          <rect class="box-a" x="428" y="52" width="112" height="56" rx="3"/>
+          <text class="lbl" x="484" y="76" text-anchor="middle">marts</text>
+          <text class="sub" x="484" y="93" text-anchor="middle">7 tables</text>
+
+          <rect class="box-a" x="566" y="52" width="112" height="56" rx="3"/>
+          <text class="lbl" x="622" y="76" text-anchor="middle">semantic</text>
+          <text class="sub" x="622" y="93" text-anchor="middle">5 models</text>
+
+          <rect class="box-a" x="704" y="52" width="82" height="56" rx="3"/>
+          <text class="lbl" x="745" y="76" text-anchor="middle">metrics</text>
+          <text class="sub" x="745" y="93" text-anchor="middle">23 objs</text>
+
+          <line class="flow-a" x1="126" y1="80" x2="146" y2="80" marker-end="url(#a6)"/>
+          <line class="flow-a" x1="264" y1="80" x2="284" y2="80" marker-end="url(#a6)"/>
+          <line class="flow-a" x1="402" y1="80" x2="422" y2="80" marker-end="url(#a6)"/>
+          <line class="flow-a" x1="540" y1="80" x2="560" y2="80" marker-end="url(#a6)"/>
+          <line class="flow-a" x1="678" y1="80" x2="698" y2="80" marker-end="url(#a6)"/>
+
+          <text class="cap" x="14" y="30">ONE DIRECTION ONLY</text>
+          <text class="edge" x="400" y="140" text-anchor="middle">the gateway reads target/manifest.json to resolve this chain for every answer</text>
+        </svg>
+      </div>
+      <figcaption>Metrics live in <code>metrics/</code>, not in <code>semantic/</code>: 19 YAML files declaring 23 metric objects, of which 20 are user-facing and 3 are ratio building blocks hidden from everything user- or LLM-facing.</figcaption>
+    </figure>
+
+    <h3>Three layers must agree before a dimension is answerable</h3>
+    <p>The mart has to select the column, the semantic model has to expose it or reach it through an entity, and the registry has to certify it. They have been out of step in <em>both</em> directions — a dimension MetricFlow could serve being rejected as uncertified, and a metric certifying a dimension MetricFlow refuses. An audit tool is what tells the two apart; reasoning about the layers is not reliable.</p>
+    <p>A third axis exists beyond &ldquo;certified&rdquo; and &ldquo;compiles&rdquo;: <strong>populated</strong>. A dimension can pass both and still return a single null bucket, which once produced a broken join reported as a business finding with no error anywhere. Current state: 267 pairs certified, 267 compile, 266 populated, and the one exception is correct by construction.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">09</span> Model providers</h2>
+    <p class="lede">Four are configured; <code>llm_provider_order</code> decides which three are chained. Each position is a measured decision, not a preference.</p>
+
+    <div class="tblwrap">
+      <table>
+        <caption>The chain as deployed, with the reason for each position.</caption>
+        <thead><tr><th scope="col">Rung</th><th scope="col">Model</th><th scope="col">Measured</th><th scope="col">Why here</th></tr></thead>
+        <tbody>
+          <tr><td>1 · Cerebras</td><td><code>qwen-3.8-27b</code></td><td class="n">0.44–0.54 s</td><td>450 req/min and 450k TPM, and ~10× faster than the alternative on an identical prompt.</td></tr>
+          <tr><td>2 · Google</td><td><code>gemini-3.1-flash-lite</code></td><td class="n">4.6–7.1 s</td><td>Works locally. Unreachable from the production host — requests are dropped, not refused.</td></tr>
+          <tr><td>3 · Groq</td><td>—</td><td class="n">413</td><td>Free-tier tokens-per-minute sits below the size of one request, so it cannot succeed in any minute.</td></tr>
+          <tr><td>— · OpenRouter</td><td><code>google/gemini-3.1-flash-lite</code></td><td class="n">402</td><td>Deliberately out of the chain. An unfunded rung is worse than an absent one: it fails fast and consumes one of only three slots.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <span class="note-k">The trap that will bite again</span>
+      <p>The primary is a reasoning model. Its thinking tokens bill against <code>max_tokens</code> and appear nowhere in the usage payload, so the symptom of an over-tight cap is not a truncated answer but an <em>empty</em> one — an unrecoverable error on the intent path and silently missing prose on the narrative path.</p>
+      <p><code>reasoning_effort="none"</code> is the fix, and it lives in one per-provider settings helper rather than at the call sites, because providers reject unknown parameters and one of them 400s on a neighbouring field.</p>
+    </div>
+
+    <h3>Retrieval does not run</h3>
+    <p>The embedding index is never consulted, for two independent reasons, and both failures are caught and logged as warnings before degrading silently to injecting the full metric list. That is the right outcome regardless: top-<em>k</em> retrieval makes the candidate set depend on phrasing, which is what made metric choice unstable in the first place. With 20 metrics the whole list fits comfortably in the prompt.</p>
+  </section>
+
+  <section>
+    <h2><span class="num">10</span> What the numbers are</h2>
+    <p class="lede">Counts verified against the working tree rather than transcribed from documentation.</p>
+
+    <div class="counts">
+      <div class="count"><div class="count-v">839</div><div class="count-k">gateway tests, all passing</div></div>
+      <div class="count"><div class="count-v">267</div><div class="count-k">certified metric × dimension pairs</div></div>
+      <div class="count"><div class="count-v">23</div><div class="count-k">metric objects · 20 user-facing</div></div>
+      <div class="count"><div class="count-v">13</div><div class="count-k">pipeline stages</div></div>
+      <div class="count"><div class="count-v">13</div><div class="count-k">dashboard widgets</div></div>
+      <div class="count"><div class="count-v">9</div><div class="count-k">HTTP endpoints</div></div>
+      <div class="count"><div class="count-v">2</div><div class="count-k">LLM calls per metric query</div></div>
+      <div class="count"><div class="count-v">74<span style="color:var(--ink-faint);font-size:0.62em">/79</span></div><div class="count-k">dbt tests passing</div></div>
+    </div>
+
+    <div class="note">
+      <span class="note-k">The five failing dbt tests are a deliberate decision</span>
+      <p>All five are <code>content_id</code> relationship tests. The synthetic source CSVs were generated across independent runs, so the content id spaces are disjoint — the joins fail in the raw data itself, which is why the warehouse engine is irrelevant to them. Fixing it means regenerating the whole dataset and changing every number in the app.</p>
+      <p>This count was 15 until the disjoint-id explanation was checked rather than assumed: ten of them turned out to be a different bug entirely, wearing the same clothes. Check <em>which</em> relationship fails before filing a new one under the known issue.</p>
+    </div>
+  </section>
+
+  <footer>
+    Verified against the working tree on 2026-09-09 · gateway 839 tests green · warehouse engine: duckdb<br>
+    Counts read from the live metric registry, the dbt project, and the route modules — not from CLAUDE.md, which is stale in two places noted separately.
+  </footer>
+
+</div>
+</body>
+</html>
